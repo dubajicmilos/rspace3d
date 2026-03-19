@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.spec
+.eggs/
+*.h5
+*.npz
+*.mat
+monoclinic_test/
