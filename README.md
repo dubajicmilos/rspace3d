@@ -57,6 +57,8 @@ Before processing, you need CrysAlisPro to reconstruct HK planes at each l value
 ```bash
 python -m rspace3d.volume_builder_gui
 ```
+<img width="704" height="716" alt="image" src="https://github.com/user-attachments/assets/9a6bcf76-72df-4995-8c86-80843c8d85c3" />
+
 Use the "Generate dcunwarp file" section. Set l range (e.g., -6 to 6), step (0.02), and resolution (0.8 A). Click Generate.
 
 **CLI:**
