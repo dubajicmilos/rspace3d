@@ -4,7 +4,7 @@
 
 **Reciprocal Space 3D Processing Toolkit** for single-crystal X-ray diffuse scattering.
 
-Process CrysAlisPro reciprocal space reconstructions into symmetrized 3D volumes with GPU acceleration. Works with any unit cell — cubic, tetragonal, orthorhombic, monoclinic, and triclinic.
+Process CrysAlisPro reciprocal space reconstructions into symmetrized 3D volumes with GPU acceleration. 
 
 ## What it does
 
