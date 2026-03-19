@@ -6,16 +6,6 @@ Process CrysAlisPro reciprocal space reconstructions into symmetrized 3D volumes
 
 ## What it does
 
-```
-CrysAlisPro unwarp (.img files)
-         |
-    [rspace3d]
-         |
-    Load -> Bin -> Outlier Reject -> Symmetrize -> Save (.h5)
-         |                                          |
-    View single frames                    View 3D volume slices
-    (.img / .cbf viewer)                  (HK/HL/KL + isosurface)
-```
 
 ## Installation
 
