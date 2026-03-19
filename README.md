@@ -209,7 +209,6 @@ h = M_inv[0,0] * s * (i - cx) + M_inv[0,1] * s * (j - cy)
 k = M_inv[1,0] * s * (i - cx) + M_inv[1,1] * s * (j - cy)
 ```
 
-**Important**: CrysAlisPro uses the RAW reciprocal vectors, not projected perpendicular to the fixed axis. The projection approach gives ~4% errors for monoclinic cells.
 
 For monoclinic cells (beta != 90), the cross-term `M_inv[0,1]` is significant. This means:
 - Grid lines are **tilted** (not vertical/horizontal)
