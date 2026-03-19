@@ -277,6 +277,14 @@ coverage from the Ewald sphere are visible.
 **Right**: After outlier rejection (sigma=3) and m-3m symmetrization. Hot pixels are removed,
 unmeasured regions are filled by symmetry equivalents, and the cubic symmetry of the diffuse
 scattering pattern is enforced. The data is also binned 4x4 to reduce noise.
+At l = 1.5 (between Bragg planes), the diffuse scattering is more pronounced:
+
+![Diffuse scattering comparison](docs/processing_comparison_hk15.png)
+
+The log-scale view reveals the structured diffuse scattering from correlated
+atomic displacements. The raw data (left) shows detector gaps and asymmetric
+Ewald sphere coverage. After processing (right), the full cubic symmetry of
+the diffuse pattern is recovered.
 
 ## License
 
