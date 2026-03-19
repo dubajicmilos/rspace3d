@@ -49,7 +49,7 @@ python build_exe.py
 
 ## Try It Out
 
-An example volume is included for testing (`example_data/example_monoclinic.h5` — monoclinic 2D3D400 at 250K, binned 4x4).
+An example volume is included for testing (`example_data/example_monoclinic.h5` — monoclinic 2D halide perovskite collected at I19 at Diamond Light Source at 250K, binned 4x4).
 
 **View the example:**
 ```bash
