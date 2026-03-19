@@ -11,7 +11,7 @@ Process [CrysAlisPro]([URL](https://rigaku.com/products/crystallography/x-ray-di
 
 ## What it does
 
-CrysAlisPro does not offer a reliable way to extract full 3D reciprocal space data from the raw measured frames. Using dc unwarp function it is possible to extract slices of reciprocal space. However, analyzing this data becomes difficult as exported files do not contain information about hkl grid. This software is a workaround to extract full 3D reciprocal space that is recontructed in CrysAlisPro into a single .h5 file with HKL grid calcuated from the UB matrix stored in CrysAlisPro .par file. This software offer also offers notebooks, CLI commands and guis for both processing and visualization. 
+CrysAlisPro does not offer a reliable way to extract full 3D reciprocal space data from the raw measured frames. By using dc unwarp function it is possible to extract slices of reciprocal space. However, analyzing this data becomes difficult as exported files do not contain information about hkl grid. This software is a workaround to extract full 3D reciprocal space that is recontructed in CrysAlisPro into a single .h5 file with HKL grid calcuated from the UB matrix stored in CrysAlisPro .par file. This software also offers notebooks, CLI commands and guis for both processing and visualization. 
 
 <img width="1408" height="768" alt="rspace3d" src="https://github.com/user-attachments/assets/ceb25190-5b8a-4a25-bb88-c54f1f2eb413" />
 
@@ -283,8 +283,7 @@ At l = 1.5 (between Bragg planes), the diffuse scattering is more pronounced:
 
 The log-scale view reveals the structured diffuse scattering from correlated
 atomic displacements. The raw data (left) shows detector gaps and asymmetric
-Ewald sphere coverage. After processing (right), the full cubic symmetry of
-the diffuse pattern is recovered.
+Ewald sphere coverage. 
 
 ## License
 
