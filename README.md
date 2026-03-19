@@ -13,7 +13,7 @@ Process [CrysAlisPro]([URL](https://rigaku.com/products/crystallography/x-ray-di
 
 CrysAlisPro does not offer a reliable way to extract full 3D reciprocal space data from the raw measured frames. By using dc unwarp function it is possible to extract slices of reciprocal space. However, analyzing this data becomes difficult as exported files do not contain information about hkl grid. This software is a workaround to extract full 3D reciprocal space that is recontructed in CrysAlisPro into a single .h5 file with HKL grid calcuated from the UB matrix stored in CrysAlisPro .par file. This software also offers notebooks, CLI commands and guis for both processing and visualization. 
 
-<img width="1408" height="768" alt="rspace3d" src="https://github.com/user-attachments/assets/ceb25190-5b8a-4a25-bb88-c54f1f2eb413" />
+<img width="1407" height="768" alt="Gemini_Generated_Image_ab5zm4ab5zm4ab5z" src="https://github.com/user-attachments/assets/c49a4ce5-b7c2-431e-b4c4-62482ae249d0" />
 
 ## Installation
 
