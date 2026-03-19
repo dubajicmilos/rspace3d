@@ -4,7 +4,7 @@
 
 **Reciprocal Space 3D Processing and visualization Toolkit** for single-crystal X-ray diffuse scattering.
 
-Process CrysAlisPro reciprocal space cuts that are stored as .img files into symmetrized 3D volume with GPU acceleration. 
+Process [CrysAlisPro]([URL](https://rigaku.com/products/crystallography/x-ray-diffraction/crysalispro)) reciprocal space cuts that are stored as .img files into symmetrized 3D volume with GPU acceleration. 
 
 <img width="1297" height="777" alt="image" src="https://github.com/user-attachments/assets/d99736f6-08b5-4f09-9e1d-eff895192ee0" />
 
