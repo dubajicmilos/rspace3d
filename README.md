@@ -68,8 +68,12 @@ If more than 500 layers are needed, multiple files are created automatically (Cr
 
 In the CrysAlisPro command line:
 ```
-dc unwarp dcunwarp.dcunwarp
+dc unwarp
 ```
+Load the dcunwrap file we created previosly. 
+
+<img width="589" height="558" alt="image" src="https://github.com/user-attachments/assets/394f02f9-40e8-4a8d-a874-c0f3347c9b5c" />
+
 
 This creates numbered .img files in the `unwarp/` folder (e.g., `MAPbBr3_300K_1.img` through `MAPbBr3_300K_601.img`).
 
@@ -82,8 +86,8 @@ If multiple `.dcunwarp` files were generated, run `dc unwarp` once for each file
 python -m rspace3d.volume_builder_gui
 ```
 1. Browse to the `unwarp/` folder
-2. Set Laue group (e.g., m-3m for cubic)
-3. Set binning (2x2 recommended), sigma (3.0), iterations (1)
+2. Set Laue group (e.g., m-3m for cubic). This will be used both for outlier rejection and symetrization. 
+3. Set binning (2x2 recommended), sigma (e.g. 3.0, the higher the less harsh the outlier rejection is), iterations (1)
 4. Click **Process All**
 
 Output: `sample_raw.h5` (unbinned) and `sample_sym_mbar3m.h5` (processed)
