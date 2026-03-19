@@ -265,6 +265,19 @@ docs/
 - NumPy, SciPy, fabio, h5py, matplotlib, PyQt6
 - Optional: CuPy (GPU), PyVista (3D), Plotly (3D browser)
 
+## Processing Example
+
+HK plane at l = 0 from MAPbCl3 at 180K (cubic, m-3m symmetry):
+
+![Processing comparison](docs/processing_comparison.png)
+
+**Left**: Raw data directly from CrysAlisPro unwarp. Hot pixels, detector gaps, and asymmetric
+coverage from the Ewald sphere are visible.
+
+**Right**: After outlier rejection (sigma=3) and m-3m symmetrization. Hot pixels are removed,
+unmeasured regions are filled by symmetry equivalents, and the cubic symmetry of the diffuse
+scattering pattern is enforced. The data is also binned 4x4 to reduce noise.
+
 ## License
 
 MIT
