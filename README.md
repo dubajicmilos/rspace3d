@@ -6,6 +6,9 @@
 
 Process CrysAlisPro reciprocal space reconstructions into symmetrized 3D volumes with GPU acceleration. 
 
+<img width="1299" height="804" alt="image" src="https://github.com/user-attachments/assets/d041fe07-57ab-4421-b21a-5179b76224b7" />
+
+
 ## What it does
 
 <img width="1408" height="768" alt="rspace3d" src="https://github.com/user-attachments/assets/ceb25190-5b8a-4a25-bb88-c54f1f2eb413" />
