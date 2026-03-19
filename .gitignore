@@ -9,3 +9,4 @@ build/
 *.npz
 *.mat
 monoclinic_test/
+!example_data/*.h5

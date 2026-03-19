@@ -47,6 +47,21 @@ pip install pyinstaller
 python build_exe.py
 ```
 
+## Try It Out
+
+An example volume is included for testing (`example_data/example_monoclinic.h5` — monoclinic 2D3D400 at 250K, binned 4x4).
+
+**View the example:**
+```bash
+python -m rspace3d.rsp_viewer example_data/example_monoclinic.h5
+```
+
+- Switch planes (HK/HL/KL) using the Plane dropdown
+- Scrub through slices with the slider
+- Toggle the Grid checkbox to see Miller index overlay
+- Click "3D Isosurface..." for interactive 3D visualization
+- Try the Line Profile tool to extract 1D intensity cuts
+
 ## Quick Start
 
 ### Step 1: Prepare unwarp layer list
