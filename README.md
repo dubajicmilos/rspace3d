@@ -186,7 +186,7 @@ GPU support via CuPy is auto-detected. Benchmarks (MAPbI2Br, 839x737x601, m-3m):
 
 Force CPU: `--no-gpu` (CLI) or `use_gpu=False` (API).
 
-## How the Grid Works
+## How the hkl grid calcuation works
 
 CrysAlisPro stores reciprocal space maps as .img files. Each file contains:
 
