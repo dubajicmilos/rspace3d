@@ -85,7 +85,7 @@ If multiple `.dcunwarp` files were generated, run `dc unwarp` once for each file
 ```bash
 python -m rspace3d.volume_builder_gui
 ```
-1. Browse to the `unwarp/` folder
+1. Browse to the `unwarp/` folder. The GUI will also load cracker.par file which is usually in parent folder. This is used to calcuate HKL grid as .par file contains UB matrix and other info. 
 2. Set Laue group (e.g., m-3m for cubic). This will be used both for outlier rejection and symetrization. 
 3. Set binning (2x2 recommended), sigma (e.g. 3.0, the higher the less harsh the outlier rejection is), iterations (1)
 4. Click **Process All**
