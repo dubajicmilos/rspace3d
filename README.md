@@ -1,5 +1,5 @@
 
-![Uploading logo.png…]()
+<img width="2007" height="512" alt="logo" src="docs/images/logo.png" />
 
 
 **Reciprocal Space 3D Processing Toolkit** for single-crystal X-ray diffuse scattering.
