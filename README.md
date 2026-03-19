@@ -11,6 +11,8 @@ Process CrysAlisPro reciprocal space reconstructions into symmetrized 3D volumes
 
 ## What it does
 
+CrysAlisPro does offer a reliable way to extract full 3D reciprocal space data. Using unwarp function it is possible to extract slices of reciprocal space. However, analyzing this data becomes difficult as exported files do not contain information about hkl grid. This software is a workaround to extract full 3D reciprocal space that is recontructed in CrysAlisPro into a single .h5. HKL grid is calcuated from the UB matrix stored in CrysAlisPro .par file and saved in the .h5 file. Thus this provides a reliable way to extract the 3D volume from single crystal meausrement. Moreover, this software offer notebooks, CLI commands and guis for both processing and visualization. 
+
 <img width="1408" height="768" alt="rspace3d" src="https://github.com/user-attachments/assets/ceb25190-5b8a-4a25-bb88-c54f1f2eb413" />
 
 ## Installation
