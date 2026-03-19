@@ -145,19 +145,19 @@ print(f'{layer.plane_type}, {layer.fixed_label}={layer.fixed_value}')
 
 All 11 crystallographic Laue groups are supported:
 
-| Laue Group | Crystal System | Ops | Example compounds |
-|------------|---------------|-----|-------------------|
-| -1         | Triclinic     | 2   | |
-| 2/m        | Monoclinic    | 4   | 2D3D400 (beta=105.6) |
-| mmm        | Orthorhombic  | 8   | |
-| 4/m        | Tetragonal    | 8   | |
-| 4/mmm      | Tetragonal    | 16  | |
-| -3         | Trigonal      | 6   | |
-| -3m        | Trigonal      | 12  | |
-| 6/m        | Hexagonal     | 12  | |
-| 6/mmm      | Hexagonal     | 24  | |
-| m-3        | Cubic         | 24  | |
-| m-3m       | Cubic         | 48  | MAPbBr3, CsPbCl3, MAPbI2Br |
+| Laue Group | Crystal System | Ops |
+|------------|---------------|-----|
+| -1         | Triclinic     | 2   |
+| 2/m        | Monoclinic    | 4   |
+| mmm        | Orthorhombic  | 8   |
+| 4/m        | Tetragonal    | 8   |
+| 4/mmm      | Tetragonal    | 16  |
+| -3         | Trigonal      | 6   |
+| -3m        | Trigonal      | 12  |
+| 6/m        | Hexagonal     | 12  |
+| 6/mmm      | Hexagonal     | 24  |
+| m-3        | Cubic         | 24  |
+| m-3m       | Cubic         | 48  |
 
 ## HDF5 Output Format
 
