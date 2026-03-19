@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rspace3d"
+version = "0.1.0"
+description = "Reciprocal Space 3D Processing Toolkit for single-crystal X-ray diffuse scattering"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Milos Dubajic"},
+]
+keywords = ["crystallography", "diffuse-scattering", "reciprocal-space", "synchrotron", "CrysAlisPro"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "fabio",
+    "h5py",
+    "matplotlib",
+    "PyQt6",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+3d = ["pyvista"]
+plotly = ["plotly"]
+all = ["cupy-cuda12x", "pyvista", "plotly"]
+
+[project.scripts]
+rspace3d-process = "scripts.volume_process:main"
+rspace3d-viewer = "rspace3d.rsp_viewer:main"
+rspace3d-builder = "rspace3d.volume_builder_gui:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/rspace3d"
+Documentation = "https://github.com/yourusername/rspace3d#readme"
