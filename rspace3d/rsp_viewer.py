@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QToolBar, QStatusBar, QFileDialog, QComboBox,
     QDoubleSpinBox, QCheckBox, QLabel, QPushButton, QSlider,
-    QStackedWidget,
+    QStackedWidget, QDialog, QTextEdit, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
@@ -203,6 +203,10 @@ class UnifiedViewer(QMainWindow):
         self.iso_btn = QPushButton('3D Isosurface...')
         self.iso_btn.clicked.connect(self._show_isosurface)
         self.vol_toolbar.addWidget(self.iso_btn)
+
+        self.info_btn = QPushButton('Info...')
+        self.info_btn.clicked.connect(self._show_info)
+        self.vol_toolbar.addWidget(self.info_btn)
 
         self.vol_toolbar.setVisible(False)
 
@@ -818,6 +822,102 @@ class UnifiedViewer(QMainWindow):
                 l_range=(float(self.vol.L[0]), float(self.vol.L[-1])))
         except Exception as e:
             self.status.showMessage(f'Isosurface error: {e}')
+
+    def _show_info(self):
+        """Show volume metadata in a dialog."""
+        if self.vol is None:
+            return
+
+        import numpy as np
+        v = self.vol
+        m = v.metadata
+        nh, nk, nl = v.intensity.shape
+
+        lines = []
+        lines.append('=== Volume Information ===\n')
+        lines.append(f'Shape:      {nh} x {nk} x {nl}')
+        lines.append(f'Data type:  {v.intensity.dtype}')
+        lines.append(f'Memory:     {v.intensity.nbytes / 1e6:.0f} MB')
+        lines.append(f'Plane type: {v.plane_type}')
+        lines.append(f'')
+        lines.append(f'H range:    [{v.H[0]:.4f}, {v.H[-1]:.4f}]  ({len(v.H)} pts, step {v.H[1]-v.H[0]:.6f})')
+        lines.append(f'K range:    [{v.K[0]:.4f}, {v.K[-1]:.4f}]  ({len(v.K)} pts, step {v.K[1]-v.K[0]:.6f})')
+        lines.append(f'L range:    [{v.L[0]:.4f}, {v.L[-1]:.4f}]  ({len(v.L)} pts, step {v.L[1]-v.L[0]:.6f})')
+        lines.append(f'')
+
+        nz = (v.intensity != 0).sum()
+        lines.append(f'Nonzero:    {nz:,} / {v.intensity.size:,} ({nz/v.intensity.size*100:.1f}%)')
+        lines.append(f'Intensity:  [{v.intensity.min():.1f}, {v.intensity.max():.1f}]')
+        lines.append(f'')
+
+        cell = m.get('cell')
+        if cell:
+            lines.append('=== Unit Cell ===\n')
+            lines.append(f'a = {cell["a"]:.5f} A')
+            lines.append(f'b = {cell["b"]:.5f} A')
+            lines.append(f'c = {cell["c"]:.5f} A')
+            lines.append(f'alpha = {cell["alpha"]:.3f} deg')
+            lines.append(f'beta  = {cell["beta"]:.3f} deg')
+            lines.append(f'gamma = {cell["gamma"]:.3f} deg')
+            lines.append(f'')
+
+        wl = m.get('wavelength')
+        if wl:
+            lines.append(f'Wavelength: {wl:.6f} A')
+
+        lines.append(f'')
+        lines.append('=== Processing ===\n')
+        laue = m.get('laue_group', '')
+        if laue:
+            lines.append(f'Laue group: {laue}')
+        lines.append(f'Bin HK:     {m.get("bin_xy", 1)}x')
+        lines.append(f'Bin L:      {m.get("bin_z", 1)}x')
+
+        s = m.get('s')
+        if s:
+            lines.append(f'')
+            lines.append(f'=== Grid ===\n')
+            lines.append(f'Cartesian step (s): {s:.8f} 1/A per pixel')
+            cx = m.get('cx'); cy = m.get('cy')
+            if cx:
+                lines.append(f'Pixel center:       cx={cx:.1f}, cy={cy:.1f}')
+
+        M_inv = m.get('M_inv')
+        if M_inv is not None:
+            lines.append(f'')
+            lines.append(f'M_inv (pixel -> Miller):')
+            lines.append(f'  [{M_inv[0,0]:.6f}, {M_inv[0,1]:.6f}]')
+            lines.append(f'  [{M_inv[1,0]:.6f}, {M_inv[1,1]:.6f}]')
+
+        ub = m.get('ub')
+        if ub is not None:
+            lines.append(f'')
+            lines.append(f'UB matrix (includes lambda):')
+            for row in ub:
+                lines.append(f'  [{row[0]:12.8f}, {row[1]:12.8f}, {row[2]:12.8f}]')
+
+        src = m.get('source_folder', '')
+        if src:
+            lines.append(f'')
+            lines.append(f'Source: {src}')
+
+        # Show dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Volume Information')
+        dlg.setMinimumSize(500, 600)
+        layout = QVBoxLayout(dlg)
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setStyleSheet('font-family: Consolas, monospace; font-size: 12px;')
+        text.setPlainText('\n'.join(lines))
+        layout.addWidget(text)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.exec()
 
 
 def main():
