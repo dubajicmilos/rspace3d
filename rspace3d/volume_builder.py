@@ -798,14 +798,21 @@ def compute_outlier_stats(vol: VolumeData, laue_group: str) -> dict:
 
 
 def reject_outliers(vol: VolumeData, laue_group: str,
-                    sigma: float = 3.0, n_iter: int = 2,
+                    sigma: float = 3.0, n_iter: int = 1,
                     progress_callback: Optional[Callable] = None,
                     use_gpu: Optional[bool] = None) -> VolumeData:
-    """Reject outlier voxels by comparing to symmetrized volume.
+    """Reject outlier voxels using per-voxel symmetry-equivalent comparison.
 
-    Approach: symmetrize, compute vectorized MAD per L-slice,
-    replace voxels deviating > sigma*robust_std with symmetrized value.
-    Automatically uses GPU if available.
+    For each voxel, gathers intensities at ALL symmetry-equivalent
+    positions from the RAW data, computes the MEDIAN (robust to
+    outliers) and MAD of those equivalents, then flags voxels that
+    deviate by more than sigma * MAD from the median.
+
+    This is the correct approach: no pre-symmetrization needed because
+    the median naturally ignores outliers. Replaces bad voxels with
+    the median of their equivalents.
+
+    Matches the MATLAB sym_clean_volume_fast logic.
     """
     if use_gpu is None:
         use_gpu = HAS_GPU
@@ -820,37 +827,54 @@ def reject_outliers(vol: VolumeData, laue_group: str,
         data = vol.intensity.astype(np.float32).copy()
         op_maps = _precompute_op_maps(vol, laue_group, xp=np)
 
+    MAD_SCALE = 1.4826
+    n_ops = len([om for om in op_maps if om is not None])
+    nh, nk, nl = data.shape
     n_replaced_total = 0
 
     for iteration in range(n_iter):
         if progress_callback:
             progress_callback(iteration, n_iter)
 
-        sym_data = _symmetrize_core(data, op_maps, vol, xp=xp)
+        # Gather all equivalent intensities: shape (n_ops, nh, nk, nl)
+        # Process one operation at a time to limit memory
+        # Stack into a (n_ops, nh, nk, nl) array for median/MAD
 
-        # MAD-based outlier detection per L-slice
-        # Use a loop to avoid creating multiple volume-sized temps
-        nl = data.shape[2]
-        n_replaced = 0
-        for il in range(nl):
-            sl_res = data[:, :, il] - sym_data[:, :, il]
-            nz = sl_res != 0
-            nz_count = int(nz.sum())
-            if nz_count < 10:
+        equiv = xp.full((n_ops, nh, nk, nl), xp.nan, dtype=xp.float32)
+        op_count = 0
+
+        for om in op_maps:
+            if om is None:
                 continue
-            vals_nz = sl_res[nz]
-            med = float(xp.median(vals_nz))
-            mad = float(xp.median(xp.abs(vals_nz - med)))
-            robust_std = 1.4826 * mad
-            if robust_std < 1e-10:
-                continue
-            outlier = xp.abs(sl_res) > sigma * robust_std
-            n_out = int(outlier.sum())
-            n_replaced += n_out
-            if n_out > 0:
-                data[:, :, il] = xp.where(outlier, sym_data[:, :, il], data[:, :, il])
-        del sym_data
+            gi, gv = om
+            vals = data[gi[0], gi[1], gi[2]]
+            valid = gv[0] & gv[1] & gv[2]
+            # Set invalid and zero (unmeasured) to NaN
+            vals = xp.where(valid & (vals != 0), vals, xp.nan)
+            equiv[op_count] = vals
+            del vals, valid
+            op_count += 1
+
+        # Compute per-voxel median and MAD from equivalents
+        # nanmedian along axis 0 (across operations)
+        med = xp.nanmedian(equiv, axis=0)  # (nh, nk, nl)
+
+        # MAD = median(|equiv - median|) per voxel
+        abs_dev = xp.abs(equiv - med[None, :, :, :])
+        mad = xp.nanmedian(abs_dev, axis=0) * MAD_SCALE  # (nh, nk, nl)
+        del equiv, abs_dev
+
+        # Flag outliers: |raw - median| > sigma * MAD
+        residual = xp.abs(data - med)
+        is_finite = xp.isfinite(med) & (data != 0)
+        outlier = (residual > sigma * mad) & is_finite & (mad > 1e-10)
+
+        n_replaced = int(outlier.sum())
         n_replaced_total += n_replaced
+
+        # Replace outliers with median of equivalents
+        data = xp.where(outlier, med, data)
+        del med, mad, residual, outlier, is_finite
 
     if progress_callback:
         progress_callback(n_iter, n_iter)
