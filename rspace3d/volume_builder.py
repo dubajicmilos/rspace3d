@@ -874,16 +874,19 @@ def reject_outliers(vol: VolumeData, laue_group: str,
                     continue
                 gi, gv = om
 
-                # Slice the gather indices for this H-chunk
-                # gi[0] indexes into dim 0 (H) of data — need full data access
-                # gi[1], gi[2] index dims 1, 2
-                # But the OUTPUT is only for h_start:h_end
-                # We gather from full data, but store only the chunk rows
-                gi0_chunk = gi[0][h_start:h_end]
-                gv0_chunk = gv[0][h_start:h_end]
+                # Slice the gi/gv that carries the H-dimension (dim 0).
+                # For axis-permuting ops (e.g. K,-H,L in 4/mmm), the
+                # H-carrier may be gi[1] or gi[2], not gi[0].
+                gi_c = list(gi)
+                gv_c = list(gv)
+                for d in range(3):
+                    if gi[d].shape[0] > 1:
+                        gi_c[d] = gi[d][h_start:h_end]
+                        gv_c[d] = gv[d][h_start:h_end]
+                        break
 
-                vals = data[gi0_chunk, gi[1], gi[2]]
-                valid = gv0_chunk & gv[1] & gv[2]
+                vals = data[gi_c[0], gi_c[1], gi_c[2]]
+                valid = gv_c[0] & gv_c[1] & gv_c[2]
                 vals = xp.where(valid & (vals != 0), vals, xp.nan)
                 equiv[op_count] = vals
                 del vals, valid
