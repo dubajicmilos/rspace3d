@@ -113,7 +113,7 @@ Output: `sample_raw.h5` (unbinned) and `sample_sym_mbar3m.h5` (processed)
 
 **Command line:**
 ```bash
-python scripts/volume_process.py F:\path\to\unwarp --laue m-3m --sigma 3 --bin 2
+python -m rspace3d.volume_process F:\path\to\unwarp --laue m-3m --sigma 3 --bin 2
 ```
 
 ### Step 4: View the results
@@ -138,7 +138,7 @@ Features:
 |------|-------------|------------|
 | **Unified Viewer** | View .img/.cbf/.h5 files | `python -m rspace3d.rsp_viewer` |
 | **Volume Processor GUI** | One-button processing pipeline | `python -m rspace3d.volume_builder_gui` |
-| **Volume Processor CLI** | Scriptable processing | `python scripts/volume_process.py folder [options]` |
+| **Volume Processor CLI** | Scriptable processing | `python -m rspace3d.volume_process folder [options]` |
 | **dcunwarp Generator** | Create CrysAlisPro layer lists | `python -m rspace3d.make_dcunwarp lmin lmax step [res]` |
 
 ## Python API
@@ -247,12 +247,11 @@ rspace3d/
     __init__.py              # Package init, public API
     rsp_reader.py            # Read single .img files, compute Miller grids
     volume_builder.py        # Core: load, bin, reject, symmetrize, save
+    volume_process.py        # CLI volume processor
     rsp_viewer.py    # GUI: unified viewer (.img/.cbf/.h5)
     volume_builder_gui.py     # GUI: one-button volume processor
     volume_isosurface.py     # 3D isosurface (PyVista/Plotly)
     make_dcunwarp.py         # Generate CrysAlisPro layer lists
-scripts/
-    volume_process.py        # CLI volume processor
 notebooks/
     volume_analysis.ipynb    # Jupyter notebook for analysis
 docs/

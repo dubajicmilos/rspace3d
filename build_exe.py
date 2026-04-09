@@ -29,7 +29,7 @@ APPS = [
     },
     {
         'name': 'rspace3d-process',
-        'script': 'scripts/volume_process.py',
+        'script': 'rspace3d/volume_process.py',
         'icon': None,
         'console': True,
     },
