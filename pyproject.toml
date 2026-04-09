@@ -32,15 +32,18 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
-3d = ["pyvista"]
+viz3d = ["pyvista"]
 plotly = ["plotly"]
 all = ["cupy-cuda12x", "pyvista", "plotly"]
 
 [project.scripts]
-rspace3d-process = "scripts.volume_process:main"
+rspace3d-process = "rspace3d.volume_process:main"
 rspace3d-viewer = "rspace3d.rsp_viewer:main"
 rspace3d-builder = "rspace3d.volume_builder_gui:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/rspace3d"
-Documentation = "https://github.com/yourusername/rspace3d#readme"
+Homepage = "https://github.com/dubajicmilos/rspace3d"
+Documentation = "https://github.com/dubajicmilos/rspace3d#readme"
+
+[tool.setuptools]
+packages = ["rspace3d"]
