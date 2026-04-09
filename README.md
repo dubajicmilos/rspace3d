@@ -20,7 +20,7 @@ CrysAlisPro does not offer a reliable way to extract full 3D reciprocal space da
 ### From source
 
 ```bash
-git clone https://github.com/yourusername/rspace3d.git
+git clone https://github.com/dubajicmilos/rspace3d.git
 cd rspace3d
 pip install -e .
 ```
@@ -35,7 +35,7 @@ pip install plotly           # Alternative 3D (browser-based)
 
 ### Standalone executables
 
-Download from [Releases](https://github.com/yourusername/rspace3d/releases) — no Python installation needed:
+Download from [Releases](https://github.com/dubajicmilos/rspace3d/releases) — no Python installation needed:
 
 - **rspace3d-viewer.exe** — View .img files and .h5 volumes
 - **rspace3d-builder.exe** — One-button volume processing
