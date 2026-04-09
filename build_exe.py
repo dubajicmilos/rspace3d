@@ -6,9 +6,9 @@ Usage:
     python build_exe.py
 
 Creates dist/ folder with:
-    rspace3d-viewer.exe    — Unified viewer (single .img / .h5 volumes)
-    rspace3d-processor.exe — One-button volume processor
-    rspace3d-process.exe   — Command-line processor
+    rspace3d-viewer.exe   — Unified viewer (single .img / .h5 volumes)
+    rspace3d-builder.exe  — One-button volume processor GUI
+    rspace3d-process.exe  — Command-line processor
 """
 
 import subprocess
@@ -17,13 +17,13 @@ import sys
 APPS = [
     {
         'name': 'rspace3d-viewer',
-        'script': 'rspace3d/rsp_unified_viewer.py',
+        'script': 'rspace3d/rsp_viewer.py',
         'icon': None,
         'console': False,
     },
     {
-        'name': 'rspace3d-processor',
-        'script': 'rspace3d/volume_gui_simple.py',
+        'name': 'rspace3d-builder',
+        'script': 'rspace3d/volume_builder_gui.py',
         'icon': None,
         'console': False,
     },
