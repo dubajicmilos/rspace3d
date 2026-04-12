@@ -287,9 +287,16 @@ def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
 
     # Keep int32 if input is integer, else float32
     if np.issubdtype(trimmed.dtype, np.integer):
-        acc = trimmed.astype(np.int64).reshape(
-            nh_t // bh, bh, nk_t // bk, bk, nl_t // bl, bl)
-        binned = (acc.sum(axis=(1, 3, 5)) // (bh * bk * bl)).astype(np.int32)
+        # Sum one axis at a time to avoid allocating the full volume as int64.
+        # Each sum reduces the array before the next upcast+sum.
+        acc = trimmed.reshape(nh_t // bh, bh, nk_t, nl_t)
+        acc = acc.sum(axis=1, dtype=np.int64)       # (nh_new, nk_t, nl_t)
+        acc = acc.reshape(nh_t // bh, nk_t // bk, bk, nl_t)
+        acc = acc.sum(axis=2)                        # (nh_new, nk_new, nl_t)
+        if bl > 1:
+            acc = acc.reshape(nh_t // bh, nk_t // bk, nl_t // bl, bl)
+            acc = acc.sum(axis=3)                    # (nh_new, nk_new, nl_new)
+        binned = (acc // (bh * bk * bl)).astype(np.int32)
     else:
         binned = trimmed.reshape(
             nh_t // bh, bh, nk_t // bk, bk, nl_t // bl, bl
