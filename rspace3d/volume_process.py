@@ -71,7 +71,7 @@ def main():
 
     def _num(f):
         try: return int(f.rsplit('_', 1)[1].split('.')[0])
-        except: return 0
+        except (ValueError, IndexError): return 0
     sorted_f = sorted(img_files, key=_num)
     n = len(sorted_f)
 
