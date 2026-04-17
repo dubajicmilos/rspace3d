@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from scipy.ndimage import map_coordinates
 
-from .rsp_reader import _PLANE_CONFIG, read_rsp_layer
+from .rsp_reader import _PLANE_CONFIG, compute_plane_M_inv, read_rsp_layer
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -209,28 +209,6 @@ def cell_from_ub(ub: npt.NDArray[np.float64],
     }
 
 
-def compute_plane_M_inv(ub: npt.NDArray[np.float64],
-                        wavelength: float,
-                        plane_type: str) -> npt.NDArray[np.float64]:
-    """Compute the 2x2 M_inv matrix for any plane type from the UB matrix.
-
-    Uses the raw reciprocal vectors (not projected perpendicular to
-    fixed axis) to match CrysAlisPro's pixel grid convention.
-    """
-    cfg = _PLANE_CONFIG[plane_type]
-    recip = ub / wavelength
-    v1 = recip[:, cfg['vec1_col']]
-    v2 = recip[:, cfg['vec2_col']]
-
-    e_x = v1 / np.linalg.norm(v1)
-    v2_perp = v2 - np.dot(v2, e_x) * e_x
-    e_y = v2_perp / np.linalg.norm(v2_perp)
-
-    M = np.array([[np.dot(v1, e_x), np.dot(v2, e_x)],
-                   [np.dot(v1, e_y), np.dot(v2, e_y)]])
-    return np.linalg.inv(M)
-
-
 def compute_1d_axes(
     header: dict[str, Any],
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
@@ -348,6 +326,47 @@ def _filter_numbered_imgs(folder: str) -> list[str]:
     main_prefix = prefix_counts.most_common(1)[0][0]
 
     return [f for f in all_numbered if f.rsplit('_', 1)[0] == main_prefix]
+
+
+def _img_number(fname: str) -> int:
+    """Parse trailing number from an .img filename for numeric sorting.
+
+    e.g. "MAPbI2Br_293K_1_42.img" -> 42. Returns 0 on parse failure.
+    """
+    try:
+        return int(fname.rsplit('_', 1)[1].split('.')[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def resolve_unit_cell(
+    folder: str,
+    header: dict[str, Any],
+) -> tuple[dict[str, float], str | None]:
+    """Resolve unit cell from par file (primary) or .img header UB (fallback).
+
+    Parameters
+    ----------
+    folder : str
+        Unwarp folder to search for a .par file.
+    header : dict
+        Header dict from `_read_header_fast` (needs 'ub' and 'wavelength').
+
+    Returns
+    -------
+    (cell, par_path)
+        `cell` has keys a, b, c, alpha, beta, gamma. `par_path` is the path
+        to the .par file that was used (for logging), or None if the cell
+        was computed from the .img header UB.
+    """
+    par_path = find_par_file(folder)
+    cell: dict[str, float] | None = None
+    if par_path:
+        cell = read_par_cell(par_path)
+    if cell is None:
+        cell = cell_from_ub(header['ub'], header['wavelength'])
+        return cell, None
+    return cell, par_path
 
 
 def scan_unwarp_folder(folder: str) -> list[tuple[str, float]]:

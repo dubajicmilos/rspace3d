@@ -110,6 +110,43 @@ def _prepare_data(
     return data, H, K, L
 
 
+def _build_plotly_figure(
+    data: npt.NDArray[np.float32],
+    H: npt.NDArray[np.floating],
+    K: npt.NDArray[np.floating],
+    L: npt.NDArray[np.floating],
+    isovalue: float | list[float] | None,
+    colormap: str,
+    opacity: float,
+    title: str,
+    size: tuple[int, int],
+) -> Any:
+    """Build a Plotly isosurface figure (shared by both Plotly entry points)."""
+    import plotly.graph_objects as go
+
+    HH, KK, LL = np.meshgrid(H, K, L, indexing='ij')
+    isovalues = isovalue if isinstance(isovalue, (list, tuple)) else [isovalue]
+
+    fig = go.Figure()
+    for iso in isovalues:
+        fig.add_trace(go.Isosurface(
+            x=HH.flatten(), y=KK.flatten(), z=LL.flatten(),
+            value=data.flatten(),
+            isomin=iso, isomax=iso,
+            surface_count=1, opacity=opacity, colorscale=colormap,
+            caps=dict(x_show=False, y_show=False, z_show=False),
+            showscale=False,
+        ))
+
+    fig.update_layout(
+        title=title,
+        scene=dict(xaxis_title='h', yaxis_title='k', zaxis_title='l',
+                   aspectmode='data'),
+        width=size[0], height=size[1],
+    )
+    return fig
+
+
 def _plot_plotly(
     data: npt.NDArray[np.float32],
     H: npt.NDArray[np.floating],
@@ -122,45 +159,11 @@ def _plot_plotly(
     save_html: str | None,
 ) -> None:
     """Plotly-based isosurface (interactive, browser)."""
-    import plotly.graph_objects as go
-
-    # Create meshgrid for Plotly (needs flat arrays)
-    HH, KK, LL = np.meshgrid(H, K, L, indexing='ij')
-
-    isovalues = isovalue if isinstance(isovalue, (list, tuple)) else [isovalue]
-
-    fig = go.Figure()
-
-    for iso in isovalues:
-        fig.add_trace(go.Isosurface(
-            x=HH.flatten(),
-            y=KK.flatten(),
-            z=LL.flatten(),
-            value=data.flatten(),
-            isomin=iso,
-            isomax=iso,
-            surface_count=1,
-            opacity=opacity,
-            colorscale=colormap,
-            caps=dict(x_show=False, y_show=False, z_show=False),
-            showscale=False,
-        ))
-
-    fig.update_layout(
-        title=title,
-        scene=dict(
-            xaxis_title='h',
-            yaxis_title='k',
-            zaxis_title='l',
-            aspectmode='data',
-        ),
-        width=900, height=700,
-    )
-
+    fig = _build_plotly_figure(data, H, K, L, isovalue, colormap, opacity,
+                                title, size=(900, 700))
     if save_html:
         fig.write_html(save_html)
         print(f'Saved: {save_html}')
-
     fig.show()
 
 
@@ -409,29 +412,8 @@ def plot_isosurface_notebook(
     if title is None:
         title = f'Isosurface at I={isovalue:.0f}'
 
-    import plotly.graph_objects as go
-
-    HH, KK, LL = np.meshgrid(H, K, L, indexing='ij')
-    isovalues = isovalue if isinstance(isovalue, (list, tuple)) else [isovalue]
-
-    fig = go.Figure()
-    for iso in isovalues:
-        fig.add_trace(go.Isosurface(
-            x=HH.flatten(), y=KK.flatten(), z=LL.flatten(),
-            value=data.flatten(),
-            isomin=iso, isomax=iso,
-            surface_count=1, opacity=opacity, colorscale=colormap,
-            caps=dict(x_show=False, y_show=False, z_show=False),
-            showscale=False,
-        ))
-
-    fig.update_layout(
-        title=title,
-        scene=dict(xaxis_title='h', yaxis_title='k', zaxis_title='l',
-                    aspectmode='data'),
-        width=800, height=600,
-    )
-    return fig
+    return _build_plotly_figure(data, H, K, L, isovalue, colormap, opacity,
+                                 title, size=(800, 600))
 
 
 # ──────────────────────────────────────────────────────────

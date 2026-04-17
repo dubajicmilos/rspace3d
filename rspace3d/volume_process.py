@@ -27,8 +27,8 @@ import time
 from rspace3d.volume_builder import (
     load_unwarp_folder, bin_volume,
     reject_outliers, symmetrize_volume,
-    save_volume_h5, find_par_file, read_par_cell, cell_from_ub,
-    _read_header_fast, _filter_numbered_imgs,
+    save_volume_h5, resolve_unit_cell,
+    _read_header_fast, _filter_numbered_imgs, _img_number,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
 
@@ -71,10 +71,7 @@ def main() -> None:
         print(f'Error: no numbered .img files found in {folder}')
         sys.exit(1)
 
-    def _num(f: str) -> int:
-        try: return int(f.rsplit('_', 1)[1].split('.')[0])
-        except (ValueError, IndexError): return 0
-    sorted_f = sorted(img_files, key=_num)
+    sorted_f = sorted(img_files, key=_img_number)
     n = len(sorted_f)
 
     # Prefix for output filenames
@@ -99,17 +96,12 @@ def main() -> None:
     print(f'  Fixed:   {l_min:.3f} to {l_max:.3f} (step {l_step:.4f})')
 
     # Unit cell from par file (primary) or .img header (fallback)
-    par_path = find_par_file(folder)
-    cell = None
+    cell, par_path = resolve_unit_cell(folder, hdr)
     if par_path:
         print(f'  Par:     {os.path.basename(par_path)}')
-        cell = read_par_cell(par_path)
-    if cell is None:
-        cell = cell_from_ub(hdr['ub'], hdr['wavelength'])
-    if cell:
-            print(f'  Cell:    a={cell["a"]:.5f}  b={cell["b"]:.5f}  c={cell["c"]:.5f} A')
-            print(f'           alpha={cell["alpha"]:.3f}  beta={cell["beta"]:.3f}  '
-                  f'gamma={cell["gamma"]:.3f} deg')
+    print(f'  Cell:    a={cell["a"]:.5f}  b={cell["b"]:.5f}  c={cell["c"]:.5f} A')
+    print(f'           alpha={cell["alpha"]:.3f}  beta={cell["beta"]:.3f}  '
+          f'gamma={cell["gamma"]:.3f} deg')
 
     print(f'  Laue:    {args.laue} ({_EXPECTED_ORDERS[args.laue]} ops)')
     print(f'  Sigma:   {args.sigma}  |  Iterations: {args.iter}')
