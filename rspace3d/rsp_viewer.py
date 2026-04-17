@@ -16,10 +16,10 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
     QSplitter, QToolBar, QStatusBar, QFileDialog, QComboBox,
     QDoubleSpinBox, QCheckBox, QLabel, QPushButton, QSlider,
-    QStackedWidget, QDialog, QTextEdit, QDialogButtonBox,
+    QDialog, QTextEdit, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction

@@ -746,23 +746,6 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
     )
 
 
-def _to_hkl(H_vals, K_vals, L_vals, axis_map):
-    """Convert volume coordinates to standard (h, k, l)."""
-    result = [None, None, None]
-    for vol_ax, std_ax in axis_map.items():
-        idx = {'h': 0, 'k': 1, 'l': 2}[std_ax]
-        result[idx] = {'H': H_vals, 'K': K_vals, 'L': L_vals}[vol_ax]
-    return result
-
-
-def _from_hkl(h, k, l, axis_map):
-    """Convert standard (h, k, l) back to volume coordinates."""
-    std_vals = {'h': h, 'k': k, 'l': l}
-    return (std_vals[axis_map['H']],
-            std_vals[axis_map['K']],
-            std_vals[axis_map['L']])
-
-
 # ──────────────────────────────────────────────────────────────────
 # Outlier rejection
 # ──────────────────────────────────────────────────────────────────
@@ -1216,20 +1199,6 @@ def load_volume_h5(path: str) -> VolumeData:
     return VolumeData(
         intensity=intensity, H=H, K=K, L=L,
         plane_type=plane_type, metadata=metadata,
-    )
-
-
-def save_volume_npz(path: str, vol: VolumeData):
-    """Save volume as compressed .npz file."""
-    np.savez_compressed(
-        path, intensity=vol.intensity,
-        H=vol.H, K=vol.K, L=vol.L,
-        plane_type=np.array(vol.plane_type),
-        wavelength=vol.metadata.get('wavelength', 0),
-        laue_group=np.array(vol.metadata.get('laue_group', '')),
-        source_folder=np.array(vol.metadata.get('source_folder', '')),
-        bin_xy=vol.metadata.get('bin_xy', 1),
-        bin_z=vol.metadata.get('bin_z', 1),
     )
 
 

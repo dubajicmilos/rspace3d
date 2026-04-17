@@ -20,12 +20,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QFormLayout, QPushButton, QLabel, QComboBox,
     QSpinBox, QDoubleSpinBox, QProgressBar, QFileDialog,
-    QStatusBar, QTextEdit, QMessageBox,
+    QTextEdit, QMessageBox,
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .volume_builder import (
-    VolumeData, load_unwarp_folder, bin_volume,
+    load_unwarp_folder, bin_volume,
     reject_outliers, symmetrize_volume,
     save_volume_h5, _read_header_fast,
     find_par_file, read_par_cell, cell_from_ub, _filter_numbered_imgs,
@@ -274,9 +274,8 @@ class SimpleVolumeGUI(QMainWindow):
             except: return 0
         sorted_f = sorted(img_files, key=_num)
 
-        # Store prefix for output filenames
-        self._img_prefix = sorted_f[0].rsplit('_', 1)[0]
-        self._log(f'Prefix: {self._img_prefix} ({n} files)')
+        img_prefix = sorted_f[0].rsplit('_', 1)[0]
+        self._log(f'Prefix: {img_prefix} ({n} files)')
 
         hdr = _read_header_fast(os.path.join(folder, sorted_f[0]))
         nx, ny = hdr['nx'], hdr['ny']
@@ -313,9 +312,6 @@ class SimpleVolumeGUI(QMainWindow):
         self._log(f'Raw volume: {nx} x {ny} x {n} = {raw_mb:.0f} MB')
         self._log(f'Binned 2x2: {nx2} x {ny2} x {n} = {bin_mb:.0f} MB')
 
-        self._file_count = n
-        self._frame_nx = nx
-        self._frame_ny = ny
         self.process_btn.setEnabled(True)
 
     # ── Generate dcunwarp ──
