@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from scipy.ndimage import map_coordinates
 
+from .rsp_reader import _PLANE_CONFIG
+
 
 # ──────────────────────────────────────────────────────────────────
 # Data structures
@@ -227,13 +229,6 @@ def compute_plane_M_inv(ub: npt.NDArray[np.float64],
     M = np.array([[np.dot(v1, e_x), np.dot(v2, e_x)],
                    [np.dot(v1, e_y), np.dot(v2, e_y)]])
     return np.linalg.inv(M)
-
-
-_PLANE_CONFIG = {
-    'HK': {'vec1_col': 0, 'vec2_col': 1},
-    'HL': {'vec1_col': 0, 'vec2_col': 2},
-    'KL': {'vec1_col': 1, 'vec2_col': 2},
-}
 
 
 def compute_1d_axes(
