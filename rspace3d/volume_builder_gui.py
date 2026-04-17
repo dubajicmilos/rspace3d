@@ -30,8 +30,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from .volume_builder import (
     load_unwarp_folder, bin_volume,
     reject_outliers, symmetrize_volume,
-    save_volume_h5, _read_header_fast,
-    find_par_file, read_par_cell, cell_from_ub, _filter_numbered_imgs,
+    save_volume_h5, _read_header_fast, resolve_unit_cell,
+    _filter_numbered_imgs, _img_number,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
 from .make_dcunwarp import generate_dcunwarp
@@ -272,10 +272,7 @@ class SimpleVolumeGUI(QMainWindow):
             self.process_btn.setEnabled(False)
             return
 
-        def _num(f: str) -> int:
-            try: return int(f.rsplit('_', 1)[1].split('.')[0])
-            except (ValueError, IndexError): return 0
-        sorted_f = sorted(img_files, key=_num)
+        sorted_f = sorted(img_files, key=_img_number)
 
         img_prefix = sorted_f[0].rsplit('_', 1)[0]
         self._log(f'Prefix: {img_prefix} ({n} files)')
@@ -291,13 +288,10 @@ class SimpleVolumeGUI(QMainWindow):
                 f'Fixed axis: {l_min:.3f} to {l_max:.3f} (step {l_step:.4f})')
 
         # Unit cell: try par file first, fall back to .img header UB
-        par_path = find_par_file(folder)
-        cell = None
+        cell, par_path = resolve_unit_cell(folder, hdr)
         if par_path:
             self._log(f'Par file: {os.path.basename(par_path)}')
-            cell = read_par_cell(par_path)
-        if cell is None:
-            cell = cell_from_ub(hdr['ub'], hdr['wavelength'])
+        else:
             self._log('Cell computed from .img header UB matrix')
 
         info += (f'\nCell: a={cell["a"]:.5f}  b={cell["b"]:.5f}  '

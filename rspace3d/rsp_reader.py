@@ -109,8 +109,7 @@ def read_rsp_layer(filename: str,
 
     # --- Compute Miller index grids ---
     idx1, idx2, M_inv, s, cx, cy, step_idx1, step_idx2 = _compute_index_grid(
-        UB, wavelength, d_min, NX, NY,
-        cfg['vec1_col'], cfg['vec2_col']
+        UB, wavelength, d_min, NX, NY, plane_type
     )
 
     # --- Read intensity ---
@@ -168,14 +167,38 @@ def _detect_plane_type(header: bytes) -> str:
         return 'HK'  # default
 
 
+def compute_plane_M_inv(ub: npt.NDArray[np.float64],
+                        wavelength: float,
+                        plane_type: str) -> npt.NDArray[np.float64]:
+    """Compute the 2x2 M_inv matrix for any plane type from the UB matrix.
+
+    Uses the raw reciprocal vectors (not projected perpendicular to
+    fixed axis) to match CrysAlisPro's pixel grid convention. Works for
+    any unit cell including triclinic (handles shear).
+    """
+    cfg = _PLANE_CONFIG[plane_type]
+    recip = ub / wavelength
+    v1 = recip[:, cfg['vec1_col']]
+    v2 = recip[:, cfg['vec2_col']]
+
+    # Orthonormal basis in the v1-v2 plane (no projection onto fixed axis)
+    e_x = v1 / np.linalg.norm(v1)
+    v2_perp = v2 - np.dot(v2, e_x) * e_x
+    e_y = v2_perp / np.linalg.norm(v2_perp)
+
+    # 2x2 transformation matrix: (x, y) = M @ (idx1, idx2)
+    M = np.array([[np.dot(v1, e_x), np.dot(v2, e_x)],
+                   [np.dot(v1, e_y), np.dot(v2, e_y)]])
+    return np.linalg.inv(M)
+
+
 def _compute_index_grid(
     UB: npt.NDArray[np.float64],
     wavelength: float,
     d_min: float,
     NX: int,
     NY: int,
-    vec1_col: int,
-    vec2_col: int,
+    plane_type: str,
 ) -> tuple[
     npt.NDArray[np.float64],  # idx1
     npt.NDArray[np.float64],  # idx2
@@ -186,35 +209,18 @@ def _compute_index_grid(
     float,  # step_idx1
     float,  # step_idx2
 ]:
-    """Compute Miller index grids for two free axes.
+    """Compute Miller index grids and step sizes for a given plane.
 
-    Builds a 2D orthonormal basis in the plane of the two free
-    reciprocal vectors (v1, v2), then constructs the 2x2 transformation
-    matrix M that maps Miller indices to Cartesian pixel coordinates.
-
-    CrysAlisPro uses the raw reciprocal vectors (NOT projected
-    perpendicular to the fixed axis) to define the image plane.
-    This matters for monoclinic/triclinic cells where the fixed
-    axis is not perpendicular to the free axes.
-
-    Works for any unit cell including triclinic (handles shear).
+    Delegates the raw-vector 2x2 M_inv build to `compute_plane_M_inv`,
+    then adds the pixel meshgrid, Cartesian step, and per-axis display
+    step sizes.
     """
-    # Reciprocal lattice vectors (standard 1/Angstrom)
+    cfg = _PLANE_CONFIG[plane_type]
     recip = UB / wavelength
-    v1 = recip[:, vec1_col]
-    v2 = recip[:, vec2_col]
+    v1 = recip[:, cfg['vec1_col']]
+    v2 = recip[:, cfg['vec2_col']]
 
-    # Orthonormal basis in the v1-v2 plane (no projection onto fixed axis)
-    e_x = v1 / np.linalg.norm(v1)
-    v2_perp = v2 - np.dot(v2, e_x) * e_x
-    e_y = v2_perp / np.linalg.norm(v2_perp)
-
-    # 2x2 transformation matrix: (x, y) = M @ (idx1, idx2)
-    M = np.array([
-        [np.dot(v1, e_x), np.dot(v2, e_x)],
-        [np.dot(v1, e_y), np.dot(v2, e_y)]
-    ])
-    M_inv = np.linalg.inv(M)
+    M_inv = compute_plane_M_inv(UB, wavelength, plane_type)
 
     # Cartesian step
     s = 2.0 / (d_min * NX)
@@ -230,7 +236,10 @@ def _compute_index_grid(
     idx1 = M_inv[0, 0] * I * s + M_inv[0, 1] * J * s
     idx2 = M_inv[1, 0] * I * s + M_inv[1, 1] * J * s
 
-    # Diagonal step sizes for display
+    # Diagonal step sizes for display (rebuild orthonormal basis for e_y)
+    e_x = v1 / np.linalg.norm(v1)
+    e_y = (v2 - np.dot(v2, e_x) * e_x)
+    e_y /= np.linalg.norm(e_y)
     step_idx1 = float(s / np.linalg.norm(v1))
     step_idx2 = float(s / abs(np.dot(v2, e_y)))
 
