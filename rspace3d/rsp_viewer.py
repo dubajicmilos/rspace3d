@@ -243,6 +243,9 @@ class UnifiedViewer(QMainWindow):
 
         # Mouse tracking
         self.main_canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+        # Re-apply axis range on widget resize so the image stays centered
+        # (data limits are expanded to match the widget aspect ratio)
+        self.main_canvas.mpl_connect('resize_event', lambda e: self._apply_axis_range())
 
     # ──────────────────────────────────────────────────────────
     # File I/O
@@ -498,16 +501,13 @@ class UnifiedViewer(QMainWindow):
         self.main_ax.set_title(title, fontsize=13)
         self.main_ax.format_coord = lambda x, y: ''
 
-        if self._current_M_inv is not None:
-            self._set_miller_ticks()
-
-        self._apply_axis_range()
-
+        # Add colorbar BEFORE applying axis range so the widget aspect
+        # reflects the final layout (colorbar steals width from the axes).
         if self.cbar_check.isChecked():
             self.cbar = self.main_fig.colorbar(self.im, ax=self.main_ax,
                                                 fraction=0.046, pad=0.04)
-        if self.grid_check.isChecked():
-            self._draw_grid_lines()
+
+        self._apply_axis_range()
 
         self._update_clim()
         self.main_canvas.draw()
@@ -601,8 +601,32 @@ class UnifiedViewer(QMainWindow):
             rx, ry = self.xrange_spin.value(), self.yrange_spin.value()
             corners = [(-rx, -ry), (rx, -ry), (-rx, ry), (rx, ry)]
             cart = [self._miller_to_cart(i1, i2) for i1, i2 in corners]
-            self.main_ax.set_xlim(min(c[0] for c in cart), max(c[0] for c in cart))
-            self.main_ax.set_ylim(min(c[1] for c in cart), max(c[1] for c in cart))
+            x_lo, x_hi = min(c[0] for c in cart), max(c[0] for c in cart)
+            y_lo, y_hi = min(c[1] for c in cart), max(c[1] for c in cart)
+            # Expand limits so data aspect matches the axes-box widget aspect.
+            # With aspect='equal' + default adjustable='box', matplotlib would
+            # otherwise shrink the box and leave the image off-center. By giving
+            # matplotlib limits that already match the widget aspect, the box
+            # stays full-size and the image is centered.
+            try:
+                bbox = self.main_ax.get_window_extent()
+                widget_aspect = bbox.width / bbox.height
+                if widget_aspect > 0:
+                    dx, dy = x_hi - x_lo, y_hi - y_lo
+                    if dx / dy >= widget_aspect:
+                        # x is limiting — expand y
+                        pad = (dx / widget_aspect - dy) / 2
+                        y_lo -= pad
+                        y_hi += pad
+                    else:
+                        # y is limiting — expand x
+                        pad = (dy * widget_aspect - dx) / 2
+                        x_lo -= pad
+                        x_hi += pad
+            except Exception:
+                pass  # fallback: use unexpanded limits
+            self.main_ax.set_xlim(x_lo, x_hi)
+            self.main_ax.set_ylim(y_lo, y_hi)
             self._set_miller_ticks()
         else:
             # CBF: pixel range
