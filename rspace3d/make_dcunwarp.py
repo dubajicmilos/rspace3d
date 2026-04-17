@@ -16,6 +16,8 @@ Output:
     ...
 """
 
+from __future__ import annotations
+
 import numpy as np
 import sys
 from datetime import datetime
@@ -23,7 +25,13 @@ from datetime import datetime
 MAX_LAYERS_PER_FILE = 500
 
 
-def generate_dcunwarp(l_min, l_max, l_step, resolution=0.8, prefix='dcunwarp'):
+def generate_dcunwarp(
+    l_min: float,
+    l_max: float,
+    l_step: float,
+    resolution: float = 0.8,
+    prefix: str = 'dcunwarp',
+) -> list[str]:
     """Generate .dcunwarp file(s) for HK planes at varying l.
 
     Parameters

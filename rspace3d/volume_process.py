@@ -17,6 +17,8 @@ Options:
     --no-gpu  Force CPU even if GPU available
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys
@@ -30,7 +32,7 @@ from rspace3d.volume_builder import (
 )
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description='Process CrysAlisPro unwarp .img files into symmetrized 3D volume.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -69,7 +71,7 @@ def main():
         print(f'Error: no numbered .img files found in {folder}')
         sys.exit(1)
 
-    def _num(f):
+    def _num(f: str) -> int:
         try: return int(f.rsplit('_', 1)[1].split('.')[0])
         except (ValueError, IndexError): return 0
     sorted_f = sorted(img_files, key=_num)

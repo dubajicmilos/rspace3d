@@ -16,15 +16,27 @@ Usage:
     python volume_isosurface.py sample.h5 --iso 50
 """
 
+from __future__ import annotations
+
 import sys
+from typing import Any
 import numpy as np
-from .volume_builder import load_volume_h5
+import numpy.typing as npt
+from .volume_builder import VolumeData, load_volume_h5
 
 
-def plot_isosurface(vol, isovalue=None, method='plotly',
-                    colormap='plasma', opacity=0.6,
-                    h_range=None, k_range=None, l_range=None,
-                    title=None, save_html=None):
+def plot_isosurface(
+    vol: VolumeData | str,
+    isovalue: float | list[float] | None = None,
+    method: str = 'plotly',
+    colormap: str = 'plasma',
+    opacity: float = 0.6,
+    h_range: tuple[float, float] | None = None,
+    k_range: tuple[float, float] | None = None,
+    l_range: tuple[float, float] | None = None,
+    title: str | None = None,
+    save_html: str | None = None,
+) -> None:
     """Plot 3D isosurface of a reciprocal space volume.
 
     Parameters
@@ -67,7 +79,17 @@ def plot_isosurface(vol, isovalue=None, method='plotly',
         _plot_plotly(data, H, K, L, isovalue, colormap, opacity, title, save_html)
 
 
-def _prepare_data(vol, h_range, k_range, l_range):
+def _prepare_data(
+    vol: VolumeData,
+    h_range: tuple[float, float] | None,
+    k_range: tuple[float, float] | None,
+    l_range: tuple[float, float] | None,
+) -> tuple[
+    npt.NDArray[np.float32],
+    npt.NDArray[np.floating],
+    npt.NDArray[np.floating],
+    npt.NDArray[np.floating],
+]:
     """Crop volume to specified Miller index ranges."""
     data = vol.intensity.astype(np.float32)
     H, K, L = vol.H, vol.K, vol.L
@@ -88,7 +110,17 @@ def _prepare_data(vol, h_range, k_range, l_range):
     return data, H, K, L
 
 
-def _plot_plotly(data, H, K, L, isovalue, colormap, opacity, title, save_html):
+def _plot_plotly(
+    data: npt.NDArray[np.float32],
+    H: npt.NDArray[np.floating],
+    K: npt.NDArray[np.floating],
+    L: npt.NDArray[np.floating],
+    isovalue: float | list[float] | None,
+    colormap: str,
+    opacity: float,
+    title: str,
+    save_html: str | None,
+) -> None:
     """Plotly-based isosurface (interactive, browser)."""
     import plotly.graph_objects as go
 
@@ -132,7 +164,16 @@ def _plot_plotly(data, H, K, L, isovalue, colormap, opacity, title, save_html):
     fig.show()
 
 
-def _plot_pyvista(data, H, K, L, isovalue, colormap, opacity, title):
+def _plot_pyvista(
+    data: npt.NDArray[np.float32],
+    H: npt.NDArray[np.floating],
+    K: npt.NDArray[np.floating],
+    L: npt.NDArray[np.floating],
+    isovalue: float | list[float] | None,
+    colormap: str,
+    opacity: float,
+    title: str,
+) -> None:
     """PyVista-based isosurface with interactive controls.
 
     Features:
@@ -236,17 +277,17 @@ def _plot_pyvista(data, H, K, L, isovalue, colormap, opacity, title):
             print(f'isosurface rebuild failed: {e}', file=sys.stderr)
 
     pl = pv.Plotter()
-    pl.set_background('white')
+    pl.set_background('white')  # type: ignore[arg-type]
 
     # Initial render
     iso_scaled = initial_iso * scale if use_scaled else initial_iso
     contour = grid.contour([iso_scaled], scalars='intensity')
     if contour.n_points > 0:
-        pl.add_mesh(contour, opacity=opacity, cmap=colormap,
+        pl.add_mesh(contour, opacity=opacity, cmap=colormap,  # type: ignore[arg-type]
                     smooth_shading=True, show_scalar_bar=False,
                     name='isosurface')
 
-    slider_kw = dict(style='modern', title_height=0.015, tube_width=0.003)
+    slider_kw: dict[str, Any] = dict(style='modern', title_height=0.015, tube_width=0.003)
 
     # --- Isovalue slider (log scale) ---
     initial_log = np.log10(max(initial_iso, 0.1))
@@ -336,15 +377,22 @@ def _plot_pyvista(data, H, K, L, isovalue, colormap, opacity, title):
             pl.add_mesh(line, color=grid_color, opacity=grid_opacity,
                         line_width=grid_width)
 
-    pl.add_axes(xlabel='h', ylabel='k', zlabel='l',
+    pl.add_axes(xlabel='h', ylabel='k', zlabel='l',  # type: ignore[call-arg]
                 line_width=2, label_size=(0.15, 0.05))
     pl.camera_position = 'iso'
     pl.show()
 
 
-def plot_isosurface_notebook(vol, isovalue=None,
-                              h_range=None, k_range=None, l_range=None,
-                              colormap='plasma', opacity=0.6, title=None):
+def plot_isosurface_notebook(
+    vol: VolumeData | str,
+    isovalue: float | list[float] | None = None,
+    h_range: tuple[float, float] | None = None,
+    k_range: tuple[float, float] | None = None,
+    l_range: tuple[float, float] | None = None,
+    colormap: str = 'plasma',
+    opacity: float = 0.6,
+    title: str | None = None,
+):
     """Plotly isosurface optimized for Jupyter notebooks.
 
     Returns a Plotly Figure object for inline display.

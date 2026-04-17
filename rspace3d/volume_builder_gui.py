@@ -11,9 +11,12 @@ Usage:
     python volume_builder_gui.py
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import time
+from typing import Any, Callable
 import numpy as np
 
 from PyQt6.QtWidgets import (
@@ -44,18 +47,18 @@ class WorkerThread(QThread):
     error = pyqtSignal(str)
     log_msg = pyqtSignal(str)
 
-    def __init__(self, func, *args):
+    def __init__(self, func: Callable[..., Any], *args: Any) -> None:
         super().__init__()
         self.func = func
         self.args = args
 
-    def _emit_progress(self, current, total):
+    def _emit_progress(self, current: int, total: int) -> None:
         self.progress.emit(current, total)
 
-    def _emit_log(self, msg):
+    def _emit_log(self, msg: str) -> None:
         self.log_msg.emit(msg)
 
-    def run(self):
+    def run(self) -> None:
         try:
             result = self.func(*self.args)
             self.finished.emit(result)
@@ -70,12 +73,12 @@ class WorkerThread(QThread):
 
 class SimpleVolumeGUI(QMainWindow):
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle('3D Volume Processor')
         self.resize(700, 700)
-        self._worker = None
-        self._folder_path = None
+        self._worker: WorkerThread | None = None
+        self._folder_path: str | None = None
         self._build_ui()
 
         if HAS_GPU:
@@ -88,7 +91,7 @@ class SimpleVolumeGUI(QMainWindow):
         else:
             self._log('No GPU — using CPU')
 
-        self.statusBar().showMessage('Select an unwarp folder to begin')
+        self.statusBar().showMessage('Select an unwarp folder to begin')  # type: ignore[union-attr]
 
     def _build_ui(self):
         central = QWidget()
@@ -269,7 +272,7 @@ class SimpleVolumeGUI(QMainWindow):
             self.process_btn.setEnabled(False)
             return
 
-        def _num(f):
+        def _num(f: str) -> int:
             try: return int(f.rsplit('_', 1)[1].split('.')[0])
             except (ValueError, IndexError): return 0
         sorted_f = sorted(img_files, key=_num)
@@ -378,9 +381,17 @@ class SimpleVolumeGUI(QMainWindow):
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _do_process_all(self, folder, laue, sigma, niter, bin_xy, bin_z):
-        log = lambda msg: QThread.currentThread()._emit_log(msg)
-        cb = QThread.currentThread()._emit_progress
+    def _do_process_all(
+        self,
+        folder: str,
+        laue: str,
+        sigma: float,
+        niter: int,
+        bin_xy: int,
+        bin_z: int,
+    ) -> dict[str, str]:
+        log = lambda msg: QThread.currentThread()._emit_log(msg)  # type: ignore[union-attr]
+        cb = QThread.currentThread()._emit_progress  # type: ignore[union-attr]
         device = 'GPU' if HAS_GPU else 'CPU'
 
         # Derive base name from .img filename prefix
@@ -484,7 +495,7 @@ class SimpleVolumeGUI(QMainWindow):
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
 
-def main():
+def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName('3D Volume Processor')
     gui = SimpleVolumeGUI()
