@@ -21,8 +21,6 @@ import argparse
 import os
 import sys
 import time
-import re
-import numpy as np
 
 from rspace3d.volume_builder import (
     load_unwarp_folder, bin_volume,

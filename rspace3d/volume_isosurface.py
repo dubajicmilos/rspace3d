@@ -17,7 +17,7 @@ Usage:
 """
 
 import numpy as np
-from .volume_builder import VolumeData, load_volume_h5
+from .volume_builder import load_volume_h5
 
 
 def plot_isosurface(vol, isovalue=None, method='plotly',

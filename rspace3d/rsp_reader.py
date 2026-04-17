@@ -218,16 +218,6 @@ def _compute_index_grid(UB, wavelength, d_min, NX, NY,
     return idx1, idx2, M_inv, s, cx, cy, step_idx1, step_idx2
 
 
-def read_par_UB(par_filename):
-    """Read the UB matrix from a CrysAlisPro .par file."""
-    with open(par_filename, 'r', errors='replace') as f:
-        for line in f:
-            if line.startswith('CRYSTALLOGRAPHY UB '):
-                vals = [float(x) for x in line.split()[2:11]]
-                return np.array(vals).reshape(3, 3)
-    raise ValueError(f"No CRYSTALLOGRAPHY UB line found in {par_filename}")
-
-
 if __name__ == '__main__':
     import sys
     import glob
