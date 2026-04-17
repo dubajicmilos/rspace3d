@@ -10,6 +10,12 @@ Works with any unit cell (cubic to triclinic).
 
 __version__ = '0.1.0'
 
+# Rigaku Oxford detector type 8 ships with newer CrysAlisPro experiments but is
+# missing from fabio < 2026-04. Patch in place so .img reads don't KeyError.
+import fabio.OXDimage as _oxd  # noqa: E402
+_oxd.DETECTOR_TYPES.setdefault(8, "Rigaku Oxford detector type 8")
+del _oxd
+
 from .rsp_reader import read_rsp_layer, RSPLayer
 from .volume_builder import (
     VolumeData,
