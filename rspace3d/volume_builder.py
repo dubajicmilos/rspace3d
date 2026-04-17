@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from scipy.ndimage import map_coordinates
 
-from .rsp_reader import _PLANE_CONFIG
+from .rsp_reader import _PLANE_CONFIG, read_rsp_layer
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -410,8 +410,7 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
         progress_callback(n_files, n_files)
 
     # Compute full M_inv and cell from first file header
-    from .rsp_reader import read_rsp_layer as _read_layer
-    ref_layer = _read_layer(file_list[0][0])
+    ref_layer = read_rsp_layer(file_list[0][0])
     cell = cell_from_ub(ref_header['ub'], ref_header['wavelength'])
 
     par_path = find_par_file(folder)

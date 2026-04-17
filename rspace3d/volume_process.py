@@ -28,7 +28,8 @@ from rspace3d.volume_builder import (
     load_unwarp_folder, bin_volume,
     reject_outliers, symmetrize_volume,
     save_volume_h5, find_par_file, read_par_cell, cell_from_ub,
-    _read_header_fast, LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
+    _read_header_fast, _filter_numbered_imgs,
+    LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
 
 
@@ -65,7 +66,6 @@ def main() -> None:
         sys.exit(1)
 
     # Count files (filter to single prefix)
-    from rspace3d.volume_builder import _filter_numbered_imgs
     img_files = _filter_numbered_imgs(folder)
     if not img_files:
         print(f'Error: no numbered .img files found in {folder}')
