@@ -16,6 +16,7 @@ Usage:
     python volume_isosurface.py sample.h5 --iso 50
 """
 
+import sys
 import numpy as np
 from .volume_builder import load_volume_h5
 
@@ -222,14 +223,17 @@ def _plot_pyvista(data, H, K, L, isovalue, colormap, opacity, title):
             clipped = clipped.clip(normal='-z', origin=(0, 0, -state['l_clip']), invert=True)
 
         pl.remove_actor('isosurface')
+        # VTK's contour() can fail for degenerate isovalue/clip combinations
+        # (empty grid, out-of-range isovalue). Keep the viewer alive on those
+        # failures and log to stderr so the operator sees the cause.
         try:
             contour = clipped.contour([iso_scaled], scalars='intensity')
             if contour.n_points > 0:
                 pl.add_mesh(contour, opacity=opacity, cmap=colormap,
                             smooth_shading=True, show_scalar_bar=False,
                             name='isosurface')
-        except Exception:
-            pass
+        except (RuntimeError, ValueError) as e:
+            print(f'isosurface rebuild failed: {e}', file=sys.stderr)
 
     pl = pv.Plotter()
     pl.set_background('white')
