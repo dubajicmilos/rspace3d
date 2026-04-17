@@ -224,12 +224,9 @@ def compute_plane_M_inv(ub, wavelength, plane_type):
 
 
 _PLANE_CONFIG = {
-    'HK': {'vec1_col': 0, 'vec2_col': 1, 'fixed_col': 2,
-            'x_label': 'h', 'y_label': 'k', 'fixed_label': 'l'},
-    'HL': {'vec1_col': 0, 'vec2_col': 2, 'fixed_col': 1,
-            'x_label': 'h', 'y_label': 'l', 'fixed_label': 'k'},
-    'KL': {'vec1_col': 1, 'vec2_col': 2, 'fixed_col': 0,
-            'x_label': 'k', 'y_label': 'l', 'fixed_label': 'h'},
+    'HK': {'vec1_col': 0, 'vec2_col': 1},
+    'HL': {'vec1_col': 0, 'vec2_col': 2},
+    'KL': {'vec1_col': 1, 'vec2_col': 2},
 }
 
 
@@ -750,38 +747,6 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
 # Outlier rejection
 # ──────────────────────────────────────────────────────────────────
 
-def compute_outlier_stats(vol: VolumeData, laue_group: str) -> dict:
-    """Compute statistics to help choose sigma threshold.
-
-    Returns dict with percentiles and suggested sigma values.
-    """
-    vol_sym = symmetrize_volume(vol, laue_group)
-    residual = vol.intensity.astype(np.float32) - vol_sym.intensity
-
-    finite = np.isfinite(residual) & (residual != 0)
-    r = residual[finite]
-    med = np.median(r)
-    mad = np.median(np.abs(r - med))
-    robust_std = 1.4826 * mad
-
-    abs_r = np.abs(r)
-    return {
-        'median_residual': float(med),
-        'mad': float(mad),
-        'robust_std': float(robust_std),
-        'percentile_90': float(np.percentile(abs_r, 90)),
-        'percentile_95': float(np.percentile(abs_r, 95)),
-        'percentile_99': float(np.percentile(abs_r, 99)),
-        'percentile_999': float(np.percentile(abs_r, 99.9)),
-        'max_abs_residual': float(abs_r.max()),
-        'n_above_2sigma': int((abs_r > 2 * robust_std).sum()),
-        'n_above_3sigma': int((abs_r > 3 * robust_std).sum()),
-        'n_above_5sigma': int((abs_r > 5 * robust_std).sum()),
-        'n_total': int(finite.sum()),
-        'fraction_above_3sigma': float((abs_r > 3 * robust_std).sum() / len(r)),
-    }
-
-
 def reject_outliers(vol: VolumeData, laue_group: str,
                     sigma: float = 3.0, n_iter: int = 1,
                     progress_callback: Optional[Callable] = None,
@@ -991,7 +956,7 @@ def _extract_nonnat(vol, x_ax, y_ax, fixed_ax, vol_dim_fixed,
                     target_val, int_range, view_plane):
     """Non-native plane with cross-term correction and regridding."""
     data = vol.intensity.astype(np.float32)
-    H, K, L = vol.H, vol.K, vol.L
+    H, K = vol.H, vol.K
     nh, nk, nl = data.shape
     dh = H[1] - H[0] if nh > 1 else 1.0
     dk = K[1] - K[0] if nk > 1 else 1.0
@@ -1007,7 +972,6 @@ def _extract_nonnat(vol, x_ax, y_ax, fixed_ax, vol_dim_fixed,
             M_inv_HK = np.eye(2)
 
     s = vol.metadata.get('s', abs(dh / M_inv_HK[0, 0]))
-    cx = vol.metadata.get('cx', (nh + 1) / 2.0)
     cy = vol.metadata.get('cy', (nk + 1) / 2.0)
     h_cross = M_inv_HK[0, 1] * s
 
