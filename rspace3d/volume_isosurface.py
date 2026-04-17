@@ -55,7 +55,6 @@ def plot_isosurface(vol, isovalue=None, method='plotly',
         isovalue = float(np.percentile(nz, 50)) if len(nz) > 0 else 1.0
 
     if title is None:
-        cell = vol.metadata.get('cell')
         laue = vol.metadata.get('laue_group', '')
         title = f'Isosurface at I={isovalue:.0f}'
         if laue:

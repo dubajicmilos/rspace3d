@@ -44,16 +44,13 @@ class RSPLayer:
 _FIXED_OFFSETS = {'h': 864, 'k': 872, 'l': 880}
 _THICKNESS_MIN = {'h': 960, 'k': 968, 'l': 976}
 _THICKNESS_MAX = {'h': 992, 'k': 1000, 'l': 1008}
-_XAXIS_FLAGS = {'h': 896, 'k': 904}       # offset where =1.0 means this index is x-axis
-_YAXIS_FLAGS = {'k': 936, 'l': 944}       # offset where =1.0 means this index is y-axis
-
 # Plane configurations: which UB columns map to which axis
 _PLANE_CONFIG = {
-    'HK': {'vec1_col': 0, 'vec2_col': 1, 'fixed_col': 2,
+    'HK': {'vec1_col': 0, 'vec2_col': 1,
             'x_label': 'h', 'y_label': 'k', 'fixed_label': 'l'},
-    'HL': {'vec1_col': 0, 'vec2_col': 2, 'fixed_col': 1,
+    'HL': {'vec1_col': 0, 'vec2_col': 2,
             'x_label': 'h', 'y_label': 'l', 'fixed_label': 'k'},
-    'KL': {'vec1_col': 1, 'vec2_col': 2, 'fixed_col': 0,
+    'KL': {'vec1_col': 1, 'vec2_col': 2,
             'x_label': 'k', 'y_label': 'l', 'fixed_label': 'h'},
 }
 
@@ -107,7 +104,7 @@ def read_rsp_layer(filename, UB_override=None):
     # --- Compute Miller index grids ---
     idx1, idx2, M_inv, s, cx, cy, step_idx1, step_idx2 = _compute_index_grid(
         UB, wavelength, d_min, NX, NY,
-        cfg['vec1_col'], cfg['vec2_col'], cfg['fixed_col']
+        cfg['vec1_col'], cfg['vec2_col']
     )
 
     # --- Read intensity ---
@@ -166,7 +163,7 @@ def _detect_plane_type(header):
 
 
 def _compute_index_grid(UB, wavelength, d_min, NX, NY,
-                        vec1_col, vec2_col, fixed_col):
+                        vec1_col, vec2_col):
     """Compute Miller index grids for two free axes.
 
     Builds a 2D orthonormal basis in the plane of the two free

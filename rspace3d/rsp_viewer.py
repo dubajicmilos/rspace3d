@@ -852,7 +852,6 @@ class UnifiedViewer(QMainWindow):
         if self.vol is None:
             return
 
-        import numpy as np
         v = self.vol
         m = v.metadata
         nh, nk, nl = v.intensity.shape
