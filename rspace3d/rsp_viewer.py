@@ -10,9 +10,12 @@ Usage:
     python rsp_viewer.py volume.h5
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import numpy as np
+import numpy.typing as npt
 from scipy.ndimage import map_coordinates
 
 from PyQt6.QtWidgets import (
@@ -30,7 +33,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.colors import LogNorm, Normalize
 
-from .rsp_reader import read_rsp_layer
+from .rsp_reader import RSPLayer, read_rsp_layer
 from .volume_builder import VolumeData, load_volume_h5, compute_plane_M_inv, extract_volume_slice
 
 
@@ -44,30 +47,32 @@ COLORMAPS = [
 class UnifiedViewer(QMainWindow):
     """Single GUI for .img, .cbf, and .h5 reciprocal space data."""
 
-    def __init__(self, filename=None):
+    def __init__(self, filename: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle('Reciprocal Space Viewer')
         self.resize(1300, 850)
 
         # State
-        self.layer = None          # single .img
-        self.vol = None            # 3D volume
-        self._raw_data = None      # raw .cbf
-        self._display_data = None
-        self._y_flipped = False
-        self._mode = None          # 'img', 'cbf', 'vol'
+        self.layer: RSPLayer | None = None          # single .img
+        self.vol: VolumeData | None = None          # 3D volume
+        self._raw_data: npt.NDArray[np.float64] | None = None      # raw .cbf
+        self._display_data: npt.NDArray[np.floating] | None = None
+        self._y_flipped: bool = False
+        self._mode: str | None = None               # 'img', 'cbf', 'vol'
 
         # Grid/line state
-        self.grid_lines = []
+        self.grid_lines: list = []
         self.line_artist = None
-        self._line_start = None
-        self._cid_press = self._cid_drag = self._cid_release = None
+        self._line_start: tuple[float, float] | None = None
+        self._cid_press: int | None = None
+        self._cid_drag: int | None = None
+        self._cid_release: int | None = None
         self.im = None
         self.cbar = None
-        self.extent = None
-        self._current_M_inv = None
-        self._current_x_label = 'x'
-        self._current_y_label = 'y'
+        self.extent: list[float] | None = None
+        self._current_M_inv: npt.NDArray[np.float64] | None = None
+        self._current_x_label: str = 'x'
+        self._current_y_label: str = 'y'
 
         self._build_ui()
 
@@ -943,7 +948,7 @@ class UnifiedViewer(QMainWindow):
         dlg.exec()
 
 
-def main():
+def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName('RSP Viewer')
     fname = sys.argv[1] if len(sys.argv) > 1 else None

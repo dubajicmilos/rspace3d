@@ -5,12 +5,15 @@ volume_builder.py — Build, bin, outlier-reject, and symmetrize
 Reads .img headers directly for grid computation (no .par file needed).
 """
 
+from __future__ import annotations
+
 import numpy as np
+import numpy.typing as npt
 import os
 import struct
 import io
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Callable, Dict
+from typing import Any, Callable
 from scipy.ndimage import map_coordinates
 
 
@@ -21,26 +24,26 @@ from scipy.ndimage import map_coordinates
 @dataclass
 class VolumeData:
     """3D reciprocal space volume on a regular Miller index grid."""
-    intensity: np.ndarray     # (nh, nk, nl) — int32 (raw) or float32 (processed)
-    H: np.ndarray             # (nh,) 1D array of h values
-    K: np.ndarray             # (nk,) 1D array of k values
-    L: np.ndarray             # (nl,) 1D array of l values
-    plane_type: str           # 'HK', 'HL', or 'KL'
-    metadata: dict            # wavelength, UB, cell params, etc.
+    intensity: npt.NDArray[Any]          # (nh, nk, nl) — int32 raw or float32 processed
+    H: npt.NDArray[np.floating]          # (nh,) 1D array of h values
+    K: npt.NDArray[np.floating]          # (nk,) 1D array of k values
+    L: npt.NDArray[np.floating]          # (nl,) 1D array of l values
+    plane_type: str                      # 'HK', 'HL', or 'KL'
+    metadata: dict[str, Any]             # wavelength, UB, cell params, etc.
 
 
 # ──────────────────────────────────────────────────────────────────
 # Fast header reading
 # ──────────────────────────────────────────────────────────────────
 
-def _read_header_fast(path: str) -> dict:
+def _read_header_fast(path: str) -> dict[str, Any]:
     """Read minimal header fields from a CrysAlisPro .img file."""
     with open(path, 'rb') as f:
         raw = f.read(2330)
 
-    def u16(off):
+    def u16(off: int) -> int:
         return struct.unpack_from('<H', raw, off)[0]
-    def f64(off):
+    def f64(off: int) -> float:
         return struct.unpack_from('<d', raw, off)[0]
 
     nx = u16(278)
@@ -70,7 +73,7 @@ def _read_header_fast(path: str) -> dict:
     }
 
 
-def _read_intensity(path: str) -> np.ndarray:
+def _read_intensity(path: str) -> npt.NDArray[np.int32]:
     """Read intensity data from .img file using fabio (buffered).
     Returns int32 array (native format)."""
     from fabio.OXDimage import OxdImage
@@ -85,7 +88,7 @@ def _read_intensity(path: str) -> np.ndarray:
 # Par file reading
 # ──────────────────────────────────────────────────────────────────
 
-def find_par_file(unwarp_folder: str) -> Optional[str]:
+def find_par_file(unwarp_folder: str) -> str | None:
     """Find the .par file for an unwarp folder.
 
     Searches in this order:
@@ -114,7 +117,7 @@ def find_par_file(unwarp_folder: str) -> Optional[str]:
     return None
 
 
-def read_par_cell(par_filename: str) -> Optional[dict]:
+def read_par_cell(par_filename: str) -> dict[str, float] | None:
     """Read unit cell parameters from a CrysAlisPro .par file.
 
     Primary method: compute from CRYSTALLOGRAPHY UB matrix + wavelength.
@@ -125,10 +128,10 @@ def read_par_cell(par_filename: str) -> Optional[dict]:
     import re
 
     # Read UB matrix and wavelength from par file
-    ub = None
-    wavelength = None
+    ub: npt.NDArray[np.float64] | None = None
+    wavelength: float | None = None
 
-    def _strip_esd(s):
+    def _strip_esd(s: str) -> str:
         return re.sub(r'\([^)]*\)', '', s)
 
     with open(par_filename, 'r', errors='replace') as f:
@@ -141,9 +144,9 @@ def read_par_cell(par_filename: str) -> Optional[dict]:
                 parts = line.split()
                 try:
                     idx = parts.index('UB')
-                    vals = [float(x) for x in parts[idx + 1:idx + 10]]
-                    if len(vals) == 9:
-                        ub = np.array(vals).reshape(3, 3)
+                    ub_vals = [float(x) for x in parts[idx + 1:idx + 10]]
+                    if len(ub_vals) == 9:
+                        ub = np.array(ub_vals).reshape(3, 3)
                 except (ValueError, IndexError):
                     pass
 
@@ -160,9 +163,9 @@ def read_par_cell(par_filename: str) -> Optional[dict]:
                 parts = line.split()
                 try:
                     idx = parts.index('CELL')
-                    vals = parts[idx + 1:idx + 7]
-                    if len(vals) == 6:
-                        nums = [float(_strip_esd(v)) for v in vals]
+                    cell_strs = parts[idx + 1:idx + 7]
+                    if len(cell_strs) == 6:
+                        nums = [float(_strip_esd(v)) for v in cell_strs]
                         # Sanity check: a > 1 Angstrom
                         if nums[0] > 1.0:
                             return {
@@ -179,7 +182,8 @@ def read_par_cell(par_filename: str) -> Optional[dict]:
     return None
 
 
-def cell_from_ub(ub, wavelength):
+def cell_from_ub(ub: npt.NDArray[np.float64],
+                 wavelength: float) -> dict[str, float]:
     """Compute unit cell parameters from a UB matrix.
 
     The UB matrix from .img headers includes the lambda factor:
@@ -203,7 +207,9 @@ def cell_from_ub(ub, wavelength):
     }
 
 
-def compute_plane_M_inv(ub, wavelength, plane_type):
+def compute_plane_M_inv(ub: npt.NDArray[np.float64],
+                        wavelength: float,
+                        plane_type: str) -> npt.NDArray[np.float64]:
     """Compute the 2x2 M_inv matrix for any plane type from the UB matrix.
 
     Uses the raw reciprocal vectors (not projected perpendicular to
@@ -230,7 +236,9 @@ _PLANE_CONFIG = {
 }
 
 
-def compute_1d_axes(header: dict) -> Tuple[np.ndarray, np.ndarray]:
+def compute_1d_axes(
+    header: dict[str, Any],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Compute 1D Miller index axes from .img header.
 
     Uses raw reciprocal vectors (no projection) matching CrysAlisPro convention.
@@ -253,7 +261,7 @@ def compute_1d_axes(header: dict) -> Tuple[np.ndarray, np.ndarray]:
 # Binning utilities
 # ──────────────────────────────────────────────────────────────────
 
-def bin_2d(data: np.ndarray, by: int, bx: int) -> np.ndarray:
+def bin_2d(data: npt.NDArray[np.integer], by: int, bx: int) -> npt.NDArray[np.int32]:
     """Bin 2D array by averaging. Returns int32 (integer average)."""
     ny, nx = data.shape
     ny_t = (ny // by) * by
@@ -264,7 +272,7 @@ def bin_2d(data: np.ndarray, by: int, bx: int) -> np.ndarray:
             .sum(axis=(1, 3)) // (by * bx)).astype(np.int32)
 
 
-def bin_1d(arr: np.ndarray, b: int) -> np.ndarray:
+def bin_1d(arr: npt.NDArray[np.floating], b: int) -> npt.NDArray[np.floating]:
     """Bin a 1D array by averaging groups of b elements."""
     n = (len(arr) // b) * b
     return arr[:n].reshape(-1, b).mean(axis=1)
@@ -321,7 +329,7 @@ def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
 # Volume loading
 # ──────────────────────────────────────────────────────────────────
 
-def _filter_numbered_imgs(folder: str) -> List[str]:
+def _filter_numbered_imgs(folder: str) -> list[str]:
     """Return only numbered .img files sharing the most common prefix.
 
     Filters to {prefix}_{number}.img pattern, then groups by prefix and
@@ -347,7 +355,7 @@ def _filter_numbered_imgs(folder: str) -> List[str]:
     return [f for f in all_numbered if f.rsplit('_', 1)[0] == main_prefix]
 
 
-def scan_unwarp_folder(folder: str) -> List[Tuple[str, float]]:
+def scan_unwarp_folder(folder: str) -> list[tuple[str, float]]:
     """Scan folder for numbered .img files, return [(path, fixed_value)] sorted.
 
     Only loads files matching the pattern {prefix}_{number}.img with the
@@ -364,7 +372,7 @@ def scan_unwarp_folder(folder: str) -> List[Tuple[str, float]]:
 
 
 def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
-                       progress_callback: Optional[Callable] = None) -> VolumeData:
+                       progress_callback: Callable[[int, int], None] | None = None) -> VolumeData:
     """Load all .img files from unwarp folder into a 3D volume.
 
     Data is kept as int32 (native CrysAlisPro format) to save memory.
@@ -445,7 +453,10 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
 # Symmetry operations — all 11 Laue groups
 # ──────────────────────────────────────────────────────────────────
 
-def _generate_group(generators, max_iter=200):
+def _generate_group(
+    generators: list[npt.NDArray[np.int_]],
+    max_iter: int = 200,
+) -> list[npt.NDArray[np.int_]]:
     """Generate full point group from generator matrices."""
     ops = {tuple(np.eye(3, dtype=int).flatten())}
     queue = [g.astype(int) for g in generators]
@@ -494,10 +505,10 @@ _LAUE_GENERATORS = {
     'm-3m':   [_C3_111, _C4c, _INV],
 }
 
-_LAUE_GROUPS_CACHE: Dict[str, List[np.ndarray]] = {}
+_LAUE_GROUPS_CACHE: dict[str, list[npt.NDArray[np.int_]]] = {}
 
 
-def get_symmetry_operations(laue_group: str) -> List[np.ndarray]:
+def get_symmetry_operations(laue_group: str) -> list[npt.NDArray[np.int_]]:
     """Return list of 3x3 symmetry operation matrices for a Laue group."""
     if laue_group not in _LAUE_GROUPS_CACHE:
         if laue_group not in _LAUE_GENERATORS:
@@ -528,7 +539,7 @@ LAUE_GROUP_NAMES = {
 # Axis mapping helpers
 # ──────────────────────────────────────────────────────────────────
 
-def _get_axis_mapping(plane_type: str) -> dict:
+def _get_axis_mapping(plane_type: str) -> dict[str, str]:
     """Map volume axes (H,K,L) to standard (h,k,l).
     HK: H->h, K->k, L->l | HL: H->h, K->l, L->k | KL: H->k, K->l, L->h
     """
@@ -538,7 +549,10 @@ def _get_axis_mapping(plane_type: str) -> dict:
             }.get(plane_type, {'H': 'h', 'K': 'k', 'L': 'l'})
 
 
-def _build_axis_permutation(op, axis_map):
+def _build_axis_permutation(
+    op: npt.NDArray[np.int_],
+    axis_map: dict[str, str],
+) -> tuple[list[int], list[int]] | None:
     """For a symmetry operation, determine how it permutes volume axes.
 
     Returns (src_axes, signs) where for each volume dimension i:
@@ -557,7 +571,7 @@ def _build_axis_permutation(op, axis_map):
         vol_to_std[vol_ax] = std_idx
 
     # Convert vol_dim -> std_idx mapping
-    dim_to_std = [None, None, None]
+    dim_to_std: list[int] = [0, 0, 0]
     for vol_ax in ['H', 'K', 'L']:
         vol_dim = {'H': 0, 'K': 1, 'L': 2}[vol_ax]
         std_idx = {'h': 0, 'k': 1, 'l': 2}[axis_map[vol_ax]]
@@ -588,7 +602,7 @@ def _build_axis_permutation(op, axis_map):
 # GPU detection
 # ──────────────────────────────────────────────────────────────────
 
-def _has_gpu():
+def _has_gpu() -> bool:
     """Check if CuPy + CUDA GPU is available."""
     try:
         import cupy as cp
@@ -605,7 +619,11 @@ HAS_GPU = _has_gpu()
 # Precomputed operation maps (shared between sym & reject)
 # ──────────────────────────────────────────────────────────────────
 
-def _precompute_op_maps(vol, laue_group, xp=None):
+def _precompute_op_maps(
+    vol: VolumeData,
+    laue_group: str,
+    xp: Any = None,
+) -> list[tuple[list[Any], list[Any]] | None]:
     """Precompute 1D index maps for all operations. Works with numpy or cupy."""
     if xp is None:
         xp = np
@@ -616,7 +634,7 @@ def _precompute_op_maps(vol, laue_group, xp=None):
     sizes = [len(vol.H), len(vol.K), len(vol.L)]
     axis_map = _get_axis_mapping(vol.plane_type)
 
-    op_maps = []
+    op_maps: list[tuple[list[Any], list[Any]] | None] = []
     for op in ops:
         perm = _build_axis_permutation(op, axis_map)
         if perm is None:
@@ -636,7 +654,7 @@ def _precompute_op_maps(vol, laue_group, xp=None):
             idx_1d.append(xp.asarray(np.clip(src_idx, 0, sizes[sd] - 1)))
             valid_1d.append(xp.asarray(v))
 
-        inv_map = [None, None, None]
+        inv_map: list[int] = [0, 0, 0]
         for i in range(3):
             inv_map[src_dims[i]] = i
 
@@ -658,7 +676,12 @@ def _precompute_op_maps(vol, laue_group, xp=None):
 # Core symmetrization loop (works with numpy or cupy arrays)
 # ──────────────────────────────────────────────────────────────────
 
-def _symmetrize_core(data, op_maps, vol, xp=None):
+def _symmetrize_core(
+    data: Any,
+    op_maps: list[tuple[list[Any], list[Any]] | None],
+    vol: VolumeData,
+    xp: Any = None,
+) -> Any:
     """Run symmetrization using precomputed maps. xp = numpy or cupy.
 
     Memory-efficient: uses float32 accumulator + int16 count, deletes
@@ -701,8 +724,8 @@ def _symmetrize_core(data, op_maps, vol, xp=None):
 # ──────────────────────────────────────────────────────────────────
 
 def symmetrize_volume(vol: VolumeData, laue_group: str,
-                      progress_callback: Optional[Callable] = None,
-                      use_gpu: Optional[bool] = None) -> VolumeData:
+                      progress_callback: Callable[[int, int], None] | None = None,
+                      use_gpu: bool | None = None) -> VolumeData:
     """Symmetrize the 3D volume by averaging over all Laue group operations.
 
     Uses fast 1D index-map + broadcasting for signed-permutation ops.
@@ -749,8 +772,8 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
 
 def reject_outliers(vol: VolumeData, laue_group: str,
                     sigma: float = 3.0, n_iter: int = 1,
-                    progress_callback: Optional[Callable] = None,
-                    use_gpu: Optional[bool] = None) -> VolumeData:
+                    progress_callback: Callable[[int, int], None] | None = None,
+                    use_gpu: bool | None = None) -> VolumeData:
     """Reject outlier voxels using per-voxel symmetry-equivalent comparison.
 
     For each voxel, gathers intensities at ALL symmetry-equivalent
@@ -888,7 +911,21 @@ def reject_outliers(vol: VolumeData, laue_group: str,
 # Volume slice extraction (shared by all viewers)
 # ──────────────────────────────────────────────────────────────────
 
-def extract_volume_slice(vol, plane_index, target_val, int_range=0.0):
+def extract_volume_slice(
+    vol: VolumeData,
+    plane_index: int,
+    target_val: float,
+    int_range: float = 0.0,
+) -> tuple[
+    npt.NDArray[np.float32],     # slice_2d
+    npt.NDArray[np.floating],    # x_ax
+    npt.NDArray[np.floating],    # y_ax
+    str,                         # x_label
+    str,                         # y_label
+    str,                         # fixed_label
+    float,                       # actual_val
+    int,                         # n_slices
+]:
     """Extract a 2D slice from a 3D volume at a constant Miller index.
 
     Handles non-orthogonal grids (monoclinic) by interpolating at the
@@ -933,7 +970,12 @@ def extract_volume_slice(vol, plane_index, target_val, int_range=0.0):
     return sl, x_ax, y_ax, x_label, y_label, fixed_label, actual_val, n_slices
 
 
-def _extract_native(data, fixed_ax, target_val, int_range):
+def _extract_native(
+    data: npt.NDArray[Any],
+    fixed_ax: npt.NDArray[np.floating],
+    target_val: float,
+    int_range: float,
+) -> tuple[npt.NDArray[np.float32], float, int]:
     """Native plane (HK): direct pixel extraction."""
     if int_range < 1e-6:
         idx = int(np.argmin(np.abs(fixed_ax - target_val)))
@@ -944,7 +986,7 @@ def _extract_native(data, fixed_ax, target_val, int_range):
         lo, hi = target_val - int_range, target_val + int_range
         indices = np.where((fixed_ax >= lo) & (fixed_ax <= hi))[0]
         if len(indices) == 0:
-            indices = [int(np.argmin(np.abs(fixed_ax - target_val)))]
+            indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])
         actual_val = float(fixed_ax[indices[len(indices) // 2]])
         n_slices = len(indices)
         slab = data[:, :, indices].astype(np.float64).sum(axis=2)
@@ -952,8 +994,16 @@ def _extract_native(data, fixed_ax, target_val, int_range):
     return slab.T.astype(np.float32), actual_val, n_slices
 
 
-def _extract_nonnat(vol, x_ax, y_ax, fixed_ax, vol_dim_fixed,
-                    target_val, int_range, view_plane):
+def _extract_nonnat(
+    vol: VolumeData,
+    x_ax: npt.NDArray[np.floating],
+    y_ax: npt.NDArray[np.floating],
+    fixed_ax: npt.NDArray[np.floating],
+    vol_dim_fixed: int,
+    target_val: float,
+    int_range: float,
+    view_plane: str,
+) -> tuple[npt.NDArray[np.float32], float, int, npt.NDArray[np.floating]]:
     """Non-native plane with cross-term correction and regridding."""
     data = vol.intensity.astype(np.float32)
     H, K = vol.H, vol.K
@@ -985,7 +1035,7 @@ def _extract_nonnat(vol, x_ax, y_ax, fixed_ax, vol_dim_fixed,
         lo, hi = target_val - int_range, target_val + int_range
         indices = np.where((fixed_ax >= lo) & (fixed_ax <= hi))[0]
         if len(indices) == 0:
-            indices = [int(np.argmin(np.abs(fixed_ax - target_val)))]
+            indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])
         actual_val = float(fixed_ax[indices[len(indices) // 2]])
         target_vals = [fixed_ax[i] for i in indices]
         n_slices = len(target_vals)
@@ -1020,9 +1070,9 @@ def _extract_nonnat(vol, x_ax, y_ax, fixed_ax, vol_dim_fixed,
 
     else:
         idx = int(np.argmin(np.abs(fixed_ax - target_val)))
-        slab = data[:, :, idx].T
+        slab_native = data[:, :, idx].T
         actual_val = float(fixed_ax[idx])
-        return slab.astype(np.float32), actual_val, 1, x_ax
+        return slab_native.astype(np.float32), actual_val, 1, x_ax
 
     # Regrid to Cartesian
     ub = vol.metadata.get('ub')
@@ -1061,7 +1111,7 @@ def _extract_nonnat(vol, x_ax, y_ax, fixed_ax, vol_dim_fixed,
 # ──────────────────────────────────────────────────────────────────
 
 def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
-                   compression_level: int = 4):
+                   compression_level: int = 4) -> None:
     """Save volume as HDF5 file, MATLAB-compatible.
 
     Datasets: /data (3D intensity), /H, /K, /L (1D axes),

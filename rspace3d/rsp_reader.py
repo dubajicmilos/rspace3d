@@ -13,39 +13,44 @@ Usage:
     plt.pcolormesh(layer.idx1, layer.idx2, layer.intensity)
 """
 
+from __future__ import annotations
+
 import numpy as np
+import numpy.typing as npt
 import struct
 import io
 from dataclasses import dataclass
+from typing import Any
 from fabio.OXDimage import OxdImage
 
 
 @dataclass
 class RSPLayer:
     """Result of reading a reciprocal space layer .img file."""
-    intensity: np.ndarray   # (NY, NX) intensity array
-    idx1: np.ndarray        # (NY, NX) first free Miller index (x-axis)
-    idx2: np.ndarray        # (NY, NX) second free Miller index (y-axis)
-    fixed_value: float      # value of the fixed Miller index
-    plane_type: str         # 'HK', 'HL', or 'KL'
-    x_label: str            # label for x-axis, e.g. 'h'
-    y_label: str            # label for y-axis, e.g. 'k'
-    fixed_label: str        # label for fixed axis, e.g. 'l'
-    thickness: tuple        # (min, max) integration range of fixed index
-    M_inv: np.ndarray       # (2,2) pixel-to-Miller-index matrix (full, with cross-terms)
-    s: float                # Cartesian step (1/Angstrom per pixel)
-    cx: float               # grid center x (1-based pixel)
-    cy: float               # grid center y (1-based pixel)
-    step_idx1: float        # display step: r.l.u. per pixel along x (no cross-term)
-    step_idx2: float        # display step: r.l.u. per pixel along y (no cross-term)
+    intensity: npt.NDArray[np.int32]        # (NY, NX) intensity array
+    idx1: npt.NDArray[np.float64]           # (NY, NX) first free Miller index (x-axis)
+    idx2: npt.NDArray[np.float64]           # (NY, NX) second free Miller index (y-axis)
+    fixed_value: float                      # value of the fixed Miller index
+    plane_type: str                         # 'HK', 'HL', or 'KL'
+    x_label: str                            # label for x-axis, e.g. 'h'
+    y_label: str                            # label for y-axis, e.g. 'k'
+    fixed_label: str                        # label for fixed axis, e.g. 'l'
+    thickness: tuple[float, float]          # (min, max) integration range of fixed index
+    M_inv: npt.NDArray[np.float64]          # (2,2) pixel-to-Miller-index matrix (full, with cross-terms)
+    s: float                                # Cartesian step (1/Angstrom per pixel)
+    cx: float                               # grid center x (1-based pixel)
+    cy: float                               # grid center y (1-based pixel)
+    step_idx1: float                        # display step: r.l.u. per pixel along x (no cross-term)
+    step_idx2: float                        # display step: r.l.u. per pixel along y (no cross-term)
 
 
 # Header offsets for axis flags and fixed values
 _FIXED_OFFSETS = {'h': 864, 'k': 872, 'l': 880}
 _THICKNESS_MIN = {'h': 960, 'k': 968, 'l': 976}
 _THICKNESS_MAX = {'h': 992, 'k': 1000, 'l': 1008}
-# Plane configurations: which UB columns map to which axis
-_PLANE_CONFIG = {
+# Plane configurations: which UB columns map to which axis.
+# Mixed int/str values, so annotated as dict[str, Any] for mypy.
+_PLANE_CONFIG: dict[str, dict[str, Any]] = {
     'HK': {'vec1_col': 0, 'vec2_col': 1,
             'x_label': 'h', 'y_label': 'k', 'fixed_label': 'l'},
     'HL': {'vec1_col': 0, 'vec2_col': 2,
@@ -55,7 +60,8 @@ _PLANE_CONFIG = {
 }
 
 
-def read_rsp_layer(filename, UB_override=None):
+def read_rsp_layer(filename: str,
+                   UB_override: npt.NDArray[np.float64] | None = None) -> RSPLayer:
     """Read any CrysAlisPro reciprocal space .img file.
 
     Auto-detects cross-section type (HK, HL, KL) from header flags.
@@ -131,7 +137,7 @@ def read_rsp_layer(filename, UB_override=None):
     )
 
 
-def _detect_plane_type(header):
+def _detect_plane_type(header: bytes) -> str:
     """Detect cross-section type from header axis flags.
 
     Checks which axis flag offsets are set to 1.0:
@@ -162,8 +168,24 @@ def _detect_plane_type(header):
         return 'HK'  # default
 
 
-def _compute_index_grid(UB, wavelength, d_min, NX, NY,
-                        vec1_col, vec2_col):
+def _compute_index_grid(
+    UB: npt.NDArray[np.float64],
+    wavelength: float,
+    d_min: float,
+    NX: int,
+    NY: int,
+    vec1_col: int,
+    vec2_col: int,
+) -> tuple[
+    npt.NDArray[np.float64],  # idx1
+    npt.NDArray[np.float64],  # idx2
+    npt.NDArray[np.float64],  # M_inv
+    float,  # s
+    float,  # cx
+    float,  # cy
+    float,  # step_idx1
+    float,  # step_idx2
+]:
     """Compute Miller index grids for two free axes.
 
     Builds a 2D orthonormal basis in the plane of the two free
@@ -209,8 +231,8 @@ def _compute_index_grid(UB, wavelength, d_min, NX, NY,
     idx2 = M_inv[1, 0] * I * s + M_inv[1, 1] * J * s
 
     # Diagonal step sizes for display
-    step_idx1 = s / np.linalg.norm(v1)
-    step_idx2 = s / abs(np.dot(v2, e_y))
+    step_idx1 = float(s / np.linalg.norm(v1))
+    step_idx2 = float(s / abs(np.dot(v2, e_y)))
 
     return idx1, idx2, M_inv, s, cx, cy, step_idx1, step_idx2
 
