@@ -82,10 +82,6 @@ def _read_intensity(path: str) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Grid computation (from rsp_reader logic)
-# ──────────────────────────────────────────────────────────────────
-
-# ──────────────────────────────────────────────────────────────────
 # Par file reading
 # ──────────────────────────────────────────────────────────────────
 
@@ -290,12 +286,12 @@ def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
         # Sum one axis at a time to avoid allocating the full volume as int64.
         # Each sum reduces the array before the next upcast+sum.
         acc = trimmed.reshape(nh_t // bh, bh, nk_t, nl_t)
-        acc = acc.sum(axis=1, dtype=np.int64)       # (nh_new, nk_t, nl_t)
+        acc = acc.sum(axis=1, dtype=np.int64)
         acc = acc.reshape(nh_t // bh, nk_t // bk, bk, nl_t)
-        acc = acc.sum(axis=2)                        # (nh_new, nk_new, nl_t)
+        acc = acc.sum(axis=2)
         if bl > 1:
             acc = acc.reshape(nh_t // bh, nk_t // bk, nl_t // bl, bl)
-            acc = acc.sum(axis=3)                    # (nh_new, nk_new, nl_new)
+            acc = acc.sum(axis=3)
         binned = (acc // (bh * bk * bl)).astype(np.int32)
     else:
         binned = trimmed.reshape(
@@ -418,7 +414,6 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
     ref_layer = _read_layer(file_list[0][0])
     cell = cell_from_ub(ref_header['ub'], ref_header['wavelength'])
 
-    # Also try par file
     par_path = find_par_file(folder)
     if par_path:
         par_cell = read_par_cell(par_path)
@@ -689,13 +684,13 @@ def _symmetrize_core(data, op_maps, vol, xp=None):
             continue
         gi, gv = om
 
-        vals = data[gi[0], gi[1], gi[2]]         # (nh,nk,nl) float32 temp
-        mask = gv[0] & gv[1] & gv[2]             # broadcast bool, tiny
-        mask = mask & (vals != 0)                 # (nh,nk,nl) bool temp
-        vals *= mask                              # in-place zero unmeasured
-        sym_sum += vals                           # in-place accumulate
-        sym_count += mask                         # bool -> int16 in-place
-        del vals, mask                            # free immediately
+        vals = data[gi[0], gi[1], gi[2]]
+        mask = gv[0] & gv[1] & gv[2]
+        mask = mask & (vals != 0)
+        vals *= mask
+        sym_sum += vals
+        sym_count += mask
+        del vals, mask
 
     with np.errstate(invalid='ignore', divide='ignore'):
         count_f = sym_count.astype(xp.float32)
