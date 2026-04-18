@@ -12,6 +12,7 @@ import numpy.typing as npt
 import os
 import struct
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable
 from scipy.ndimage import map_coordinates
@@ -386,11 +387,18 @@ def scan_unwarp_folder(folder: str) -> list[tuple[str, float]]:
 
 
 def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
-                       progress_callback: Callable[[int, int], None] | None = None) -> VolumeData:
+                       progress_callback: Callable[[int, int], None] | None = None,
+                       max_workers: int = 0) -> VolumeData:
     """Load all .img files from unwarp folder into a 3D volume.
 
     Data is kept as int32 (native CrysAlisPro format) to save memory.
     Only converted to float during processing (outlier rejection / symmetrization).
+
+    Per-file reads (fabio decode + optional bin) run on a ThreadPoolExecutor;
+    both steps release the GIL, so threading scales well on typical disks.
+    `max_workers=0` auto-picks `min(8, cpu_count())`; pass `max_workers=1` to
+    disable threading (e.g. on RAM-constrained machines — each worker holds
+    one raw frame transiently).
     """
     file_list = scan_unwarp_folder(folder)
     if not file_list:
@@ -415,18 +423,26 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
     volume = np.zeros((nx_bin, ny_bin, n_files), dtype=np.int32)
     l_values = np.zeros(n_files, dtype=np.float64)
 
-    for i, (path, fixed_val) in enumerate(file_list):
-        if progress_callback:
-            progress_callback(i, n_files)
+    workers = max_workers if max_workers > 0 else min(8, os.cpu_count() or 1)
 
+    def _load_frame(args):
+        idx, path, fixed_val = args
         data = _read_intensity(path)  # int32 (ny, nx)
         if bin_xy > 1:
             data = bin_2d(data, bin_xy, bin_xy)  # int32
-        volume[:, :, i] = data.T
-        l_values[i] = fixed_val
+        return idx, fixed_val, data.T
 
-    if progress_callback:
-        progress_callback(n_files, n_files)
+    n_done = 0
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futs = [exe.submit(_load_frame, (i, path, fv))
+                for i, (path, fv) in enumerate(file_list)]
+        for fut in as_completed(futs):
+            idx, fixed_val, data_T = fut.result()
+            volume[:, :, idx] = data_T
+            l_values[idx] = fixed_val
+            n_done += 1
+            if progress_callback:
+                progress_callback(n_done, n_files)
 
     # Compute full M_inv and cell from first file header
     ref_layer = read_rsp_layer(file_list[0][0])

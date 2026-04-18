@@ -56,6 +56,9 @@ def main() -> None:
                         help='L bin factor (default: 1)')
     parser.add_argument('--no-gpu', action='store_true',
                         help='Force CPU even if GPU available')
+    parser.add_argument('--workers', type=int, default=0,
+                        help='Parallel file-load threads (0 = auto: min(8, cpu_count); '
+                             '1 = sequential)')
 
     args = parser.parse_args()
     folder = args.folder
@@ -111,7 +114,7 @@ def main() -> None:
     # ── Step 1: Load ──
     print(f'\n[1/4] Loading {n} files...', end=' ', flush=True)
     t0 = time.time()
-    vol = load_unwarp_folder(folder, bin_xy=1)
+    vol = load_unwarp_folder(folder, bin_xy=1, max_workers=args.workers)
     dt = time.time() - t0
     nh, nk, nl = vol.intensity.shape
     print(f'{dt:.1f}s  ({nh}x{nk}x{nl}, {vol.intensity.dtype})')
