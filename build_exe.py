@@ -45,6 +45,11 @@ for app in APPS:
         sys.executable, '-m', 'PyInstaller',
         '--onefile',
         f'--name={app["name"]}',
+        # fabio registers image-format plugins at import time via importlib,
+        # which PyInstaller's static analysis can't see. Without this the
+        # bundle crashes on startup with ModuleNotFoundError for e.g.
+        # fabio.pilatusimage / fabio.brukerimage / fabio.cbfimage.
+        '--collect-submodules', 'fabio',
     ]
 
     if not app['console']:
