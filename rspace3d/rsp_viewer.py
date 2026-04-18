@@ -435,13 +435,17 @@ class UnifiedViewer(QMainWindow):
         plane_type = self._get_vol_plane_type()
         ub = self.vol.metadata.get('ub')
         wl = self.vol.metadata.get('wavelength', 1.0)
-        if ub is not None:
-            self._current_M_inv = compute_plane_M_inv(ub, wl, plane_type)
+        is_native = plane_type == self.vol.plane_type
+        if is_native:
+            if ub is not None:
+                self._current_M_inv = compute_plane_M_inv(ub, wl, plane_type)
+            else:
+                self._current_M_inv = self.vol.metadata.get('M_inv')
         else:
-            self._current_M_inv = self.vol.metadata.get('M_inv')
+            # Non-native data is already in Miller-index coordinates
+            self._current_M_inv = np.eye(2)
 
         # Y-flip for native plane
-        is_native = plane_type == self.vol.plane_type
         if is_native and self._current_M_inv is not None and self._current_M_inv[1, 1] < 0:
             self._y_flipped = True
             sl = sl[::-1, :]
@@ -465,14 +469,8 @@ class UnifiedViewer(QMainWindow):
             if self._y_flipped:
                 y_first, y_last = y_last, y_first
             self.extent = [x_min, x_max, min(y_first, y_last), max(y_first, y_last)]
-        elif s is not None:
-            # Regridded non-native: uses s directly
-            ny_sl, nx_sl = sl.shape
-            cx_e = (nx_sl + 1) / 2.0
-            cy_e = (ny_sl + 1) / 2.0
-            self.extent = [(0.5-cx_e)*s, (nx_sl+0.5-cx_e)*s,
-                           (0.5-cy_e)*s, (ny_sl+0.5-cy_e)*s]
         else:
+            # Non-native: data in Miller indices — use x_ax/y_ax directly
             dx = abs(x_ax[-1]-x_ax[0]) / max(len(x_ax)-1, 1) / 2
             dy = abs(y_ax[-1]-y_ax[0]) / max(len(y_ax)-1, 1) / 2
             self.extent = [x_ax[0]-dx, x_ax[-1]+dx, y_ax[0]-dy, y_ax[-1]+dy]
