@@ -28,7 +28,7 @@ pip install -e .
 ### Optional dependencies
 
 ```bash
-pip install cupy-cuda12x   # GPU acceleration (6-10x faster)
+pip install cupy-cuda12x   # GPU acceleration (6-12x faster)
 pip install pyvista         # 3D isosurface visualization
 pip install plotly           # Alternative 3D (browser-based)
 ```
@@ -116,6 +116,8 @@ Output: `sample_raw.h5` (unbinned) and `sample_sym_mbar3m.h5` (processed)
 python -m rspace3d.volume_process F:\path\to\unwarp --laue m-3m --sigma 3 --bin 2
 ```
 
+Add `--workers 1` to force a sequential (single-threaded) file load on RAM-constrained machines; default auto-picks `min(8, cpu_count())`.
+
 ### Step 4: View the results
 
 **Unified viewer** (handles .img, .cbf, and .h5):
@@ -194,14 +196,25 @@ L = h5read('sample_sym_mbar3m.h5', '/L');          % l axis
 
 Additional datasets: `/M_inv` (2x2), `/UB` (3x3). Attributes: `cell_a/b/c/alpha/beta/gamma`, `wavelength`, `laue_group`, `s`, `cx`, `cy`.
 
-## GPU Acceleration
+## Performance
 
-GPU support via CuPy is auto-detected. Benchmarks (MAPbI2Br, 839x737x601, m-3m):
+**Parallel file loader.** `load_unwarp_folder` reads .img files on a
+`ThreadPoolExecutor` (fabio decode + optional binning both release the GIL).
+Default worker count is `min(8, cpu_count())`. On exp_172 (491 HK files,
+bin_xy=2) load time drops from 5.3 s to 2.8 s (~1.9x). Disable with
+`--workers 1` (CLI) or `max_workers=1` (API) on RAM-constrained machines.
 
-| Operation | CPU (24 cores) | GPU (GTX 1070) | Speedup |
-|-----------|---------------|----------------|---------|
-| Symmetrize | 198s | 30s | **6.6x** |
-| Reject + Sym | 218s | 36s | **6.0x** |
+**GPU acceleration.** CuPy support is auto-detected. Benchmarks:
+
+| Dataset | Operation | CPU | GPU (GTX 1070) | Speedup |
+|---------|-----------|----:|----:|--------:|
+| MAPbI2Br 839x737x601 | Symmetrize   | 198 s (24 cores) | 30 s | **6.6x** |
+| MAPbI2Br 839x737x601 | Reject + Sym | 218 s (24 cores) | 36 s | **6.0x** |
+| exp_172 387x400x491 (bin=2)   | Symmetrize   |  28 s | 3.4 s | **8.4x** |
+| exp_172 387x400x491 (bin=2)   | Reject + Sym | 374 s | 33 s  | **11.4x** |
+
+Speedup varies with volume size and CPU core count (fewer CPU cores or smaller
+volumes bias the ratio toward GPU).
 
 Force CPU: `--no-gpu` (CLI) or `use_gpu=False` (API).
 
