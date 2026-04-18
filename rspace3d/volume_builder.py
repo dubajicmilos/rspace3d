@@ -821,33 +821,30 @@ def reject_outliers(vol: VolumeData, laue_group: str,
     nh, nk, nl = data.shape
     n_replaced_total = 0
 
-    # Determine chunk size based on available memory
-    equiv_bytes = n_ops * nh * nk * nl * 4  # float32
+    # Chunk sizing. Per chunk, peak live memory is 2 * (chunk_size * per_h):
+    # equiv plus the sort buffer CuPy/NumPy nanmedian allocates internally
+    # (same size as input). We do the MAD step in-place on equiv so abs_dev
+    # is not a separate allocation.
+    per_h = n_ops * nk * nl * 4  # bytes per H-slice of equiv
     if use_gpu:
         free_mem, _ = cp.cuda.Device(0).mem_info
-        # Need ~3x equiv for: equiv + abs_dev + sorting overhead
-        can_fit_full = equiv_bytes * 3 < free_mem * 0.8
+        # Budget: 2x chunk for equiv+sort_buf, keep under 40% of free mem
+        # to leave room for data, pool fragmentation, and small temporaries.
+        chunk_size = max(1, int(free_mem * 0.4 / (2 * per_h)))
     else:
-        can_fit_full = equiv_bytes < 4e9  # 4 GB limit for CPU
-
-    if can_fit_full:
-        chunk_size = nh  # process all at once
-    else:
-        # Per H-slice: n_ops * nk * nl * 4 bytes
-        per_h = n_ops * nk * nl * 4
-        if use_gpu:
-            chunk_size = max(1, int(free_mem * 0.25 / per_h))
-        else:
-            chunk_size = max(1, int(1e9 / per_h))  # ~1 GB chunks
+        chunk_size = max(1, int(1e9 / (2 * per_h)))  # ~1 GB per chunk total
     chunk_size = min(chunk_size, nh)
 
-    for iteration in range(n_iter):
-        if progress_callback:
-            progress_callback(iteration, n_iter)
+    n_chunks = (nh + chunk_size - 1) // chunk_size
+    total_steps = n_iter * n_chunks
 
+    for iteration in range(n_iter):
         n_replaced = 0
 
-        for h_start in range(0, nh, chunk_size):
+        for chunk_idx, h_start in enumerate(range(0, nh, chunk_size)):
+            if progress_callback:
+                progress_callback(iteration * n_chunks + chunk_idx, total_steps)
+
             h_end = min(h_start + chunk_size, nh)
             h_len = h_end - h_start
 
@@ -878,12 +875,16 @@ def reject_outliers(vol: VolumeData, laue_group: str,
                 del vals, valid
                 op_count += 1
 
-            # Per-voxel median and MAD
+            # Per-voxel median and MAD. Reuse equiv as the abs_dev buffer
+            # (in-place subtract + abs) so we don't need a second full-size
+            # copy — this is what keeps GPU memory within budget on large
+            # unbinned volumes.
             with np.errstate(invalid='ignore'):
                 med = xp.nanmedian(equiv, axis=0)
-                abs_dev = xp.abs(equiv - med[None, :, :, :])
-                mad = xp.nanmedian(abs_dev, axis=0) * MAD_SCALE
-            del equiv, abs_dev
+                equiv -= med[None, :, :, :]
+                xp.abs(equiv, out=equiv)
+                mad = xp.nanmedian(equiv, axis=0) * MAD_SCALE
+            del equiv
 
             # Flag outliers in this chunk
             data_chunk = data[h_start:h_end]
@@ -896,13 +897,12 @@ def reject_outliers(vol: VolumeData, laue_group: str,
             del med, mad, residual, outlier, is_finite
 
             if use_gpu:
-                import cupy as cp
                 cp.get_default_memory_pool().free_all_blocks()
 
         n_replaced_total += n_replaced
 
     if progress_callback:
-        progress_callback(n_iter, n_iter)
+        progress_callback(total_steps, total_steps)
 
     if use_gpu:
         import cupy as cp
