@@ -1017,14 +1017,17 @@ def _extract_nonnat(
     int_range: float,
     view_plane: str,
 ) -> tuple[npt.NDArray[np.float32], float, int, npt.NDArray[np.floating]]:
-    """Non-native plane with cross-term correction and regridding."""
+    """Non-native plane extraction with cross-term correction.
+
+    Slab shape after transpose matches (len(y_ax), len(x_ax)) for imshow
+    with extent=(x_ax[0], x_ax[-1], y_ax[0], y_ax[-1]).
+    """
     data = vol.intensity.astype(np.float32)
     H, K = vol.H, vol.K
     nh, nk, nl = data.shape
     dh = H[1] - H[0] if nh > 1 else 1.0
     dk = K[1] - K[0] if nk > 1 else 1.0
 
-    # HK M_inv for cross-term correction
     M_inv_HK = vol.metadata.get('M_inv')
     if M_inv_HK is None:
         ub = vol.metadata.get('ub')
@@ -1038,7 +1041,6 @@ def _extract_nonnat(
     cy = vol.metadata.get('cy', (nk + 1) / 2.0)
     h_cross = M_inv_HK[0, 1] * s
 
-    # Integration targets
     if int_range < 1e-6:
         idx = int(np.argmin(np.abs(fixed_ax - target_val)))
         actual_val = float(fixed_ax[idx])
@@ -1054,7 +1056,7 @@ def _extract_nonnat(
         n_slices = len(target_vals)
 
     if vol_dim_fixed == 0:
-        # KL: fixed H — per-row ih correction
+        # KL: fixed H — per-row ih correction for monoclinic cross-term
         IK, IL = np.meshgrid(np.arange(nk), np.arange(nl), indexing='ij')
         slab = np.zeros((nk, nl), dtype=np.float64)
         for tv in target_vals:
@@ -1066,7 +1068,7 @@ def _extract_nonnat(
                 order=1, mode='constant', cval=0.0).reshape(nk, nl)
 
     elif vol_dim_fixed == 1:
-        # HL: fixed K — interpolate ik, correct h-offset
+        # HL: fixed K — interpolate ik, apply constant h-offset for monoclinic
         IH, IL = np.meshgrid(np.arange(nh), np.arange(nl), indexing='ij')
         slab = np.zeros((nh, nl), dtype=np.float64)
         for tv in target_vals:
@@ -1087,36 +1089,9 @@ def _extract_nonnat(
         actual_val = float(fixed_ax[idx])
         return slab_native.astype(np.float32), actual_val, 1, x_ax
 
-    # Regrid to Cartesian
-    ub = vol.metadata.get('ub')
-    wl = vol.metadata.get('wavelength', 1.0)
-    if ub is not None:
-        M_inv_view = compute_plane_M_inv(ub, wl, view_plane)
-    else:
-        M_inv_view = M_inv_HK
-
-    out_n = len(vol.H)
-    cx_out = (out_n + 1) / 2.0
-    ii = np.arange(1, out_n + 1) - cx_out
-    jj = np.arange(1, out_n + 1) - cx_out
-    II, JJ = np.meshgrid(ii, jj)
-    # Use the stored s directly — bin_volume already updates it correctly
-    s_out = vol.metadata.get('s', s)
-
-    idx1_out = M_inv_view[0, 0] * s_out * II + M_inv_view[0, 1] * s_out * JJ
-    idx2_out = M_inv_view[1, 0] * s_out * II + M_inv_view[1, 1] * s_out * JJ
-
-    dx = x_ax[1] - x_ax[0] if len(x_ax) > 1 else 1.0
-    dy = y_ax[1] - y_ax[0] if len(y_ax) > 1 else 1.0
-    fi = (idx1_out - x_ax[0]) / dx
-    fj = (idx2_out - y_ax[0]) / dy
-
-    regridded = map_coordinates(
-        slab.astype(np.float32), [fi.ravel(), fj.ravel()],
-        order=1, mode='constant', cval=0.0
-    ).reshape(out_n, out_n).astype(np.float32)
-
-    return regridded, actual_val, n_slices, x_ax
+    # Transpose to (ny, nx) for imshow; no Cartesian regridding needed because
+    # slab axes already map directly to (x_ax, y_ax) Miller indices.
+    return slab.T.astype(np.float32), actual_val, n_slices, x_ax
 
 
 # ──────────────────────────────────────────────────────────────────
