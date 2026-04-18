@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rspace3d"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reciprocal Space 3D Processing Toolkit for single-crystal X-ray diffuse scattering"
 readme = "README.md"
 license = {text = "MIT"}
