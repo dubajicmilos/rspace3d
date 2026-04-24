@@ -25,6 +25,23 @@ cd rspace3d
 pip install -e .
 ```
 
+### Updating
+
+To fetch the latest updates without reinstalling from scratch:
+
+```bash
+pip install --upgrade git+https://github.com/dubajicmilos/rspace3d.git
+```
+
+This pulls the latest `main` and replaces the installed version in place.
+
+If you installed from a local clone with `pip install -e .` (editable mode),
+just run `git pull` inside the clone — changes take effect immediately,
+no pip step needed.
+
+Users on the standalone `.exe` builds need to download the new release
+from [Releases](https://github.com/dubajicmilos/rspace3d/releases).
+
 ### Optional dependencies
 
 ```bash
