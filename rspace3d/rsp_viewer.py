@@ -12,6 +12,7 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import sys
 import os
 import numpy as np
@@ -25,7 +26,7 @@ from PyQt6.QtWidgets import (
     QDialog, QTextEdit, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QPixmap
 
 import matplotlib
 matplotlib.use('QtAgg')
@@ -73,6 +74,9 @@ class UnifiedViewer(QMainWindow):
         self._current_M_inv: npt.NDArray[np.float64] | None = None
         self._current_x_label: str = 'x'
         self._current_y_label: str = 'y'
+        # Last fixed-axis value used across all planes. Carried over when
+        # switching plane so the viewer doesn't reset the cut to 0.
+        self._last_cut_value: float | None = None
 
         self._build_ui()
 
@@ -248,9 +252,6 @@ class UnifiedViewer(QMainWindow):
 
         # Mouse tracking
         self.main_canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
-        # Re-apply axis range on widget resize so the image stays centered
-        # (data limits are expanded to match the widget aspect ratio)
-        self.main_canvas.mpl_connect('resize_event', lambda e: self._apply_axis_range())
 
     # ──────────────────────────────────────────────────────────
     # File I/O
@@ -320,6 +321,7 @@ class UnifiedViewer(QMainWindow):
                 metadata={'wavelength': float(d.get('wavelength', 0))})
 
         self._mode = 'vol'
+        self._last_cut_value = None
         self.vol_toolbar.setVisible(True)
         self.setWindowTitle(f'RSP Viewer — {os.path.basename(path)}')
 
@@ -386,7 +388,11 @@ class UnifiedViewer(QMainWindow):
         self.slice_spin.blockSignals(True)
         self.slice_slider.blockSignals(True)
         self.slice_spin.setRange(float(fixed_ax[0]), float(fixed_ax[-1]))
-        target = 0.0 if fixed_ax[0] <= 0 <= fixed_ax[-1] else float(fixed_ax[len(fixed_ax)//2])
+        last = self._last_cut_value
+        if last is not None and fixed_ax[0] <= last <= fixed_ax[-1]:
+            target = float(last)
+        else:
+            target = 0.0 if fixed_ax[0] <= 0 <= fixed_ax[-1] else float(fixed_ax[len(fixed_ax)//2])
         self.slice_spin.setValue(target)
         self.slice_slider.setRange(0, len(fixed_ax) - 1)
         self.slice_slider.setValue(int(np.argmin(np.abs(fixed_ax - target))))
@@ -428,6 +434,7 @@ class UnifiedViewer(QMainWindow):
         plane_idx = self.plane_combo.currentIndex()
         target_val = self.slice_spin.value()
         int_range = self.int_range_spin.value()
+        self._last_cut_value = target_val
 
         sl, x_ax, y_ax, xl, yl, fl, fv, n_sl = extract_volume_slice(
             self.vol, plane_idx, target_val, int_range)
@@ -493,11 +500,10 @@ class UnifiedViewer(QMainWindow):
         self.line_artist = None
         self.cbar = None
 
-        cmap = self.cmap_combo.currentText()
         self.main_ax.set_autoscale_on(False)
         self.im = self.main_ax.imshow(
             self._display_data, extent=self.extent, origin='lower',
-            aspect='equal', cmap=cmap, interpolation='nearest')
+            aspect='equal', cmap=self._get_cmap(), interpolation='nearest')
 
         self.main_ax.set_xlabel(xlabel, fontsize=12)
         self.main_ax.set_ylabel(ylabel, fontsize=12)
@@ -536,9 +542,17 @@ class UnifiedViewer(QMainWindow):
     # Colormap / clim
     # ──────────────────────────────────────────────────────────
 
+    def _get_cmap(self):
+        # Map "bad" values (NaN / non-positive inputs under LogNorm) to the low
+        # end of the colormap so unmeasured voxels render the same as in linear
+        # mode instead of showing through to the figure background (white).
+        cmap = matplotlib.colormaps[self.cmap_combo.currentText()].copy()
+        cmap.set_bad(cmap(0.0))
+        return cmap
+
     def _update_cmap(self, name):
         if self.im:
-            self.im.set_cmap(name)
+            self.im.set_cmap(self._get_cmap())
             self.main_canvas.draw_idle()
 
     def _update_clim(self):
@@ -548,8 +562,10 @@ class UnifiedViewer(QMainWindow):
         if vmax <= vmin:
             vmax = vmin + 1
         if self.log_check.isChecked():
-            vmin = max(vmin, 0.1)
-            self.im.set_norm(LogNorm(vmin=vmin, vmax=vmax))
+            # LogNorm requires strictly positive vmin. clip=True maps positive
+            # values below vmin to the low-end color instead of extrapolating.
+            vmin = max(vmin, 1e-10)
+            self.im.set_norm(LogNorm(vmin=vmin, vmax=vmax, clip=True))
         else:
             self.im.set_norm(Normalize(vmin=vmin, vmax=vmax))
         self.main_canvas.draw_idle()
@@ -606,28 +622,6 @@ class UnifiedViewer(QMainWindow):
             cart = [self._miller_to_cart(i1, i2) for i1, i2 in corners]
             x_lo, x_hi = min(c[0] for c in cart), max(c[0] for c in cart)
             y_lo, y_hi = min(c[1] for c in cart), max(c[1] for c in cart)
-            # Expand limits so data aspect matches the axes-box widget aspect.
-            # With aspect='equal' + default adjustable='box', matplotlib would
-            # otherwise shrink the box and leave the image off-center. By giving
-            # matplotlib limits that already match the widget aspect, the box
-            # stays full-size and the image is centered.
-            try:
-                bbox = self.main_ax.get_window_extent()
-                widget_aspect = bbox.width / bbox.height
-                if widget_aspect > 0:
-                    dx, dy = x_hi - x_lo, y_hi - y_lo
-                    if dx / dy >= widget_aspect:
-                        # x is limiting — expand y
-                        pad = (dx / widget_aspect - dy) / 2
-                        y_lo -= pad
-                        y_hi += pad
-                    else:
-                        # y is limiting — expand x
-                        pad = (dy * widget_aspect - dx) / 2
-                        x_lo -= pad
-                        x_hi += pad
-            except Exception:
-                pass  # fallback: use unexpanded limits
             self.main_ax.set_xlim(x_lo, x_hi)
             self.main_ax.set_ylim(y_lo, y_hi)
             self._set_miller_ticks()
@@ -827,12 +821,83 @@ class UnifiedViewer(QMainWindow):
     def _export(self):
         if self._display_data is None:
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'Export', '', 'PNG (*.png);;PDF (*.pdf);;SVG (*.svg)')
-        if path:
-            self.main_fig.savefig(path, dpi=300, bbox_inches='tight',
-                                  pad_inches=0.05, facecolor='white')
-            self.status.showMessage(f'Exported: {path}')
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Export options')
+        layout = QVBoxLayout(dlg)
+        cb_colorbar = QCheckBox('Include colorbar')
+        cb_colorbar.setChecked(self.cbar is not None)
+        cb_colorbar.setEnabled(self.cbar is not None)
+        cb_title = QCheckBox('Include title')
+        cb_title.setChecked(True)
+        cb_axes = QCheckBox('Include axis labels and numbers')
+        cb_axes.setChecked(True)
+        layout.addWidget(cb_colorbar)
+        layout.addWidget(cb_title)
+        layout.addWidget(cb_axes)
+
+        action = {'mode': None}
+        btns = QDialogButtonBox()
+        save_btn = btns.addButton('Save to file...',
+                                  QDialogButtonBox.ButtonRole.AcceptRole)
+        copy_btn = btns.addButton('Copy to clipboard',
+                                  QDialogButtonBox.ButtonRole.AcceptRole)
+        btns.addButton(QDialogButtonBox.StandardButton.Cancel)
+
+        def pick(mode):
+            action['mode'] = mode
+            dlg.accept()
+        save_btn.clicked.connect(lambda: pick('save'))
+        copy_btn.clicked.connect(lambda: pick('copy'))
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted or action['mode'] is None:
+            return
+
+        path = None
+        if action['mode'] == 'save':
+            path, _ = QFileDialog.getSaveFileName(
+                self, 'Export', '', 'PNG (*.png);;PDF (*.pdf);;SVG (*.svg)')
+            if not path:
+                return
+
+        saved_title = self.main_ax.get_title()
+        hid_cbar = False
+        hid_axes = False
+        try:
+            if not cb_title.isChecked():
+                self.main_ax.set_title('')
+            if not cb_axes.isChecked():
+                self.main_ax.xaxis.set_visible(False)
+                self.main_ax.yaxis.set_visible(False)
+                hid_axes = True
+            if not cb_colorbar.isChecked() and self.cbar is not None:
+                self.cbar.ax.set_visible(False)
+                hid_cbar = True
+
+            if action['mode'] == 'save':
+                self.main_fig.savefig(path, dpi=300, bbox_inches='tight',
+                                      pad_inches=0.05, facecolor='white')
+                self.status.showMessage(f'Exported: {path}')
+            else:
+                buf = io.BytesIO()
+                self.main_fig.savefig(buf, format='png', dpi=300,
+                                      bbox_inches='tight', pad_inches=0.05,
+                                      facecolor='white')
+                pixmap = QPixmap()
+                pixmap.loadFromData(buf.getvalue(), 'PNG')
+                QApplication.clipboard().setPixmap(pixmap)
+                self.status.showMessage('Copied image to clipboard')
+        finally:
+            if saved_title:
+                self.main_ax.set_title(saved_title)
+            if hid_axes:
+                self.main_ax.xaxis.set_visible(True)
+                self.main_ax.yaxis.set_visible(True)
+            if hid_cbar and self.cbar is not None:
+                self.cbar.ax.set_visible(True)
+            self.main_canvas.draw_idle()
 
     def _show_isosurface(self):
         """Launch 3D isosurface viewer for the loaded volume."""
