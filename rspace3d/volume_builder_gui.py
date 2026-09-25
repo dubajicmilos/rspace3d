@@ -22,15 +22,15 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QFormLayout, QPushButton, QLabel, QComboBox,
-    QSpinBox, QDoubleSpinBox, QProgressBar, QFileDialog,
+    QCheckBox, QSpinBox, QDoubleSpinBox, QProgressBar, QFileDialog,
     QTextEdit, QMessageBox,
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .volume_builder import (
-    load_unwarp_folder, bin_volume,
-    reject_outliers, symmetrize_volume,
-    save_volume_h5, _read_header_fast, resolve_unit_cell,
+    load_unwarp_folder, bin_volume, symmetrize_volume,
+    save_volume_h5, load_volume_h5, adaptive_morph_size, bin_native,
+    raw_cache_mismatch, _read_header_fast, resolve_unit_cell,
     _filter_numbered_imgs, _img_number,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
@@ -79,6 +79,7 @@ class SimpleVolumeGUI(QMainWindow):
         self.resize(700, 700)
         self._worker: WorkerThread | None = None
         self._folder_path: str | None = None
+        self._dataset_valid = False
         self._build_ui()
 
         if HAS_GPU:
@@ -207,21 +208,42 @@ class SimpleVolumeGUI(QMainWindow):
         self.sigma_spin.setDecimals(1)
         self.sigma_spin.setToolTip(
             'Outlier rejection threshold in units of robust standard deviation.\n'
-            'Voxels deviating more than N*sigma from the symmetrized mean\n'
-            'are replaced with the symmetrized value.\n\n'
-            '3.0 = standard (removes ~2-5% of voxels)\n'
+            'For each voxel, the symmetry-equivalent orbit is gathered and\n'
+            'members deviating more than N*sigma*MAD from the orbit median\n'
+            'are excluded from the symmetrized mean.\n\n'
+            '3.0 = standard\n'
             '5.0 = conservative (removes only extreme outliers)\n'
-            '2.0 = aggressive (removes more, may affect weak features)')
+            '1.5 = aggressive (tighter clipping, use with caution)')
         f2.addRow('Outlier sigma:', self.sigma_spin)
 
-        self.niter_spin = QSpinBox()
-        self.niter_spin.setRange(1, 5)
-        self.niter_spin.setValue(1)
-        self.niter_spin.setToolTip(
-            'Number of outlier rejection iterations.\n'
-            'Each iteration: symmetrize, find outliers, replace, repeat.\n'
-            '1 = usually sufficient, 2 = for noisy data with many hot pixels')
-        f2.addRow('Rejection iterations:', self.niter_spin)
+        # Coverage-mask kernel (auto by default; allow odd integer override)
+        self.morph_combo = QComboBox()
+        self.morph_combo.addItem('auto', 'auto')
+        for n in (3, 5, 7, 9, 11, 13, 15):
+            self.morph_combo.addItem(str(n), n)
+        self.morph_combo.setToolTip(
+            'Coverage-mask morphological-opening kernel.\n'
+            'Decides which zero pixels are real low-count measurements\n'
+            'vs unmeasured detector regions (gaps, beamstop, edges).\n\n'
+            "'auto' (default) picks ~5% of one Bragg cell from the\n"
+            'detector geometry — adapts to detector distance, pixel\n'
+            'count and unit cell size.\n\n'
+            'Override with a fixed odd integer if needed (3 = original\n'
+            'behaviour; larger = fewer false positives, may shave thin\n'
+            'detector gaps).')
+        f2.addRow('Mask kernel:', self.morph_combo)
+
+        # Force-reload toggle (default: reuse _raw.h5 if it exists and
+        # matches the requested morph_size).
+        self.force_reload_chk = QCheckBox('Force re-read .img files')
+        self.force_reload_chk.setChecked(False)
+        self.force_reload_chk.setToolTip(
+            'When unchecked (default): if a {prefix}_raw.h5 already exists\n'
+            'in the unwarp folder AND its morph_size matches the request,\n'
+            'load from there and skip the .img read + raw save steps.\n\n'
+            'Check this to always re-read the .img files and overwrite\n'
+            'the cached raw file (e.g. if frames changed on disk).')
+        f2.addRow('', self.force_reload_chk)
 
         self.process_btn = QPushButton('Process All')
         self.process_btn.setEnabled(False)
@@ -230,12 +252,11 @@ class SimpleVolumeGUI(QMainWindow):
         self.process_btn.clicked.connect(self._process_all)
         self.process_btn.setToolTip(
             'Run the full pipeline:\n'
-            '1. Load all .img files into 3D volume\n'
+            '1. Load all .img files into 3D volume (with per-frame coverage mask)\n'
             '2. Save raw volume as .h5\n'
             '3. Bin the volume\n'
-            '4. Reject outliers using symmetry equivalents\n'
-            '5. Symmetrize (average equivalent reflections)\n'
-            '6. Save processed volume as .h5')
+            '4. Single-pass symmetrize + outlier rejection (orbit MAD clip)\n'
+            '5. Save processed volume as .h5')
         f2.addRow(self.process_btn)
 
         g2.setLayout(f2)
@@ -256,20 +277,20 @@ class SimpleVolumeGUI(QMainWindow):
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self, 'Select Unwarp Folder',
-            'F:\\' if os.path.exists('F:\\') else '')
+            '')
         if folder:
             self._set_folder(folder)
 
     def _set_folder(self, folder):
         self._folder_path = folder
+        self._dataset_valid = False
         self.folder_label.setText(folder)
         self._log(f'Folder: {folder}')
 
         img_files = _filter_numbered_imgs(folder)
         n = len(img_files)
         if n == 0:
-            self.info_label.setText('No .img files found.')
-            self.process_btn.setEnabled(False)
+            self._fail_folder('No .img files found.')
             return
 
         sorted_f = sorted(img_files, key=_img_number)
@@ -277,18 +298,22 @@ class SimpleVolumeGUI(QMainWindow):
         img_prefix = sorted_f[0].rsplit('_', 1)[0]
         self._log(f'Prefix: {img_prefix} ({n} files)')
 
-        hdr = _read_header_fast(os.path.join(folder, sorted_f[0]))
+        try:
+            hdr = _read_header_fast(os.path.join(folder, sorted_f[0]))
+            l_min = hdr['fixed_value']
+            l_max = _read_header_fast(os.path.join(folder, sorted_f[-1]))['fixed_value']
+            # Unit cell: try par file first, fall back to .img header UB
+            cell, par_path = resolve_unit_cell(folder, hdr)
+        except Exception as e:                     # truncated / foreign .img, bad par
+            self._fail_folder(f'Could not read the .img headers: {e}')
+            return
         nx, ny = hdr['nx'], hdr['ny']
-        l_min = _read_header_fast(os.path.join(folder, sorted_f[0]))['fixed_value']
-        l_max = _read_header_fast(os.path.join(folder, sorted_f[-1]))['fixed_value']
         l_step = (l_max - l_min) / max(n - 1, 1)
 
         info = (f'{n} files  |  {nx} x {ny} px  |  {hdr["plane_type"]}  |  '
                 f'lambda = {hdr["wavelength"]:.5f} A\n'
                 f'Fixed axis: {l_min:.3f} to {l_max:.3f} (step {l_step:.4f})')
 
-        # Unit cell: try par file first, fall back to .img header UB
-        cell, par_path = resolve_unit_cell(folder, hdr)
         if par_path:
             self._log(f'Par file: {os.path.basename(par_path)}')
         else:
@@ -309,7 +334,14 @@ class SimpleVolumeGUI(QMainWindow):
         self._log(f'Raw volume: {nx} x {ny} x {n} = {raw_mb:.0f} MB')
         self._log(f'Binned 2x2: {nx2} x {ny2} x {n} = {bin_mb:.0f} MB')
 
+        self._dataset_valid = True
         self.process_btn.setEnabled(True)
+
+    def _fail_folder(self, msg):
+        self._dataset_valid = False
+        self.info_label.setText(msg)
+        self._log('  ERROR: ' + msg)
+        self.process_btn.setEnabled(False)
 
     # ── Generate dcunwarp ──
 
@@ -355,20 +387,23 @@ class SimpleVolumeGUI(QMainWindow):
     def _process_all(self):
         laue = self.laue_combo.currentData()
         sigma = self.sigma_spin.value()
-        niter = self.niter_spin.value()
+        morph = self.morph_combo.currentData()
+        force_reload = self.force_reload_chk.isChecked()
         bin_xy = self.bin_xy_spin.value()
         bin_z = self.bin_z_spin.value()
         device = 'GPU' if HAS_GPU else 'CPU'
 
         self._set_busy(True, 'Processing...')
         self._log(f'\n{"="*50}')
-        self._log(f'Processing: {laue}, sigma={sigma}, iter={niter}, '
-                  f'bin={bin_xy}x{bin_xy}x{bin_z}, {device}')
+        self._log(f'Processing: {laue}, sigma={sigma}, morph={morph}, '
+                  f'bin={bin_xy}x{bin_xy}x{bin_z}, '
+                  f'force_reload={force_reload}, {device}')
         self._log(f'{"="*50}')
 
         self._worker = WorkerThread(
             self._do_process_all,
-            self._folder_path, laue, sigma, niter, bin_xy, bin_z)
+            self._folder_path, laue, sigma, morph, bin_xy, bin_z,
+            force_reload)
         self._worker.progress.connect(self._update_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_process_done)
@@ -380,9 +415,10 @@ class SimpleVolumeGUI(QMainWindow):
         folder: str,
         laue: str,
         sigma: float,
-        niter: int,
+        morph: int | str,
         bin_xy: int,
         bin_z: int,
+        force_reload: bool,
     ) -> dict[str, str]:
         log = lambda msg: QThread.currentThread()._emit_log(msg)  # type: ignore[union-attr]
         cb = QThread.currentThread()._emit_progress  # type: ignore[union-attr]
@@ -394,57 +430,125 @@ class SimpleVolumeGUI(QMainWindow):
         first_img = img_files[0]
         # Strip trailing _<number>.img
         base = first_img.rsplit('_', 1)[0]
-
-        # ── Step 1: Load raw ──
-        log(f'Step 1/4: Loading all .img files...')
-        t0 = time.time()
-        vol = load_unwarp_folder(folder, bin_xy=1, progress_callback=cb)
-        dt = time.time() - t0
-        nh, nk, nl = vol.intensity.shape
-        log(f'  Loaded: {nh} x {nk} x {nl} ({vol.intensity.dtype}) in {dt:.1f}s')
-        log(f'  H=[{vol.H[0]:.3f}, {vol.H[-1]:.3f}]  '
-            f'K=[{vol.K[0]:.3f}, {vol.K[-1]:.3f}]  '
-            f'L=[{vol.L[0]:.3f}, {vol.L[-1]:.3f}]')
-
-        # ── Step 2: Save raw ──
         raw_path = os.path.join(folder, f'{base}_raw.h5')
-        log(f'Step 2/4: Saving raw volume...')
-        t0 = time.time()
-        save_volume_h5(raw_path, vol)
-        dt = time.time() - t0
-        size_mb = os.path.getsize(raw_path) / 1e6
-        log(f'  Saved: {raw_path}')
-        log(f'  {size_mb:.1f} MB on disk (gzip) in {dt:.1f}s')
+
+        # Compute the morph_size that the loader WOULD apply, so we can
+        # validate any cached _raw.h5 before reusing it.
+        if morph == 'auto':
+            hdr0 = _read_header_fast(os.path.join(folder, first_img))
+            s_pp_now = 2.0 / (hdr0['d_min'] * hdr0['nx'])
+            plane_to_cols = {'HK': (0, 1), 'HL': (0, 2), 'KL': (1, 2)}
+            c1, c2 = plane_to_cols[hdr0['plane_type']]
+            ub0 = np.asarray(hdr0['ub']).reshape(3, 3)
+            wl0 = hdr0['wavelength']
+            recip_now = 0.5 * (float(np.linalg.norm(ub0[:, c1] / wl0))
+                               + float(np.linalg.norm(ub0[:, c2] / wl0)))
+            morph_now = adaptive_morph_size(s_pp_now, recip_now)
+        else:
+            morph_now = int(morph)
+
+        # Cache decision: the raw cache must carry the requested mask kernel
+        # AND the fingerprint of the current .img/.par files.
+        use_cache = False
+        cached_vol = None
+        if os.path.isfile(raw_path) and not force_reload:
+            try:
+                cached_vol = load_volume_h5(raw_path)
+                reason = raw_cache_mismatch(cached_vol, folder, morph_now)
+                if reason is None:
+                    use_cache = True
+                else:
+                    log(f'  Cache invalid: {os.path.basename(raw_path)}: {reason}. '
+                        'Regenerating from .img files.')
+                    cached_vol = None
+            except Exception as e:
+                log(f'  Could not read {os.path.basename(raw_path)} '
+                    f'({e}); regenerating.')
+
+        if use_cache:
+            # ── Steps 1+2: load cached, skip .img read + save ──
+            log(f'Step 1+2/4: Loading cached {os.path.basename(raw_path)}...')
+            t0 = time.time()
+            vol = cached_vol
+            dt = time.time() - t0
+            nh, nk, nl = vol.intensity.shape
+            log(f'  Loaded: {nh} x {nk} x {nl} ({vol.intensity.dtype}) '
+                f'in {dt:.1f}s')
+            log(f'  H=[{vol.H[0]:.3f}, {vol.H[-1]:.3f}]  '
+                f'K=[{vol.K[0]:.3f}, {vol.K[-1]:.3f}]  '
+                f'L=[{vol.L[0]:.3f}, {vol.L[-1]:.3f}]')
+            ms = vol.metadata.get('morph_size', morph_now)
+            mode = vol.metadata.get('morph_mode', 'unknown')
+            nu_mean = vol.metadata.get('n_unmeasured_per_frame_mean')
+            nu_pct = vol.metadata.get('n_unmeasured_per_frame_pct')
+            log(f'  Cached mask: morph={ms}px ({mode})'
+                + (f', unmeasured/frame mean={nu_mean:,.0f} '
+                   f'({nu_pct:.2f}%)' if nu_mean is not None else ''))
+            log(f'  (skipped .img read + raw save; check '
+                f'"Force re-read" to regenerate)')
+        else:
+            # ── Step 1: Load raw ──
+            log(f'Step 1/4: Loading all .img files...')
+            t0 = time.time()
+            vol = load_unwarp_folder(folder, bin_xy=1, morph_size=morph,
+                                     progress_callback=cb)
+            dt = time.time() - t0
+            nh, nk, nl = vol.intensity.shape
+            log(f'  Loaded: {nh} x {nk} x {nl} ({vol.intensity.dtype}) '
+                f'in {dt:.1f}s')
+            log(f'  H=[{vol.H[0]:.3f}, {vol.H[-1]:.3f}]  '
+                f'K=[{vol.K[0]:.3f}, {vol.K[-1]:.3f}]  '
+                f'L=[{vol.L[0]:.3f}, {vol.L[-1]:.3f}]')
+            # Coverage-mask diagnostics from metadata
+            ms = vol.metadata.get('morph_size')
+            mode = vol.metadata.get('morph_mode', 'manual')
+            s_pp = vol.metadata.get('morph_s_per_pixel')
+            recip = vol.metadata.get('morph_recip_period')
+            nu_mean = vol.metadata.get('n_unmeasured_per_frame_mean')
+            nu_min = vol.metadata.get('n_unmeasured_per_frame_min')
+            nu_max = vol.metadata.get('n_unmeasured_per_frame_max')
+            nu_pct = vol.metadata.get('n_unmeasured_per_frame_pct')
+            if mode == 'auto' and s_pp is not None and recip is not None:
+                log(f'  Mask kernel: morph={ms}px (auto from '
+                    f's={s_pp:.5f} 1/A, |a*|={recip:.4f} 1/A, '
+                    f'5% of one Bragg cell)')
+            else:
+                log(f'  Mask kernel: morph={ms}px (manual)')
+            if nu_mean is not None:
+                log(f'  Coverage: unmeasured/frame mean={nu_mean:,.0f} '
+                    f'({nu_pct:.2f}%) [min {nu_min:,}, max {nu_max:,}]')
+
+            # ── Step 2: Save raw ──
+            log(f'Step 2/4: Saving raw volume...')
+            t0 = time.time()
+            save_volume_h5(raw_path, vol)
+            dt = time.time() - t0
+            size_mb = os.path.getsize(raw_path) / 1e6
+            log(f'  Saved: {raw_path}')
+            log(f'  {size_mb:.1f} MB on disk (gzip) in {dt:.1f}s')
 
         # ── Step 3: Bin ──
         if bin_xy > 1 or bin_z > 1:
-            log(f'Step 3/4: Binning {bin_xy}x{bin_xy} (HK), {bin_z}x (L)...')
-            vol = bin_volume(vol, bin_xy, bin_xy, bin_z)
+            log(f'Step 3/4: Binning {bin_xy}x{bin_xy} (in-plane), {bin_z}x (layers)...')
+            vol = bin_native(vol, bin_xy, bin_z)
             nh, nk, nl = vol.intensity.shape
             log(f'  Binned: {nh} x {nk} x {nl}')
         else:
             log(f'Step 3/4: No binning (1x1x1)')
 
-        # ── Step 4: Reject + Symmetrize ──
+        # ── Step 4: Single-pass symmetrize + outlier rejection ──
         n_ops = _EXPECTED_ORDERS[laue]
-        log(f'Step 4/4: Outlier rejection + symmetrization ({device})...')
-        log(f'  Laue group: {laue} ({n_ops} ops)')
-        log(f'  Sigma: {sigma}, iterations: {niter}')
+        log(f'Step 4/4: Symmetrize + outlier rejection ({device})...')
+        log(f'  Laue group: {laue} ({n_ops} ops), sigma={sigma}')
 
         t0 = time.time()
-        log(f'  Rejecting outliers...')
-        vol = reject_outliers(vol, laue, sigma=sigma, n_iter=niter,
-                              progress_callback=cb)
-        dt_rej = time.time() - t0
-        n_repl = vol.metadata.get('n_outliers_replaced', 0)
-        log(f'  Outlier rejection: {dt_rej:.1f}s, {n_repl:,} voxels replaced')
-
-        t0 = time.time()
-        log(f'  Symmetrizing...')
-        vol = symmetrize_volume(vol, laue, progress_callback=cb)
+        vol = symmetrize_volume(vol, laue, sigma=sigma, progress_callback=cb)
         dt_sym = time.time() - t0
-        log(f'  Symmetrization: {dt_sym:.1f}s')
-        log(f'  Range: [{vol.intensity.min():.1f}, {vol.intensity.max():.1f}]')
+        n_removed = vol.metadata.get('n_outliers_removed', 0)
+        log(f'  Done in {dt_sym:.1f}s '
+            f'({n_removed:,} orbit members flagged as outliers)')
+        log(f'  Range: [{np.nanmin(vol.intensity):.3f}, '
+            f'{np.nanmax(vol.intensity):.3f}]')
 
         # Save with Laue group suffix
         laue_suffix = laue.replace('/', '').replace('-', 'bar')
@@ -475,7 +579,7 @@ class SimpleVolumeGUI(QMainWindow):
 
     def _set_busy(self, busy, message=''):
         self.browse_btn.setEnabled(not busy)
-        self.process_btn.setEnabled(not busy and self._folder_path is not None)
+        self.process_btn.setEnabled(not busy and self._dataset_valid)
         self.dc_btn.setEnabled(not busy)
         self.statusBar().showMessage(message if message else ('Ready' if not busy else ''))
 

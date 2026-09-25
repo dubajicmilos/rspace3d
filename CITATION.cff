@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use rspace3d in your work, please cite it as below."
+type: software
+title: "rspace3d: reciprocal-space 3D processing toolkit for single-crystal X-ray diffuse scattering"
+authors:
+  - family-names: "Dubajić"
+    given-names: "Miloš"
+    affiliation: "Department of Chemical Engineering and Biotechnology, University of Cambridge"
+version: "2.1.0"
+date-released: "2026-09-25"
+license: GPL-3.0-or-later
+repository-code: "https://github.com/dubajicmilos/rspace3d"
+keywords:
+  - crystallography
+  - diffuse scattering
+  - reciprocal space
+  - synchrotron
+  - CrysAlisPro

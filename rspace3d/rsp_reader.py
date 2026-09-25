@@ -159,12 +159,15 @@ def _detect_plane_type(header: bytes) -> str:
     elif k_is_x and l_is_y:
         return 'KL'
     else:
-        # Fallback: check which fixed-value offset is non-zero
-        for label, plane in [('l', 'HK'), ('k', 'HL'), ('h', 'KL')]:
-            val = struct.unpack_from('<d', header, _FIXED_OFFSETS[label])[0]
-            if abs(val) > 1e-10:
-                return plane
-        return 'HK'  # default
+        # Fallback: the plane whose fixed Miller value is set. An ambiguous
+        # header (none or several set) is an error, not an HK layer.
+        detected = [plane for label, plane in [('l', 'HK'), ('k', 'HL'), ('h', 'KL')]
+                    if abs(struct.unpack_from('<d', header, _FIXED_OFFSETS[label])[0]) > 1e-10]
+        if len(detected) == 1:
+            return detected[0]
+        raise ValueError(
+            "Cannot determine plane type: axis flags are absent and "
+            f"{'no' if not detected else 'several'} fixed Miller values are set")
 
 
 def compute_plane_M_inv(ub: npt.NDArray[np.float64],
