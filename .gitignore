@@ -5,6 +5,7 @@ dist/
 build/
 *.spec
 .eggs/
+.pytest_cache/
 *.h5
 *.npz
 *.mat

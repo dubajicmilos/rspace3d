@@ -3,6 +3,21 @@ volume_builder.py — Build, bin, outlier-reject, and symmetrize
 3D reciprocal space volumes from CrysAlisPro unwarp .img files.
 
 Reads .img headers directly for grid computation (no .par file needed).
+
+Volume geometry
+---------------
+Every volume is stored in physical (h, k, l) axis order, `intensity[ih, ik, il]`,
+and its grid is an affine map from array index to Miller index:
+
+    hkl = origin + A @ [ih, ik, il]          (see `volume_affine`)
+
+* CrysAlisPro unwarp rasters (`grid_kind='unwarp_raster'`): the two in-plane
+  rows of `A` carry the raster's shear (`M_inv[0,1]/M_inv[1,1]`, non-zero for
+  monoclinic/triclinic cells), the third axis is the layer stack.
+* rawrecon volumes (`grid_kind='hkl_regular'`): `A` is diagonal.
+
+Symmetry operations and non-native cuts go through `A`, so a sheared raster
+and a regular hkl grid are handled by the same code.
 """
 
 from __future__ import annotations
@@ -12,9 +27,11 @@ import numpy.typing as npt
 import os
 import struct
 import io
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable
+from scipy import ndimage
 from scipy.ndimage import map_coordinates
 
 from .rsp_reader import _PLANE_CONFIG, compute_plane_M_inv, read_rsp_layer
@@ -26,13 +43,80 @@ from .rsp_reader import _PLANE_CONFIG, compute_plane_M_inv, read_rsp_layer
 
 @dataclass
 class VolumeData:
-    """3D reciprocal space volume on a regular Miller index grid."""
-    intensity: npt.NDArray[Any]          # (nh, nk, nl) — int32 raw or float32 processed
+    """3D reciprocal space volume on a regular Miller index grid.
+
+    Axis order is always physical (h, k, l). `plane_type` records which plane
+    the source raster was native to ('HK', 'HL' or 'KL'); for that plane a cut
+    is a direct array slice, the other two are interpolated (`extract_volume_slice`).
+    `H`, `K`, `L` are the Miller indices along each array axis at the raster
+    centre line (for a sheared unwarp raster the in-plane index also shifts
+    with the other in-plane index, see `volume_affine`).
+    """
+    intensity: npt.NDArray[Any]          # (nh, nk, nl) — float32; NaN = unmeasured
     H: npt.NDArray[np.floating]          # (nh,) 1D array of h values
     K: npt.NDArray[np.floating]          # (nk,) 1D array of k values
     L: npt.NDArray[np.floating]          # (nl,) 1D array of l values
-    plane_type: str                      # 'HK', 'HL', or 'KL'
+    plane_type: str                      # native raster plane: 'HK', 'HL', or 'KL'
     metadata: dict[str, Any]             # wavelength, UB, cell params, etc.
+    counts: npt.NDArray[Any] | None = None   # (nh, nk, nl) contributing pixels (rawrecon)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Grid geometry
+# ──────────────────────────────────────────────────────────────────
+
+def _axis_step(axis: npt.NDArray[np.floating], name: str) -> float:
+    """Uniform step of a 1D Miller axis (1.0 for a single point)."""
+    axis = np.asarray(axis, dtype=np.float64)
+    if len(axis) < 2:
+        return 1.0
+    steps = np.diff(axis)
+    step = float(steps.mean())
+    if step == 0 or np.max(np.abs(steps - step)) > 1e-6 * max(1.0, abs(step)):
+        raise ValueError(f"{name} axis is not uniformly spaced")
+    return step
+
+
+def raster_shear(vol: VolumeData) -> float:
+    """Shear ratio of the native raster: in-plane index-1 shift per unit of
+    in-plane index-2 (`M_inv[0,1] / M_inv[1,1]`); 0 for a regular hkl grid."""
+    if vol.metadata.get('grid_kind', 'unwarp_raster') != 'unwarp_raster':
+        return 0.0
+    m_inv = vol.metadata.get('M_inv')
+    if m_inv is None:
+        ub = vol.metadata.get('ub')
+        if ub is None:
+            return 0.0
+        m_inv = compute_plane_M_inv(np.asarray(ub, dtype=np.float64),
+                                    float(vol.metadata.get('wavelength', 1.0)),
+                                    vol.plane_type)
+    m_inv = np.asarray(m_inv, dtype=np.float64)
+    if abs(m_inv[1, 1]) < 1e-15:
+        return 0.0
+    return float(m_inv[0, 1] / m_inv[1, 1])
+
+
+def volume_affine(vol: VolumeData) -> tuple[npt.NDArray[np.float64],
+                                            npt.NDArray[np.float64]]:
+    """Index -> Miller affine map: `hkl = origin + A @ [ih, ik, il]`.
+
+    Built from the 1D axes plus the native raster's shear ratio, so it is exact
+    for binned and unbinned unwarp rasters and for regular rawrecon grids.
+    """
+    dh = _axis_step(vol.H, 'H')
+    dk = _axis_step(vol.K, 'K')
+    dl = _axis_step(vol.L, 'L')
+    A = np.diag([dh, dk, dl]).astype(np.float64)
+    origin = np.array([vol.H[0], vol.K[0], vol.L[0]], dtype=np.float64)
+    shear = raster_shear(vol)
+    if shear != 0.0:
+        # native in-plane axes (x, y) of the raster in physical index order
+        x_axis, y_axis = {'HK': (0, 1), 'HL': (0, 2), 'KL': (1, 2)}[vol.plane_type]
+        axes = [vol.H, vol.K, vol.L]
+        y_step = A[y_axis, y_axis]
+        A[x_axis, y_axis] = shear * y_step
+        origin[x_axis] += shear * float(axes[y_axis][0])
+    return origin, A
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -65,7 +149,16 @@ def _read_header_fast(path: str) -> dict[str, Any]:
     elif k_is_x and l_is_y:
         plane_type, fixed_value = 'KL', h_fixed
     else:
-        plane_type, fixed_value = 'HK', l_fixed
+        # Flagless header: the plane is the one whose fixed Miller value is
+        # set (same rule as rsp_reader). Ambiguous headers are an error, not HK.
+        detected = [(value, plane) for value, plane in
+                    ((l_fixed, 'HK'), (k_fixed, 'HL'), (h_fixed, 'KL'))
+                    if abs(value) > 1e-10]
+        if len(detected) != 1:
+            raise ValueError(
+                f"Cannot determine plane type of {path}: axis flags are absent and "
+                f"{'no' if not detected else 'several'} fixed Miller values are set")
+        fixed_value, plane_type = detected[0]
 
     ub = np.array([f64(2256 + i * 8) for i in range(9)]).reshape(3, 3)
 
@@ -235,73 +328,272 @@ def compute_1d_axes(
 # Binning utilities
 # ──────────────────────────────────────────────────────────────────
 
-def bin_2d(data: npt.NDArray[np.integer], by: int, bx: int) -> npt.NDArray[np.int32]:
-    """Bin 2D array by averaging. Returns int32 (integer average)."""
-    ny, nx = data.shape
+def bin_2d_covered(raw: npt.NDArray[Any], mask: npt.NDArray[np.bool_],
+                   by: int, bx: int, start_y: int = 0, start_x: int = 0,
+                   ) -> npt.NDArray[np.float32]:
+    """Bin a raw frame by the mean over its *covered* sub-pixels only.
+
+    `mask` is the coverage mask (True = measured). Unmeasured sub-pixels
+    (detector `-1`, dead zeros) do not enter the mean, so a partially covered
+    cell keeps the mean of its real measurements instead of being pulled
+    towards -1/0 (`[[100, -1], [-1, -1]]` -> 100, not 24.25). Cells without
+    any covered sub-pixel are NaN. `start_y`/`start_x` leading pixels are
+    skipped so the blocks can be aligned to the raster centre (`bin_starts`).
+    """
+    ny, nx = raw.shape[0] - start_y, raw.shape[1] - start_x
     ny_t = (ny // by) * by
     nx_t = (nx // bx) * bx
-    # Use int64 accumulator to avoid overflow, then back to int32
-    trimmed = data[:ny_t, :nx_t].astype(np.int64)
-    return (trimmed.reshape(ny_t // by, by, nx_t // bx, bx)
-            .sum(axis=(1, 3)) // (by * bx)).astype(np.int32)
+    blocks = (ny_t // by, by, nx_t // bx, bx)
+    m = mask[start_y:start_y + ny_t, start_x:start_x + nx_t].reshape(blocks)
+    values = raw[start_y:start_y + ny_t, start_x:start_x + nx_t].astype(np.int64).reshape(blocks)
+    summed = np.where(m, values, 0).sum(axis=(1, 3)).astype(np.float64)
+    n_cov = m.sum(axis=(1, 3))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        out = np.where(n_cov > 0, summed / np.maximum(n_cov, 1), np.nan)
+    return out.astype(np.float32)
 
 
-def bin_1d(arr: npt.NDArray[np.floating], b: int) -> npt.NDArray[np.floating]:
-    """Bin a 1D array by averaging groups of b elements."""
-    n = (len(arr) // b) * b
-    return arr[:n].reshape(-1, b).mean(axis=1)
+MORPH_MAX_KERNEL = 101   # px; ~11x the largest real 'auto' kernel (I19-2: 9 px)
+
+
+def adaptive_morph_size(s_per_pixel: float, recip_period: float,
+                        fraction_of_bragg: float = 0.05,
+                        min_morph: int = 3) -> int:
+    """Pick a morph kernel that covers `fraction_of_bragg` of one Bragg cell.
+
+    Parameters
+    ----------
+    s_per_pixel : float
+        Cartesian step per detector pixel in 1/A. For an unwarped frame this
+        is `2 / (d_min * NX)`.
+    recip_period : float
+        Length of one reciprocal-lattice period along the in-plane axes,
+        in 1/A. For an HK plane that is `mean(|a*|, |b*|)`.
+    fraction_of_bragg : float, default 0.05
+        Target kernel side length, as a fraction of one Bragg cell. 0.05
+        was calibrated on perovskite I19-2 unwarp frames where convergence
+        of `n_unmeasured` happened at 0.04-0.05.
+    min_morph : int, default 3
+        Floor on the returned kernel size.
+
+    Returns
+    -------
+    int
+        Odd integer, >= min_morph. The kernel side length in pixels.
+    """
+    for name, value in (('s_per_pixel', s_per_pixel), ('recip_period', recip_period),
+                        ('fraction_of_bragg', fraction_of_bragg)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive, got {value!r}")
+    n = max(min_morph, int(np.ceil(fraction_of_bragg * recip_period / s_per_pixel)))
+    if n > MORPH_MAX_KERNEL:
+        warnings.warn(
+            f"adaptive morph kernel {n} px exceeds the {MORPH_MAX_KERNEL} px ceiling "
+            f"(s_per_pixel={s_per_pixel:.3g}, recip_period={recip_period:.3g}); "
+            "clamped. Check d_min / UB in the .img header.", RuntimeWarning, stacklevel=2)
+        n = MORPH_MAX_KERNEL
+    return n if (n % 2) else n + 1   # force odd for symmetric structuring element
+
+
+def build_coverage_mask(raw: npt.NDArray[np.integer],
+                        morph_size: int = 3) -> npt.NDArray[np.bool_]:
+    """Return bool mask True=measured / False=unmeasured for a raw .img frame.
+
+    CrysAlisPro .img stores unmeasured pixels as either
+      - `-1`   : detector-flagged bad pixel
+      - `0`    : large dead region (beamstop, outer mask, edge), but `0` also
+                 occurs as a genuine low-count measurement
+
+    A morphological opening with an NxN square structuring element keeps
+    'solid' dead blocks while erasing isolated zeros and thin 1-pixel lines
+    (treated as real measurements).
+
+    For `morph_size`, see `adaptive_morph_size` to derive a value from the
+    detector's Cartesian step and the in-plane reciprocal-lattice period
+    (recommended path is `load_unwarp_folder(morph_size='auto')` which
+    computes it once from the .img header).
+    """
+    bad = (raw == -1)
+    zero = (raw == 0)
+    struct = np.ones((morph_size, morph_size), dtype=bool)
+    unmeasured_zero = ndimage.binary_opening(zero, structure=struct)
+    unmeasured = unmeasured_zero | bad
+    return ~unmeasured
+
+
+def bin_1d(arr: npt.NDArray[np.floating], b: int, start: int = 0) -> npt.NDArray[np.floating]:
+    """Bin a 1D array by averaging groups of b elements (skipping `start` leading ones)."""
+    n = ((len(arr) - start) // b) * b
+    return arr[start:start + n].reshape(-1, b).mean(axis=1)
+
+
+def _binned_center(c: float, b: int, start: int = 0) -> float:
+    """1-based raster centre after binning by `b` (blocks start at pixel 1 + start)."""
+    return (c - 1.0 - start) / b + 1.0 - (b - 1.0) / (2.0 * b)
+
+
+def _axis_center(axis: npt.NDArray[np.floating]) -> float:
+    """1-based position of Miller index 0 along a uniform axis."""
+    return 1.0 - float(axis[0]) / _axis_step(axis, 'axis')
+
+
+def _bin_start(c: float, b: int) -> int | None:
+    """Leading pixels to skip so the centre `c` (1-based) sits on a bin edge
+    or bin centre after binning by `b`; None when no integer skip achieves it.
+
+    Bin edges sit at pixel coordinate 0.5 + skip + b*j and bin centres half
+    a bin further, so `c - 0.5 - skip` must be a multiple of b/2.
+    """
+    half = b / 2.0
+    r = (c - 0.5) % half
+    if abs(r - round(r)) > 1e-9:          # would need a fractional skip
+        return None
+    return int(round(r))
+
+
+def _bin_kind(c: float, b: int, start: int) -> int:
+    """0 = centre on a bin edge, 1 = centre on a bin centre (after `start` skip)."""
+    return int(round((c - 0.5 - start) / (b / 2.0))) % 2
+
+
+def bin_starts(axes: list[npt.NDArray[np.floating]], factors: list[int],
+               couple: tuple[int, int] | None = None) -> list[int]:
+    """Block alignment for binning: leading samples to skip per axis.
+
+    Chosen so that each axis keeps Miller index 0 on a bin edge or a bin centre
+    (inversion stays an exact index map), and, for the two `couple`d axes, so
+    that both are of the same kind (90 deg rotations and the hexagonal
+    operations, which mix the two in-plane axes, stay exact). Costs at most
+    `b` samples at the raster edge. Falls back to 0 where no alignment exists
+    (e.g. an odd layer count binned by 2), in which case `symmetrize_volume`
+    interpolates the affected operations.
+    """
+    starts = []
+    for axis, b in zip(axes, factors):
+        if b == 1 or len(axis) < 2 * b:
+            starts.append(0)
+            continue
+        s = _bin_start(_axis_center(axis), b)
+        starts.append(0 if s is None else s)
+    if couple is not None:
+        i, j = couple
+        bi, bj = factors[i], factors[j]
+        if bi == bj and bi > 1 and bi % 2 == 0 and len(axes[j]) >= 2 * bj + bj // 2:
+            ci, cj = _axis_center(axes[i]), _axis_center(axes[j])
+            if (_bin_start(ci, bi) is not None and _bin_start(cj, bj) is not None
+                    and _bin_kind(ci, bi, starts[i]) != _bin_kind(cj, bj, starts[j])):
+                starts[j] += bj // 2
+    return starts
 
 
 def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
-    """Bin the 3D volume by averaging."""
+    """Bin the 3D volume by averaging (NaN-aware).
+
+    NaN voxels (unmeasured) are excluded from the bin mean. A binned cell
+    becomes NaN only if every sub-cell was NaN. `counts` (rawrecon pixel
+    counts) are summed. Blocks are aligned to the grid centre (`bin_starts`)
+    so that symmetry operations remain exact index maps on the binned grid;
+    the (fewer than 2b per axis) edge layers this costs are recorded in
+    metadata as `bin_dropped_layers_hkl` / `bin_starts_hkl`.
+    """
+    x_axis, y_axis = {'HK': (0, 1), 'HL': (0, 2), 'KL': (1, 2)}[vol.plane_type]
+    factors = [bh, bk, bl]
+    bx, by = factors[x_axis], factors[y_axis]
+    if bx != by:
+        raise ValueError(f"in-plane bin factors must be equal, got {bx} x {by}")
     nh, nk, nl = vol.intensity.shape
-    nh_t = (nh // bh) * bh
-    nk_t = (nk // bk) * bk
-    nl_t = (nl // bl) * bl
-    trimmed = vol.intensity[:nh_t, :nk_t, :nl_t]
+    starts = bin_starts([vol.H, vol.K, vol.L], factors, couple=(x_axis, y_axis))
+    sh, sk, sl = starts
+    nh_t = ((nh - sh) // bh) * bh
+    nk_t = ((nk - sk) // bk) * bk
+    nl_t = ((nl - sl) // bl) * bl
+    dropped = [nh - nh_t, nk - nk_t, nl - nl_t]     # alignment + remainder, < 2b each
+    box = (slice(sh, sh + nh_t), slice(sk, sk + nk_t), slice(sl, sl + nl_t))
+    trimmed = vol.intensity[box].astype(np.float32)
+    blocks = (nh_t // bh, bh, nk_t // bk, bk, nl_t // bl, bl)
 
-    # Keep int32 if input is integer, else float32
-    if np.issubdtype(trimmed.dtype, np.integer):
-        # Sum one axis at a time to avoid allocating the full volume as int64.
-        # Each sum reduces the array before the next upcast+sum.
-        acc = trimmed.reshape(nh_t // bh, bh, nk_t, nl_t)
-        acc = acc.sum(axis=1, dtype=np.int64)
-        acc = acc.reshape(nh_t // bh, nk_t // bk, bk, nl_t)
-        acc = acc.sum(axis=2)
-        if bl > 1:
-            acc = acc.reshape(nh_t // bh, nk_t // bk, nl_t // bl, bl)
-            acc = acc.sum(axis=3)
-        binned = (acc // (bh * bk * bl)).astype(np.int32)
-    else:
-        binned = trimmed.reshape(
-            nh_t // bh, bh, nk_t // bk, bk, nl_t // bl, bl
-        ).mean(axis=(1, 3, 5)).astype(np.float32)
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)       # all-NaN blocks are fine
+        binned = np.nanmean(trimmed.reshape(blocks), axis=(1, 3, 5)).astype(np.float32)
+    counts = None
+    if vol.counts is not None:
+        counts = vol.counts[box].astype(np.int64).reshape(blocks).sum(axis=(1, 3, 5))
 
-    # Update metadata to reflect binned pixel grid
+    # Update metadata to reflect the binned raster. The in-plane bin factor
+    # of the native raster scales its Cartesian step `s`; the raster centre
+    # follows the block layout (blocks start at pixel 1).
     meta = vol.metadata.copy()
-    nh_new = nh_t // bh
-    nk_new = nk_t // bk
-    old_bin = meta.get('bin_xy', 1)
     if 's' in meta:
-        meta['s'] = meta['s'] * max(bh, bk)  # Cartesian step scales with binning
-    meta['cx'] = (nh_new + 1) / 2.0
-    meta['cy'] = (nk_new + 1) / 2.0
-    meta['bin_xy'] = old_bin * max(bh, bk)
-    meta['bin_z'] = meta.get('bin_z', 1) * bl
+        meta['s'] = meta['s'] * bx
+    if 'cx' in meta:
+        meta['cx'] = _binned_center(meta['cx'], bx, starts[x_axis])
+    if 'cy' in meta:
+        meta['cy'] = _binned_center(meta['cy'], by, starts[y_axis])
+    meta['bin_xy'] = meta.get('bin_xy', 1) * bx
+    meta['bin_z'] = meta.get('bin_z', 1) * factors[3 - x_axis - y_axis]
+    if any(dropped):
+        meta['bin_dropped_layers_hkl'] = dropped
+        meta['bin_starts_hkl'] = list(starts)
 
     return VolumeData(
         intensity=binned,
-        H=bin_1d(vol.H[:nh_t], bh),
-        K=bin_1d(vol.K[:nk_t], bk),
-        L=bin_1d(vol.L[:nl_t], bl),
+        H=bin_1d(vol.H, bh, sh),
+        K=bin_1d(vol.K, bk, sk),
+        L=bin_1d(vol.L, bl, sl),
         plane_type=vol.plane_type,
         metadata=meta,
+        counts=counts,
     )
+
+
+def bin_native(vol: VolumeData, bin_xy: int, bin_z: int) -> VolumeData:
+    """Bin in-plane by `bin_xy` and along the layer stack by `bin_z`.
+
+    Maps the raster-relative factors onto the physical (h, k, l) axes of the
+    volume's native plane (the layer axis is l for HK, k for HL, h for KL).
+    """
+    factors = [bin_xy, bin_xy, bin_xy]
+    factors[{'HK': 2, 'HL': 1, 'KL': 0}[vol.plane_type]] = bin_z
+    return bin_volume(vol, *factors)
 
 
 # ──────────────────────────────────────────────────────────────────
 # Volume loading
 # ──────────────────────────────────────────────────────────────────
+
+def unwarp_source_manifest(folder: str) -> str:
+    """Fingerprint of the unwarp inputs: numbered .img names, sizes and
+    modification times plus the same for the resolved .par file.
+
+    Stored in the `_raw.h5` cache as `source_manifest`; a cache is reused only
+    when the fingerprint of the folder still matches (`raw_cache_mismatch`),
+    so added, removed or re-written layers are never silently ignored.
+    """
+    import hashlib
+    h = hashlib.sha1()
+    for fname in _filter_numbered_imgs(folder):
+        st = os.stat(os.path.join(folder, fname))
+        h.update(f"{fname}|{st.st_size}|{st.st_mtime_ns}\n".encode('utf-8'))
+    par_path = find_par_file(folder)
+    if par_path:
+        st = os.stat(par_path)
+        h.update(f"par:{os.path.abspath(par_path)}|{st.st_size}|{st.st_mtime_ns}\n"
+                 .encode('utf-8'))
+    return h.hexdigest()
+
+
+def raw_cache_mismatch(cached: VolumeData, folder: str, morph_size: int) -> str | None:
+    """Why a cached `_raw.h5` cannot stand in for re-reading `folder` (None = reusable)."""
+    if cached.metadata.get('morph_size') != morph_size:
+        return (f"mask kernel morph={cached.metadata.get('morph_size')} does not match "
+                f"the requested morph={morph_size}")
+    stamp = cached.metadata.get('source_manifest')
+    if not stamp:
+        return "the cache predates source fingerprinting (rspace3d < 2.1)"
+    if stamp != unwarp_source_manifest(folder):
+        return "the .img files or the .par file changed since the cache was written"
+    return None
+
 
 def _filter_numbered_imgs(folder: str) -> list[str]:
     """Return only numbered .img files sharing the most common prefix.
@@ -326,7 +618,8 @@ def _filter_numbered_imgs(folder: str) -> list[str]:
     prefix_counts = Counter(prefixes)
     main_prefix = prefix_counts.most_common(1)[0][0]
 
-    return [f for f in all_numbered if f.rsplit('_', 1)[0] == main_prefix]
+    return sorted((f for f in all_numbered if f.rsplit('_', 1)[0] == main_prefix),
+                  key=_img_number)
 
 
 def _img_number(fname: str) -> int:
@@ -378,24 +671,58 @@ def scan_unwarp_folder(folder: str) -> list[tuple[str, float]]:
     """
     img_files = _filter_numbered_imgs(folder)
     files = []
+    plane_types = set()
     for fname in img_files:
         path = os.path.join(folder, fname)
         hdr = _read_header_fast(path)
         files.append((path, hdr['fixed_value']))
+        plane_types.add(hdr['plane_type'])
+    if len(plane_types) > 1:
+        raise ValueError(f"Mixed plane types in {folder}: {sorted(plane_types)}")
     files.sort(key=lambda x: x[1])
+    # The layer stack must be a uniform axis: duplicates or a missing layer
+    # would silently corrupt every index map through that axis.
+    fixed = np.array([fv for _, fv in files], dtype=np.float64)
+    if len(fixed) > 1:
+        steps = np.diff(fixed)
+        if np.any(steps <= 0):
+            dup = [os.path.basename(files[i + 1][0]) for i in np.nonzero(steps <= 0)[0]]
+            raise ValueError(
+                f"Duplicate layer coordinates in {folder} (e.g. {dup[0]}): "
+                "remove the stray .img files")
+        step = float(np.median(steps))
+        bad = np.nonzero(np.abs(steps - step) > 1e-3 * step)[0]
+        if len(bad):
+            i = int(bad[0])
+            raise ValueError(
+                f"Layer spacing is not uniform in {folder}: {fixed[i]:g} -> "
+                f"{fixed[i + 1]:g} (expected step {step:g}); a layer may be missing")
     return files
 
 
 def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
+                       morph_size: int | str = 'auto',
                        progress_callback: Callable[[int, int], None] | None = None,
                        max_workers: int = 0) -> VolumeData:
     """Load all .img files from unwarp folder into a 3D volume.
 
-    Data is kept as int32 (native CrysAlisPro format) to save memory.
-    Only converted to float during processing (outlier rejection / symmetrization).
+    Unmeasured voxels (detector-bad `-1` and solid-zero dead regions) are
+    flagged using a per-frame coverage mask (`build_coverage_mask`) and
+    encoded as `NaN` in the float32 intensity volume. `symmetrize_volume`
+    skips `NaN` voxels, so downstream statistics never mix real zeros with
+    unmeasured pixels.
 
-    Per-file reads (fabio decode + optional bin) run on a ThreadPoolExecutor;
-    both steps release the GIL, so threading scales well on typical disks.
+    Parameters
+    ----------
+    morph_size : int or 'auto', default 'auto'
+        Side length of the morphological-opening kernel that decides which
+        zero pixels are real measurements vs unmeasured. `'auto'` derives
+        it once from the .img header so the kernel covers ~5% of one
+        in-plane Bragg cell — adapts to detector distance, pixel count
+        and unit-cell size. Pass an integer to override.
+
+    Per-file reads (fabio decode + mask + bin) run on a ThreadPoolExecutor;
+    all steps release the GIL, so threading scales well on typical disks.
     `max_workers=0` auto-picks `min(8, cpu_count())`; pass `max_workers=1` to
     disable threading (e.g. on RAM-constrained machines — each worker holds
     one raw frame transiently).
@@ -409,37 +736,85 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
     plane_type = ref_header['plane_type']
     axis_x_full, axis_y_full = compute_1d_axes(ref_header)
 
+    # Resolve morph_size='auto' once from header geometry. Track both the
+    # mode (auto/manual) and the geometry inputs so they land in metadata.
+    morph_recip_period: float | None = None
+    morph_s_per_pixel: float | None = None
+    if isinstance(morph_size, str):
+        if morph_size != 'auto':
+            raise ValueError(f"morph_size must be 'auto' or int, got {morph_size!r}")
+        morph_mode = 'auto'
+        # Cartesian step per pixel (1/A)
+        morph_s_per_pixel = 2.0 / (ref_header['d_min'] * nx)
+        # In-plane reciprocal-vector columns by plane type
+        plane_to_cols = {'HK': (0, 1), 'HL': (0, 2), 'KL': (1, 2)}
+        c1, c2 = plane_to_cols[plane_type]
+        ub = np.asarray(ref_header['ub']).reshape(3, 3)
+        wl = ref_header['wavelength']
+        period_1 = float(np.linalg.norm(ub[:, c1] / wl))
+        period_2 = float(np.linalg.norm(ub[:, c2] / wl))
+        morph_recip_period = 0.5 * (period_1 + period_2)
+        morph_size = adaptive_morph_size(morph_s_per_pixel, morph_recip_period)
+    elif not isinstance(morph_size, (int, np.integer)) or morph_size < 1:
+        raise ValueError(f"morph_size must be 'auto' or positive int, got {morph_size!r}")
+    else:
+        morph_mode = 'manual'
+        morph_size = int(morph_size)
+
     if bin_xy > 1:
-        axis_x = bin_1d(axis_x_full[:(len(axis_x_full) // bin_xy * bin_xy)], bin_xy)
-        axis_y = bin_1d(axis_y_full[:(len(axis_y_full) // bin_xy * bin_xy)], bin_xy)
+        # blocks aligned to the raster centre so symmetry maps stay exact
+        start_x, start_y = bin_starts([axis_x_full, axis_y_full], [bin_xy, bin_xy],
+                                      couple=(0, 1))
+        axis_x = bin_1d(axis_x_full, bin_xy, start_x)
+        axis_y = bin_1d(axis_y_full, bin_xy, start_y)
         nx_bin, ny_bin = len(axis_x), len(axis_y)
     else:
+        start_x = start_y = 0
         axis_x, axis_y = axis_x_full, axis_y_full
         nx_bin, ny_bin = nx, ny
 
     n_files = len(file_list)
 
-    # int32 storage — same as MATLAB's int32
-    volume = np.zeros((nx_bin, ny_bin, n_files), dtype=np.int32)
-    l_values = np.zeros(n_files, dtype=np.float64)
+    # float32 storage in physical (h, k, l) order. NaN = unmeasured, finite =
+    # measured (including real 0). The raster's x/y axes and the layer stack
+    # land on the physical axes of the native plane.
+    layer_values = np.zeros(n_files, dtype=np.float64)
+    # HK: (x, y, layer) = (h, k, l); HL: (x, layer, y); KL: (layer, x, y)
+    layer_axis = {'HK': 2, 'HL': 1, 'KL': 0}[plane_type]
+    shape = [nx_bin, ny_bin]
+    shape.insert(layer_axis, n_files)
+    volume = np.full(tuple(shape), np.nan, dtype=np.float32)
+
+    def put(i: int, frame: npt.NDArray[np.float32]) -> None:
+        index: list[Any] = [slice(None), slice(None)]
+        index.insert(layer_axis, i)
+        volume[tuple(index)] = frame
 
     workers = max_workers if max_workers > 0 else min(8, os.cpu_count() or 1)
 
     def _load_frame(args):
         idx, path, fixed_val = args
-        data = _read_intensity(path)  # int32 (ny, nx)
+        raw = _read_intensity(path)                           # int32 (ny, nx)
+        mask_raw = build_coverage_mask(raw, morph_size=morph_size)  # bool
         if bin_xy > 1:
-            data = bin_2d(data, bin_xy, bin_xy)  # int32
-        return idx, fixed_val, data.T
+            # mean over the covered sub-pixels only; NaN where none is covered
+            binned = bin_2d_covered(raw, mask_raw, bin_xy, bin_xy, start_y, start_x)
+        else:
+            binned = np.where(mask_raw, raw, np.nan).astype(np.float32)
+        data_T = np.ascontiguousarray(binned.T)               # (x, y)
+        n_unmeasured = int(np.count_nonzero(np.isnan(data_T)))
+        return idx, fixed_val, data_T, n_unmeasured
 
     n_done = 0
+    n_unmeasured_per_frame = np.zeros(n_files, dtype=np.int64)
     with ThreadPoolExecutor(max_workers=workers) as exe:
         futs = [exe.submit(_load_frame, (i, path, fv))
                 for i, (path, fv) in enumerate(file_list)]
         for fut in as_completed(futs):
-            idx, fixed_val, data_T = fut.result()
-            volume[:, :, idx] = data_T
-            l_values[idx] = fixed_val
+            idx, fixed_val, data_T, n_unmeasured = fut.result()
+            put(idx, data_T)
+            layer_values[idx] = fixed_val
+            n_unmeasured_per_frame[idx] = n_unmeasured
             n_done += 1
             if progress_callback:
                 progress_callback(n_done, n_files)
@@ -454,27 +829,48 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
         if par_cell:
             cell = par_cell
 
+    # Coverage-mask diagnostics. The raster geometry (s, cx, cy) describes
+    # the volume as stored, i.e. after in-plane binning; bin_z is applied
+    # once, below, through bin_volume.
+    frame_npix_post_bin = nx_bin * ny_bin
     metadata = {
         'wavelength': ref_header['wavelength'],
         'ub': ref_header['ub'],
         'd_min': ref_header['d_min'],
         'source_folder': folder,
-        'bin_xy': bin_xy, 'bin_z': bin_z,
+        'source_manifest': unwarp_source_manifest(folder),
+        'grid_kind': 'unwarp_raster',
+        'bin_xy': bin_xy, 'bin_z': 1,
         'n_files': n_files,
         'cell': cell,
         'M_inv': ref_layer.M_inv,
-        's': ref_layer.s,
-        'cx': ref_layer.cx,
-        'cy': ref_layer.cy,
+        's': ref_layer.s * bin_xy,
+        'cx': _binned_center(ref_layer.cx, bin_xy, start_x),
+        'cy': _binned_center(ref_layer.cy, bin_xy, start_y),
+        'morph_size': morph_size,
+        'morph_mode': morph_mode,
+        'morph_s_per_pixel': morph_s_per_pixel,
+        'morph_recip_period': morph_recip_period,
+        'n_unmeasured_per_frame_mean': float(n_unmeasured_per_frame.mean()),
+        'n_unmeasured_per_frame_min': int(n_unmeasured_per_frame.min()),
+        'n_unmeasured_per_frame_max': int(n_unmeasured_per_frame.max()),
+        'n_unmeasured_per_frame_pct': float(
+            100.0 * n_unmeasured_per_frame.mean() / frame_npix_post_bin),
+        'frame_npix': int(frame_npix_post_bin),
     }
 
+    axes = {'HK': (axis_x, axis_y, layer_values),
+            'HL': (axis_x, layer_values, axis_y),
+            'KL': (layer_values, axis_x, axis_y)}[plane_type]
     vol = VolumeData(
-        intensity=volume, H=axis_x, K=axis_y, L=l_values,
+        intensity=volume, H=axes[0], K=axes[1], L=axes[2],
         plane_type=plane_type, metadata=metadata,
     )
 
     if bin_z > 1:
-        vol = bin_volume(vol, 1, 1, bin_z)
+        factors = [1, 1, 1]
+        factors[layer_axis] = bin_z
+        vol = bin_volume(vol, *factors)
     return vol
 
 
@@ -505,14 +901,20 @@ def _generate_group(
     return [np.array(o, dtype=int).reshape(3, 3) for o in ops]
 
 
+# Generators act on Miller indices, h' = W h. For the hexagonal setting
+# (a = b, gamma = 120 deg) the Miller-index operators are the transposed
+# inverses of the familiar direct-space matrices: the 3-fold about c is
+# (h, k, l) -> (-h-k, h, l), the 6-fold (h, k, l) -> (-k, h+k, l) and the
+# 2-fold along a is (h, k, l) -> (h-k... ) see below. rspace3d <= 2.0.0 used
+# the direct-space matrices, which do not preserve |q| on a hexagonal cell.
 _INV = -np.eye(3, dtype=int)
 _C2a = np.diag([1, -1, -1]).astype(int)
 _C2b = np.diag([-1, 1, -1]).astype(int)
 _C4c = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=int)
 _C3_111 = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], dtype=int)
-_C3_hex = np.array([[0, -1, 0], [1, -1, 0], [0, 0, 1]], dtype=int)
-_C6_hex = np.array([[1, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=int)
-_C2p_hex = np.array([[1, -1, 0], [0, -1, 0], [0, 0, -1]], dtype=int)
+_C3_hex = np.array([[-1, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=int)    # (h,k,l)->(-h-k, h, l)
+_C6_hex = np.array([[0, -1, 0], [1, 1, 0], [0, 0, 1]], dtype=int)     # (h,k,l)->(-k, h+k, l)
+_C2p_hex = np.array([[1, 0, 0], [-1, -1, 0], [0, 0, -1]], dtype=int)  # 2-fold along a
 
 _EXPECTED_ORDERS = {
     '-1': 2, '2/m': 4, 'mmm': 8, '4/m': 8, '4/mmm': 16,
@@ -544,7 +946,9 @@ def get_symmetry_operations(laue_group: str) -> list[npt.NDArray[np.int_]]:
             raise ValueError(f"Unknown Laue group '{laue_group}'. "
                              f"Valid: {list(_LAUE_GENERATORS.keys())}")
         ops = _generate_group(_LAUE_GENERATORS[laue_group])
-        assert len(ops) == _EXPECTED_ORDERS[laue_group]
+        if len(ops) != _EXPECTED_ORDERS[laue_group]:
+            raise RuntimeError(f"Generated {len(ops)} operations for {laue_group}, "
+                               f"expected {_EXPECTED_ORDERS[laue_group]}")
         _LAUE_GROUPS_CACHE[laue_group] = ops
     return _LAUE_GROUPS_CACHE[laue_group]
 
@@ -564,67 +968,25 @@ LAUE_GROUP_NAMES = {
 }
 
 
-# ──────────────────────────────────────────────────────────────────
-# Axis mapping helpers
-# ──────────────────────────────────────────────────────────────────
+def laue_metric_residual(vol: VolumeData, laue_group: str) -> float | None:
+    """Largest relative violation of `W^T G* W = G*` over the group's operations.
 
-def _get_axis_mapping(plane_type: str) -> dict[str, str]:
-    """Map volume axes (H,K,L) to standard (h,k,l).
-    HK: H->h, K->k, L->l | HL: H->h, K->l, L->k | KL: H->k, K->l, L->h
+    `G* = B^T B` is the reciprocal metric from the volume's UB. Zero for a
+    group the cell really has; ~1e-3 for a pseudo-symmetric cell (allowed);
+    order 1 when the operations are in the wrong setting or the wrong group
+    was chosen. None if the volume carries no UB.
     """
-    return {'HK': {'H': 'h', 'K': 'k', 'L': 'l'},
-            'HL': {'H': 'h', 'K': 'l', 'L': 'k'},
-            'KL': {'H': 'k', 'K': 'l', 'L': 'h'},
-            }.get(plane_type, {'H': 'h', 'K': 'k', 'L': 'l'})
-
-
-def _build_axis_permutation(
-    op: npt.NDArray[np.int_],
-    axis_map: dict[str, str],
-) -> tuple[list[int], list[int]] | None:
-    """For a symmetry operation, determine how it permutes volume axes.
-
-    Returns (src_axes, signs) where for each volume dimension i:
-        target_dim_i_value = signs[i] * source_axis[src_axes[i]]
-
-    Only valid for signed-permutation operations (one non-zero per row).
-    Returns None if the operation is not a signed permutation.
-    """
-    # axis_map: e.g. {'H': 'h', 'K': 'k', 'L': 'l'} for HK planes
-    vol_to_std = {'H': 0, 'K': 1, 'L': 2}  # volume dim -> std axis index
-    std_to_vol = {}
-    for vol_ax, std_ax in axis_map.items():
-        std_idx = {'h': 0, 'k': 1, 'l': 2}[std_ax]
-        vol_dim = {'H': 0, 'K': 1, 'L': 2}[vol_ax]
-        std_to_vol[std_idx] = vol_dim
-        vol_to_std[vol_ax] = std_idx
-
-    # Convert vol_dim -> std_idx mapping
-    dim_to_std: list[int] = [0, 0, 0]
-    for vol_ax in ['H', 'K', 'L']:
-        vol_dim = {'H': 0, 'K': 1, 'L': 2}[vol_ax]
-        std_idx = {'h': 0, 'k': 1, 'l': 2}[axis_map[vol_ax]]
-        dim_to_std[vol_dim] = std_idx
-
-    # For each target volume dim i:
-    # target_std[dim_to_std[i]] = sum(op[dim_to_std[i], j] * source_std[j])
-    # We need: which source volume dim provides the value, and with what sign
-    src_dims = []
-    signs = []
-    for i in range(3):  # target volume dim
-        tgt_std = dim_to_std[i]  # which standard axis this vol dim represents
-        # op row tgt_std: target_std[tgt_std] = sum(op[tgt_std, j] * src_std[j])
-        row = op[tgt_std, :]
-        nonzero = [(j, int(row[j])) for j in range(3) if row[j] != 0]
-        if len(nonzero) != 1:
-            return None  # Not a signed permutation
-        src_std_idx, sign = nonzero[0]
-        # Which volume dim has std axis src_std_idx?
-        src_vol_dim = std_to_vol[src_std_idx]
-        src_dims.append(src_vol_dim)
-        signs.append(sign)
-
-    return src_dims, signs
+    ub = vol.metadata.get('ub')
+    if ub is None:
+        return None
+    wavelength = float(vol.metadata.get('wavelength') or 1.0)
+    recip = np.asarray(ub, dtype=np.float64) / wavelength
+    gstar = recip.T @ recip
+    scale = float(np.abs(gstar).max())
+    worst = 0.0
+    for op in get_symmetry_operations(laue_group):
+        worst = max(worst, float(np.abs(op.T @ gstar @ op - gstar).max()) / scale)
+    return worst
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -645,300 +1007,343 @@ HAS_GPU = _has_gpu()
 
 
 # ──────────────────────────────────────────────────────────────────
-# Precomputed operation maps (shared between sym & reject)
+# Operation maps in array-index space
 # ──────────────────────────────────────────────────────────────────
 
-def _precompute_op_maps(
-    vol: VolumeData,
-    laue_group: str,
-    xp: Any = None,
-) -> list[tuple[list[Any], list[Any]] | None]:
-    """Precompute 1D index maps for all operations. Works with numpy or cupy."""
-    if xp is None:
-        xp = np
-    ops = get_symmetry_operations(laue_group)
-    axes = [vol.H, vol.K, vol.L]
-    steps = [axes[i][1] - axes[i][0] if len(axes[i]) > 1 else 1.0 for i in range(3)]
-    origins = [axes[i][0] for i in range(3)]
-    sizes = [len(vol.H), len(vol.K), len(vol.L)]
-    axis_map = _get_axis_mapping(vol.plane_type)
-
-    op_maps: list[tuple[list[Any], list[Any]] | None] = []
-    for op in ops:
-        perm = _build_axis_permutation(op, axis_map)
-        if perm is None:
-            op_maps.append(None)  # hex/trig fallback
-            continue
-
-        src_dims, signs = perm
-        idx_1d = []
-        valid_1d = []
-        for i in range(3):
-            sd = src_dims[i]
-            sgn = signs[i]
-            src_idx = np.round(
-                (sgn * axes[i] - origins[sd]) / steps[sd]
-            ).astype(np.intp)
-            v = (src_idx >= 0) & (src_idx < sizes[sd])
-            idx_1d.append(xp.asarray(np.clip(src_idx, 0, sizes[sd] - 1)))
-            valid_1d.append(xp.asarray(v))
-
-        inv_map: list[int] = [0, 0, 0]
-        for i in range(3):
-            inv_map[src_dims[i]] = i
-
-        gather_idx = [idx_1d[inv_map[d]] for d in range(3)]
-        gather_valid = [valid_1d[inv_map[d]] for d in range(3)]
-
-        shapes = [[1, 1, 1] for _ in range(3)]
-        for d in range(3):
-            shapes[d][inv_map[d]] = sizes[inv_map[d]]
-
-        gi = [gather_idx[d].reshape(shapes[d]) for d in range(3)]
-        gv = [gather_valid[d].reshape(shapes[d]) for d in range(3)]
-        op_maps.append((gi, gv))
-
-    return op_maps
+_INDEX_MAP_TOL = 1e-4     # index units; a map is exact when all entries are integers
+_PERM_NEGLECT_TOL = 0.25  # voxels; off-permutation terms below this are rounded away
 
 
-# ──────────────────────────────────────────────────────────────────
-# Core symmetrization loop (works with numpy or cupy arrays)
-# ──────────────────────────────────────────────────────────────────
+def index_space_ops(vol: VolumeData, laue_group: str) -> list[dict[str, Any]]:
+    """Express each Miller-index operation W as an array-index map i' = M i + t.
 
-def _symmetrize_core(
-    data: Any,
-    op_maps: list[tuple[list[Any], list[Any]] | None],
-    vol: VolumeData,
-    xp: Any = None,
-) -> Any:
-    """Run symmetrization using precomputed maps. xp = numpy or cupy.
-
-    Memory-efficient: uses float32 accumulator + int16 count, deletes
-    temps immediately.  At bin_xy=2 (1.5 GB volume), total GPU usage is
-    ~5.5 GB peak, fitting in 8 GB VRAM.
+    With `hkl = origin + A i` (see `volume_affine`):
+        M = A^-1 W A,   t = A^-1 (W origin - origin).
+    Each entry has 'op' (W), 'M', 't' and 'kind':
+      'perm'     M is a signed permutation with integer t: exact 1D gather
+      'nearest'  M is a signed permutation up to terms that displace a source
+                 position by < `_PERM_NEGLECT_TOL` voxels anywhere in the
+                 volume, but its scale/offset are not integers (a raster whose
+                 layer step differs from the pixel step, a pseudo-symmetric
+                 cell with dh != dk, an unaligned binning): every target voxel
+                 takes its nearest source voxel through 1D rounded index
+                 arrays, as rspace3d <= 2.0.0 did for all operations (<= 0.5
+                 voxel positional error, no smoothing)
+      'integer'  M and t integer but not a permutation (hexagonal/trigonal
+                 3- and 6-fold operations on a regular grid): exact gather
+      'interp'   otherwise (a sheared monoclinic unwarp raster under a
+                 2-fold): trilinear, support-normalised interpolation
     """
-    if xp is None:
-        xp = np
-    nh, nk, nl = data.shape
-
-    # float32 sum (not float64) — saves 50% memory.
-    # Precision: max sum = 48 * 7M = 336M, float32 mantissa = 24 bits
-    # (exact up to 16.7M). Worst case ~1e-4 relative error on bright pixels,
-    # well within noise. After dividing by count, result is in original range.
-    sym_sum = xp.zeros((nh, nk, nl), dtype=xp.float32)
-    sym_count = xp.zeros((nh, nk, nl), dtype=xp.int16)  # max 48 ops
-
-    for om in op_maps:
-        if om is None:
-            continue
-        gi, gv = om
-
-        vals = data[gi[0], gi[1], gi[2]]
-        mask = gv[0] & gv[1] & gv[2]
-        mask = mask & (vals != 0)
-        vals *= mask
-        sym_sum += vals
-        sym_count += mask
-        del vals, mask
-
-    with np.errstate(invalid='ignore', divide='ignore'):
-        count_f = sym_count.astype(xp.float32)
-        result = xp.where(count_f > 0, sym_sum / count_f, 0)
-    del sym_sum, sym_count, count_f
+    origin, A = volume_affine(vol)
+    A_inv = np.linalg.inv(A)
+    n = np.array(vol.intensity.shape, dtype=np.float64)
+    centre = (n - 1) / 2.0
+    corners = np.array([[i, j, k] for i in (0, n[0] - 1) for j in (0, n[1] - 1)
+                        for k in (0, n[2] - 1)], dtype=np.float64) - centre
+    result = []
+    for op in get_symmetry_operations(laue_group):
+        M = A_inv @ op @ A
+        t = A_inv @ (op @ origin - origin)
+        M_int = np.rint(M)
+        t_int = np.rint(t)
+        exact = (np.abs(M - M_int).max() < _INDEX_MAP_TOL
+                 and np.abs(t - t_int).max() < _INDEX_MAP_TOL)
+        # dominant entry per row: the candidate signed-permutation structure.
+        # The dropped terms are evaluated relative to the volume centre (their
+        # value there is absorbed into the offset), so a small raster shear
+        # displaces a source position by at most its edge-to-centre effect.
+        dominant = np.argmax(np.abs(M), axis=1)
+        P = np.zeros_like(M)
+        P[np.arange(3), dominant] = M[np.arange(3), dominant]
+        is_perm_structure = len(set(dominant.tolist())) == 3
+        neglected = np.abs(corners @ (M - P).T).max() if is_perm_structure else np.inf
+        t_P = t + (M - P) @ centre
+        if exact and is_perm_structure and np.all(np.abs(M_int).sum(axis=1) == 1):
+            result.append({'op': op, 'M': M_int.astype(np.int64),
+                           't': t_int.astype(np.int64), 'kind': 'perm'})
+        elif exact:
+            result.append({'op': op, 'M': M_int.astype(np.int64),
+                           't': t_int.astype(np.int64), 'kind': 'integer'})
+        elif neglected < _PERM_NEGLECT_TOL:
+            result.append({'op': op, 'M': P, 't': t_P, 'kind': 'nearest'})
+        else:
+            result.append({'op': op, 'M': M, 't': t, 'kind': 'interp'})
     return result
 
 
+def _gather_perm(data: Any, xp: Any, M: npt.NDArray[Any], t: npt.NDArray[Any],
+                 h_start: int, h_end: int) -> tuple[Any, float]:
+    """Orbit member for a (signed-permutation-structured) map via broadcast 1D
+    index arrays; non-integer scale/offset are rounded to the nearest source
+    voxel. Returns (values, max rounding error in voxels)."""
+    nh, nk, nl = data.shape
+    sizes = (nh, nk, nl)
+    target_len = (h_end - h_start, nk, nl)
+    target_off = (h_start, 0, 0)
+    idx = []
+    valid = None
+    max_err = 0.0
+    for d in range(3):
+        j = int(np.nonzero(M[d])[0][0])          # target axis feeding source axis d
+        m = np.arange(target_off[j], target_off[j] + target_len[j], dtype=np.float64)
+        pos = float(M[d, j]) * m + float(t[d])
+        src = np.rint(pos).astype(np.int64)
+        ok = (src >= 0) & (src < sizes[d])
+        if ok.any():
+            max_err = max(max_err, float(np.abs(pos - src)[ok].max()))
+        shape = [1, 1, 1]
+        shape[j] = target_len[j]
+        idx.append(xp.asarray(np.clip(src, 0, sizes[d] - 1)).reshape(shape))
+        ok_b = xp.asarray(ok).reshape(shape)
+        valid = ok_b if valid is None else (valid & ok_b)
+    vals = data[idx[0], idx[1], idx[2]]
+    return xp.where(valid & xp.isfinite(vals), vals, xp.nan), max_err
+
+
+def _target_coords(xp: Any, M: npt.NDArray[Any], t: npt.NDArray[Any],
+                   h_start: int, h_end: int, nk: int, nl: int, dtype: Any) -> list[Any]:
+    """Source coordinate arrays (3 x broadcast chunk) for a general map."""
+    ih = xp.arange(h_start, h_end, dtype=dtype)[:, None, None]
+    ik = xp.arange(nk, dtype=dtype)[None, :, None]
+    il = xp.arange(nl, dtype=dtype)[None, None, :]
+    coords = []
+    for d in range(3):
+        c = M[d, 0] * ih + M[d, 1] * ik + M[d, 2] * il + t[d]
+        coords.append(c)
+    return coords
+
+
+def _gather_integer(data: Any, xp: Any, M: npt.NDArray[np.int64], t: npt.NDArray[np.int64],
+                    h_start: int, h_end: int) -> Any:
+    """Orbit member for a general integer map (full 3D index arrays)."""
+    nh, nk, nl = data.shape
+    src = _target_coords(xp, M, t, h_start, h_end, nk, nl, xp.int64)
+    valid = ((src[0] >= 0) & (src[0] < nh) & (src[1] >= 0) & (src[1] < nk)
+             & (src[2] >= 0) & (src[2] < nl))
+    idx = [xp.clip(src[d], 0, data.shape[d] - 1) for d in range(3)]
+    vals = data[idx[0], idx[1], idx[2]]
+    return xp.where(valid & xp.isfinite(vals), vals, xp.nan)
+
+
+def _gather_interp(filled: Any, finite: Any, xp: Any, M: npt.NDArray[np.float64],
+                   t: npt.NDArray[np.float64], h_start: int, h_end: int) -> Any:
+    """Orbit member by trilinear interpolation with support normalisation.
+
+    `filled` is the volume with NaN replaced by 0 and `finite` its float
+    finite-mask; the ratio of their interpolations is the mean of the
+    measured neighbours, NaN where no neighbour is measured.
+    """
+    nh, nk, nl = filled.shape
+    coords = _target_coords(xp, M, t, h_start, h_end, nk, nl, xp.float64)
+    shape = coords[0].shape[0], nk, nl
+    flat = xp.stack([xp.broadcast_to(c, shape).ravel() for c in coords])
+    if xp is np:
+        interp = map_coordinates
+    else:
+        from cupyx.scipy.ndimage import map_coordinates as interp
+    num = interp(filled, flat, order=1, mode='constant', cval=0.0).reshape(shape)
+    den = interp(finite, flat, order=1, mode='constant', cval=0.0).reshape(shape)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return xp.where(den > 1e-6, num / xp.maximum(den, 1e-6), xp.nan).astype(xp.float32)
+
+
 # ──────────────────────────────────────────────────────────────────
-# FAST symmetrization (auto GPU/CPU)
+# Combined outlier rejection + symmetrization (single orbit gather)
 # ──────────────────────────────────────────────────────────────────
 
 def symmetrize_volume(vol: VolumeData, laue_group: str,
+                      sigma: float | None = 3.0, min_valid: int = 3,
                       progress_callback: Callable[[int, int], None] | None = None,
-                      use_gpu: bool | None = None) -> VolumeData:
-    """Symmetrize the 3D volume by averaging over all Laue group operations.
+                      use_gpu: bool | None = None,
+                      poisson_floor: bool = True) -> VolumeData:
+    """Outlier-reject and symmetry-average in a single orbit gather.
 
-    Uses fast 1D index-map + broadcasting for signed-permutation ops.
-    Automatically uses GPU (CuPy) if available, unless use_gpu=False.
-    Zero voxels (unmeasured) are excluded from averaging.
+    For each voxel the function:
+      1. gathers intensities at all symmetry-equivalent positions (orbit),
+      2. computes the orbit median and MAD,
+      3. marks any orbit member deviating by > `sigma * scale` from the median
+         as `NaN` (outlier removed from the mean, not replaced),
+      4. writes the `nanmean` of the surviving orbit members to the voxel.
+
+    One orbit gather per voxel — no separate reject/symmetrize passes.
+    Unmeasured voxels (NaN) participate only where a measurement exists; a
+    voxel whose whole orbit is unmeasured stays NaN.
+
+    Operations are applied in array-index space through the volume's affine
+    grid (`index_space_ops`): exact index maps are gathered directly (fast
+    1D maps for signed permutations, full index arrays for the hexagonal and
+    trigonal 3-/6-fold operations); a permutation-structured map whose scale
+    or offset is not integer (layer step != pixel step, dh != dk of a
+    pseudo-symmetric cell) takes the nearest source voxel, as 2.0.0 did
+    (`metadata['symmetry_max_index_error']` records the largest rounding);
+    an operation that mixes axes off the grid (a sheared monoclinic unwarp
+    raster under a 2-fold) is sampled by trilinear interpolation of the
+    measured neighbours.
+
+    Parameters
+    ----------
+    sigma : float or None
+        Multiplier of the robust scale for the outlier threshold. Pass `None`
+        to skip outlier rejection (pure symmetric averaging).
+    min_valid : int
+        A voxel's orbit must contain at least this many finite measurements
+        for outlier flagging to apply.
+    poisson_floor : bool
+        The robust scale is `max(1.4826 * MAD, sqrt(max(median, 1)))`: the
+        MAD is floored at the Poisson noise of the orbit median, so a tied,
+        low-count orbit (MAD = 0) does not reject ordinary counting noise
+        (an orbit of seven zeros and a one kept its one; rspace3d <= 2.0.0
+        rejected it at any sigma). `False` restores the bare MAD.
+
+    Uses GPU (CuPy) if available. Processes in H-chunks sized to the
+    available GPU memory.
     """
     if use_gpu is None:
         use_gpu = HAS_GPU
+    if sigma is not None and (not np.isfinite(sigma) or sigma <= 0):
+        raise ValueError(f"sigma must be positive or None, got {sigma!r}")
+
+    residual = laue_metric_residual(vol, laue_group)
+    if residual is not None and residual > 0.02:
+        warnings.warn(
+            f"Laue group {laue_group!r} does not preserve the reciprocal metric of "
+            f"this cell (relative residual {residual:.3g}); check the group and the "
+            "cell setting. Continuing with the requested projection.",
+            RuntimeWarning, stacklevel=2)
+
+    ops = index_space_ops(vol, laue_group)
+    n_ops = len(ops)
+    identity_index = next(i for i, o in enumerate(ops)
+                          if np.array_equal(o['op'], np.eye(3, dtype=int)))
+    kinds = {o['kind'] for o in ops}
+    mapping = ('interpolated' if 'interp' in kinds
+               else 'nearest' if 'nearest' in kinds else 'exact')
+    max_index_error = 0.0
 
     if use_gpu:
         import cupy as cp
         xp = cp
-        data = cp.asarray(np.nan_to_num(vol.intensity.astype(np.float32), nan=0.0))
-        op_maps = _precompute_op_maps(vol, laue_group, xp=cp)
     else:
         xp = np
-        data = np.nan_to_num(vol.intensity.astype(np.float32), nan=0.0)
-        op_maps = _precompute_op_maps(vol, laue_group, xp=np)
-
-    if progress_callback:
-        progress_callback(0, 1)
-
-    result = _symmetrize_core(data, op_maps, vol, xp=xp)
-
-    if use_gpu:
-        result = cp.asnumpy(result)
-        del data, op_maps
-        cp.get_default_memory_pool().free_all_blocks()
-
-    if progress_callback:
-        progress_callback(1, 1)
-
-    return VolumeData(
-        intensity=result,
-        H=vol.H.copy(), K=vol.K.copy(), L=vol.L.copy(),
-        plane_type=vol.plane_type,
-        metadata={**vol.metadata, 'laue_group': laue_group},
-    )
-
-
-# ──────────────────────────────────────────────────────────────────
-# Outlier rejection
-# ──────────────────────────────────────────────────────────────────
-
-def reject_outliers(vol: VolumeData, laue_group: str,
-                    sigma: float = 3.0, n_iter: int = 1,
-                    progress_callback: Callable[[int, int], None] | None = None,
-                    use_gpu: bool | None = None) -> VolumeData:
-    """Reject outlier voxels using per-voxel symmetry-equivalent comparison.
-
-    For each voxel, gathers intensities at ALL symmetry-equivalent
-    positions from the RAW data, computes the MEDIAN (robust to
-    outliers) and MAD of those equivalents, then flags voxels that
-    deviate by more than sigma * MAD from the median.
-
-    This is the correct approach: no pre-symmetrization needed because
-    the median naturally ignores outliers. Replaces bad voxels with
-    the median of their equivalents.
-
-    Processes in H-chunks when the full equiv array (n_ops * volume)
-    exceeds available GPU memory. Falls back to CPU transparently.
-
-    Matches the MATLAB sym_clean_volume_fast logic.
-    """
-    if use_gpu is None:
-        use_gpu = HAS_GPU
-
-    if use_gpu:
-        import cupy as cp
-        xp = cp
-        data = cp.asarray(vol.intensity.astype(np.float32))
-        op_maps = _precompute_op_maps(vol, laue_group, xp=cp)
-    else:
-        xp = np
-        data = vol.intensity.astype(np.float32).copy()
-        op_maps = _precompute_op_maps(vol, laue_group, xp=np)
+    data = xp.asarray(vol.intensity.astype(np.float32, copy=False))
+    filled = finite = None
+    if mapping == 'interpolated':
+        finite_mask = xp.isfinite(data)
+        filled = xp.where(finite_mask, data, xp.float32(0.0))
+        finite = finite_mask.astype(xp.float32)
+        del finite_mask
 
     MAD_SCALE = 1.4826
-    n_ops = len([om for om in op_maps if om is not None])
     nh, nk, nl = data.shape
-    n_replaced_total = 0
 
-    # Chunk sizing. Per chunk, peak live memory is 2 * (chunk_size * per_h):
-    # equiv plus the sort buffer CuPy/NumPy nanmedian allocates internally
-    # (same size as input). We do the MAD step in-place on equiv so abs_dev
-    # is not a separate allocation.
-    per_h = n_ops * nk * nl * 4  # bytes per H-slice of equiv
+    # Separate output buffer — the orbit gather always reads from the
+    # ORIGINAL data so chunks cannot contaminate each other via symmetry.
+    result = xp.full(data.shape, xp.nan, dtype=xp.float32)
+
+    # Chunk sizing. Peak live memory per chunk ~ 3 * (chunk_size * per_h):
+    #   equiv (orbit buffer) + dev (|equiv - med|) + nanmedian sort buffer;
+    # the general/interpolated gathers add three index/coordinate arrays.
+    per_h = n_ops * nk * nl * 4
+    if kinds - {'perm', 'nearest'}:
+        per_h += 3 * nk * nl * 8
     if use_gpu:
         free_mem, _ = cp.cuda.Device(0).mem_info
-        # Budget: 2x chunk for equiv+sort_buf, keep under 40% of free mem
-        # to leave room for data, pool fragmentation, and small temporaries.
-        chunk_size = max(1, int(free_mem * 0.4 / (2 * per_h)))
+        chunk_size = max(1, int(free_mem * 0.4 / (3 * per_h)))
     else:
-        chunk_size = max(1, int(1e9 / (2 * per_h)))  # ~1 GB per chunk total
+        chunk_size = max(1, int(1e9 / (3 * per_h)))  # ~1 GB per chunk
     chunk_size = min(chunk_size, nh)
 
     n_chunks = (nh + chunk_size - 1) // chunk_size
-    total_steps = n_iter * n_chunks
+    n_removed_total = 0
 
-    for iteration in range(n_iter):
-        n_replaced = 0
+    for chunk_idx, h_start in enumerate(range(0, nh, chunk_size)):
+        if progress_callback:
+            progress_callback(chunk_idx, n_chunks)
 
-        for chunk_idx, h_start in enumerate(range(0, nh, chunk_size)):
-            if progress_callback:
-                progress_callback(iteration * n_chunks + chunk_idx, total_steps)
+        h_end = min(h_start + chunk_size, nh)
+        h_len = h_end - h_start
 
-            h_end = min(h_start + chunk_size, nh)
-            h_len = h_end - h_start
+        # Gather the orbit for every voxel in this H-chunk
+        equiv = xp.full((n_ops, h_len, nk, nl), xp.nan, dtype=xp.float32)
+        for op_index, o in enumerate(ops):
+            if o['kind'] in ('perm', 'nearest'):
+                vals, err = _gather_perm(data, xp, o['M'], o['t'], h_start, h_end)
+                max_index_error = max(max_index_error, err)
+            elif o['kind'] == 'integer':
+                vals = _gather_integer(data, xp, o['M'], o['t'], h_start, h_end)
+            else:
+                vals = _gather_interp(filled, finite, xp, o['M'], o['t'], h_start, h_end)
+            equiv[op_index] = vals
+            del vals
 
-            # Gather equivalents for this H-chunk
-            equiv = xp.full((n_ops, h_len, nk, nl), xp.nan, dtype=xp.float32)
-            op_count = 0
-
-            for om in op_maps:
-                if om is None:
-                    continue
-                gi, gv = om
-
-                # Slice the gi/gv that carries the H-dimension (dim 0).
-                # For axis-permuting ops (e.g. K,-H,L in 4/mmm), the
-                # H-carrier may be gi[1] or gi[2], not gi[0].
-                gi_c = list(gi)
-                gv_c = list(gv)
-                for d in range(3):
-                    if gi[d].shape[0] > 1:
-                        gi_c[d] = gi[d][h_start:h_end]
-                        gv_c[d] = gv[d][h_start:h_end]
-                        break
-
-                vals = data[gi_c[0], gi_c[1], gi_c[2]]
-                valid = gv_c[0] & gv_c[1] & gv_c[2]
-                vals = xp.where(valid & (vals != 0), vals, xp.nan)
-                equiv[op_count] = vals
-                del vals, valid
-                op_count += 1
-
-            # Per-voxel median and MAD. Reuse equiv as the abs_dev buffer
-            # (in-place subtract + abs) so we don't need a second full-size
-            # copy — this is what keeps GPU memory within budget on large
-            # unbinned volumes.
-            with np.errstate(invalid='ignore'):
+        # Optional outlier rejection — flag and NaN out, then nanmean below.
+        # (all-NaN orbits are legitimate here: numpy's nan-reductions warn
+        # about them, so those warnings are silenced for the chunk)
+        if sigma is not None:
+            n_valid = xp.sum(xp.isfinite(equiv), axis=0)
+            with np.errstate(invalid='ignore'), warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
                 med = xp.nanmedian(equiv, axis=0)
-                equiv -= med[None, :, :, :]
-                xp.abs(equiv, out=equiv)
-                mad = xp.nanmedian(equiv, axis=0) * MAD_SCALE
-            del equiv
+                # `dev` is allocated separately so equiv stays intact for
+                # the nanmean step that follows.
+                dev = xp.abs(equiv - med[None, :, :, :])
+                scale = xp.nanmedian(dev, axis=0) * MAD_SCALE
+                if poisson_floor:
+                    scale = xp.maximum(scale, xp.sqrt(xp.maximum(med, 1.0)))
+                outlier = (dev > sigma * scale[None, :, :, :]) & (
+                    n_valid[None, :, :, :] >= min_valid)
+            del dev, med, scale, n_valid
 
-            # Flag outliers in this chunk
-            data_chunk = data[h_start:h_end]
-            residual = xp.abs(data_chunk - med)
-            is_finite = xp.isfinite(med) & (data_chunk != 0)
-            outlier = (residual > sigma * mad) & is_finite & (mad > 1e-10)
+            # Each voxel is counted once: its own slot in its own orbit.
+            n_removed_total += int(outlier[identity_index].sum())
+            equiv = xp.where(outlier, xp.float32(xp.nan), equiv)
+            del outlier
 
-            n_replaced += int(outlier.sum())
-            data[h_start:h_end] = xp.where(outlier, med, data_chunk)
-            del med, mad, residual, outlier, is_finite
+        # nanmean — orbit average excluding NaNs (unmeasured + rejected);
+        # an all-NaN orbit stays NaN (unmeasured), it is not a measured zero.
+        with np.errstate(invalid='ignore', divide='ignore'), warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            avg = xp.nanmean(equiv, axis=0)
+        del equiv
 
-            if use_gpu:
-                cp.get_default_memory_pool().free_all_blocks()
+        result[h_start:h_end] = avg
+        del avg
 
-        n_replaced_total += n_replaced
+        if use_gpu:
+            cp.get_default_memory_pool().free_all_blocks()
 
     if progress_callback:
-        progress_callback(total_steps, total_steps)
+        progress_callback(n_chunks, n_chunks)
 
     if use_gpu:
-        import cupy as cp
-        result = cp.asnumpy(data)
-        del data, op_maps
+        result = cp.asnumpy(result)
+        del data, filled, finite
         cp.get_default_memory_pool().free_all_blocks()
-    else:
-        result = data
 
+    meta: dict[str, Any] = {**vol.metadata, 'laue_group': laue_group,
+                            'symmetry_ops_applied': n_ops,
+                            'symmetry_mapping': mapping,
+                            'symmetry_max_index_error': max_index_error}
+    if residual is not None:
+        meta['laue_metric_residual'] = residual
+    if sigma is not None:
+        meta['sigma'] = sigma
+        meta['min_valid'] = min_valid
+        meta['poisson_floor'] = poisson_floor
+        meta['n_outliers_removed'] = n_removed_total
     return VolumeData(
         intensity=result,
         H=vol.H.copy(), K=vol.K.copy(), L=vol.L.copy(),
         plane_type=vol.plane_type,
-        metadata={**vol.metadata, 'n_outliers_replaced': n_replaced_total},
+        metadata=meta,
     )
-
 
 # ──────────────────────────────────────────────────────────────────
 # Volume slice extraction (shared by all viewers)
 # ──────────────────────────────────────────────────────────────────
+
+_EDGE_SNAP_TOL = 1e-9   # index units: round-off overshoot past the grid edge is snapped back
+
 
 def extract_volume_slice(
     vol: VolumeData,
@@ -957,9 +1362,15 @@ def extract_volume_slice(
 ]:
     """Extract a 2D slice from a 3D volume at a constant Miller index.
 
-    Handles non-orthogonal grids (monoclinic) by interpolating at the
-    correct constant-Miller-index surface, then regridding onto the
-    view plane's Cartesian pixel grid.
+    The volume's native plane is a direct array slice. The other two planes
+    are sampled through the volume's affine grid (`volume_affine`), which
+    handles sheared unwarp rasters (monoclinic/triclinic cross-terms) and
+    regular rawrecon grids alike: the slab is returned on the physical
+    Miller-index axes (x_ax, y_ax) of the requested plane.
+
+    Integration over `int_range` returns the NaN-aware mean over the
+    contributing layers times their number (equal to the plain sum when all
+    layers are measured); a point stays NaN only where every layer is NaN.
 
     Parameters
     ----------
@@ -974,8 +1385,8 @@ def extract_volume_slice(
     Returns
     -------
     (slice_2d, x_ax, y_ax, x_label, y_label, fixed_label, actual_val, n_slices)
+    with slice_2d of shape (len(y_ax), len(x_ax)) for imshow.
     """
-    # Axis configuration
     cfgs = [
         (vol.H, vol.K, vol.L, 'h', 'k', 'l', 0, 1, 2),  # HK fix L
         (vol.H, vol.L, vol.K, 'h', 'l', 'k', 0, 2, 1),  # HL fix K
@@ -983,136 +1394,126 @@ def extract_volume_slice(
     ]
     x_ax, y_ax, fixed_ax = cfgs[plane_index][0], cfgs[plane_index][1], cfgs[plane_index][2]
     x_label, y_label, fixed_label = cfgs[plane_index][3], cfgs[plane_index][4], cfgs[plane_index][5]
-    vol_dim_fixed = cfgs[plane_index][8]
+    x_dim, y_dim, fixed_dim = cfgs[plane_index][6], cfgs[plane_index][7], cfgs[plane_index][8]
+
+    fixed_ax = np.asarray(fixed_ax, dtype=np.float64)
+    if int_range < 1e-6:
+        indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])
+    else:
+        lo, hi = target_val - int_range, target_val + int_range
+        indices = np.where((fixed_ax >= lo) & (fixed_ax <= hi))[0]
+        if len(indices) == 0:
+            indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])
+    actual_val = float(fixed_ax[indices[len(indices) // 2]])
+    n_slices = len(indices)
 
     plane_types = ['HK', 'HL', 'KL']
-    is_native = plane_types[plane_index] == vol.plane_type
-
-    if is_native:
-        sl, actual_val, n_slices = _extract_native(
-            vol.intensity, fixed_ax, target_val, int_range)
+    if plane_types[plane_index] == vol.plane_type:
+        sl = _extract_native(vol.intensity, fixed_dim, indices)
+    elif int_range < 1e-6:
+        # a single non-native cut is interpolated at the requested value itself
+        actual_val = float(target_val)
+        sl = _extract_nonnat(vol, x_dim, y_dim, fixed_dim, [actual_val])
     else:
-        sl, actual_val, n_slices, x_ax = _extract_nonnat(
-            vol, x_ax, y_ax, fixed_ax, vol_dim_fixed,
-            target_val, int_range, plane_types[plane_index])
+        sl = _extract_nonnat(vol, x_dim, y_dim, fixed_dim,
+                             [float(fixed_ax[i]) for i in indices])
 
     return sl, x_ax, y_ax, x_label, y_label, fixed_label, actual_val, n_slices
 
 
+def _integrate(slabs: npt.NDArray[np.floating], axis: int) -> npt.NDArray[np.float32]:
+    """NaN-aware layer integration: mean over measured layers x number of layers."""
+    n = slabs.shape[axis]
+    if n == 1:
+        return np.take(slabs, 0, axis=axis).astype(np.float32)
+    with np.errstate(invalid='ignore', divide='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)       # all-NaN columns are fine
+        mean = np.nanmean(slabs.astype(np.float64), axis=axis)
+    return (mean * n).astype(np.float32)
+
+
 def _extract_native(
     data: npt.NDArray[Any],
-    fixed_ax: npt.NDArray[np.floating],
-    target_val: float,
-    int_range: float,
-) -> tuple[npt.NDArray[np.float32], float, int]:
-    """Native plane (HK): direct pixel extraction."""
-    if int_range < 1e-6:
-        idx = int(np.argmin(np.abs(fixed_ax - target_val)))
-        actual_val = float(fixed_ax[idx])
-        slab = data[:, :, idx]
-        n_slices = 1
-    else:
-        lo, hi = target_val - int_range, target_val + int_range
-        indices = np.where((fixed_ax >= lo) & (fixed_ax <= hi))[0]
-        if len(indices) == 0:
-            indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])
-        actual_val = float(fixed_ax[indices[len(indices) // 2]])
-        n_slices = len(indices)
-        slab = data[:, :, indices].astype(np.float64).sum(axis=2)
+    fixed_dim: int,
+    indices: npt.NDArray[np.intp],
+) -> npt.NDArray[np.float32]:
+    """Native plane: direct array slice along the fixed physical axis.
 
-    return slab.T.astype(np.float32), actual_val, n_slices
+    Returns (len(y_ax), len(x_ax)): the two remaining axes in physical order
+    are (x, y) for every plane, so a transpose gives imshow orientation.
+    """
+    slab = _integrate(np.take(data, indices, axis=fixed_dim), axis=fixed_dim)
+    return np.ascontiguousarray(slab.T.astype(np.float32))
 
 
 def _extract_nonnat(
     vol: VolumeData,
-    x_ax: npt.NDArray[np.floating],
-    y_ax: npt.NDArray[np.floating],
-    fixed_ax: npt.NDArray[np.floating],
-    vol_dim_fixed: int,
-    target_val: float,
-    int_range: float,
-    view_plane: str,
-) -> tuple[npt.NDArray[np.float32], float, int, npt.NDArray[np.floating]]:
-    """Non-native plane extraction with cross-term correction.
+    x_dim: int,
+    y_dim: int,
+    fixed_dim: int,
+    target_vals: list[float],
+) -> npt.NDArray[np.float32]:
+    """Non-native plane: trilinear sampling through the affine grid.
 
-    Slab shape after transpose matches (len(y_ax), len(x_ax)) for imshow
-    with extent=(x_ax[0], x_ax[-1], y_ax[0], y_ax[-1]).
+    Every output point (x, y, fixed) is converted to fractional array indices
+    with the inverse of `volume_affine`, then interpolated with support
+    normalisation (interpolated intensity / interpolated finite-mask), so a
+    single unmeasured neighbour does not erase a sample and a point is NaN
+    only where no neighbour is measured. Coordinates that overshoot the grid
+    edge by round-off (< `_EDGE_SNAP_TOL`) are snapped onto it.
     """
-    data = vol.intensity.astype(np.float32)
-    H, K = vol.H, vol.K
-    nh, nk, nl = data.shape
-    dh = H[1] - H[0] if nh > 1 else 1.0
-    dk = K[1] - K[0] if nk > 1 else 1.0
+    data = vol.intensity
+    axes = [np.asarray(vol.H, dtype=np.float64), np.asarray(vol.K, dtype=np.float64),
+            np.asarray(vol.L, dtype=np.float64)]
+    x_ax, y_ax = axes[x_dim], axes[y_dim]
+    origin, A = volume_affine(vol)
+    A_inv = np.linalg.inv(A)
+    shape = np.array(data.shape)
 
-    M_inv_HK = vol.metadata.get('M_inv')
-    if M_inv_HK is None:
-        ub = vol.metadata.get('ub')
-        wl = vol.metadata.get('wavelength', 1.0)
-        if ub is not None:
-            M_inv_HK = compute_plane_M_inv(ub, wl, vol.plane_type)
-        else:
-            M_inv_HK = np.eye(2)
-
-    s = vol.metadata.get('s', abs(dh / M_inv_HK[0, 0]))
-    cy = vol.metadata.get('cy', (nk + 1) / 2.0)
-    h_cross = M_inv_HK[0, 1] * s
-
-    if int_range < 1e-6:
-        idx = int(np.argmin(np.abs(fixed_ax - target_val)))
-        actual_val = float(fixed_ax[idx])
-        target_vals = [target_val]
-        n_slices = 1
-    else:
-        lo, hi = target_val - int_range, target_val + int_range
-        indices = np.where((fixed_ax >= lo) & (fixed_ax <= hi))[0]
-        if len(indices) == 0:
-            indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])
-        actual_val = float(fixed_ax[indices[len(indices) // 2]])
-        target_vals = [fixed_ax[i] for i in indices]
-        n_slices = len(target_vals)
-
-    if vol_dim_fixed == 0:
-        # KL: fixed H — per-row ih correction for monoclinic cross-term
-        IK, IL = np.meshgrid(np.arange(nk), np.arange(nl), indexing='ij')
-        slab = np.zeros((nk, nl), dtype=np.float64)
-        for tv in target_vals:
-            ik_offsets = np.arange(nk) + 1 - cy
-            ih_frac = (tv - h_cross * ik_offsets - H[0]) / dh
-            IH_frac = np.broadcast_to(ih_frac[:, None], (nk, nl))
-            slab += map_coordinates(data,
-                [IH_frac.ravel(), IK.ravel().astype(float), IL.ravel().astype(float)],
-                order=1, mode='constant', cval=0.0).reshape(nk, nl)
-
-    elif vol_dim_fixed == 1:
-        # HL: fixed K — interpolate ik, apply constant h-offset for monoclinic
-        IH, IL = np.meshgrid(np.arange(nh), np.arange(nl), indexing='ij')
-        slab = np.zeros((nh, nl), dtype=np.float64)
-        for tv in target_vals:
-            ik_frac = (tv - K[0]) / dk
-            IK_frac = np.full((nh, nl), ik_frac, dtype=np.float64)
-            slab += map_coordinates(data,
-                [IH.ravel().astype(float), IK_frac.ravel(), IL.ravel().astype(float)],
-                order=1, mode='constant', cval=0.0).reshape(nh, nl)
-
-        avg_k = np.mean(target_vals)
-        ik_avg = (avg_k - K[0]) / dk
-        h_offset = h_cross * (ik_avg + 1 - cy)
-        x_ax = x_ax + h_offset
-
-    else:
-        idx = int(np.argmin(np.abs(fixed_ax - target_val)))
-        slab_native = data[:, :, idx].T
-        actual_val = float(fixed_ax[idx])
-        return slab_native.astype(np.float32), actual_val, 1, x_ax
-
-    # Transpose to (ny, nx) for imshow; no Cartesian regridding needed because
-    # slab axes already map directly to (x_ax, y_ax) Miller indices.
-    return slab.T.astype(np.float32), actual_val, n_slices, x_ax
+    X, Y = np.meshgrid(x_ax, y_ax, indexing='ij')           # (nx, ny)
+    hkl = np.empty((3, X.size), dtype=np.float64)
+    hkl[x_dim] = X.ravel()
+    hkl[y_dim] = Y.ravel()
+    slabs = []
+    for tv in target_vals:
+        hkl[fixed_dim] = tv
+        coords = A_inv @ (hkl - origin[:, None])            # (3, N) fractional indices
+        upper = (shape - 1)[:, None].astype(np.float64)
+        near = (coords > -_EDGE_SNAP_TOL) & (coords < upper + _EDGE_SNAP_TOL)
+        coords = np.where(near, np.clip(coords, 0.0, upper), coords)
+        # Only the box of source voxels touched by the plane is materialised.
+        lo = np.clip(np.floor(coords.min(axis=1)).astype(int), 0, shape - 1)
+        hi = np.clip(np.ceil(coords.max(axis=1)).astype(int), 0, shape - 1)
+        box = tuple(slice(int(lo[d]), int(hi[d]) + 1) for d in range(3))
+        sub = np.asarray(data[box], dtype=np.float32)
+        finite = np.isfinite(sub)
+        local = coords - lo[:, None]
+        num = map_coordinates(np.where(finite, sub, np.float32(0.0)), local,
+                              order=1, mode='constant', cval=0.0)
+        den = map_coordinates(finite.astype(np.float32), local,
+                              order=1, mode='constant', cval=0.0)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            slab = np.where(den > 1e-6, num / np.maximum(den, 1e-6), np.nan)
+        slabs.append(slab.reshape(X.shape))
+    slab = _integrate(np.stack(slabs, axis=0), axis=0)      # (nx, ny)
+    return np.ascontiguousarray(slab.T.astype(np.float32))
 
 
 # ──────────────────────────────────────────────────────────────────
 # Save / load — HDF5 (MATLAB-compatible) and npz
 # ──────────────────────────────────────────────────────────────────
+
+# Scalar provenance attributes written by save_volume_h5 (key -> loader cast)
+_PROVENANCE_KEYS: dict[str, Callable[[Any], Any]] = {
+    'sigma': float, 'min_valid': int, 'poisson_floor': bool,
+    'n_outliers_removed': int, 'symmetry_ops_applied': int,
+    'symmetry_mapping': str, 'symmetry_max_index_error': float,
+    'laue_metric_residual': float,
+    'reconstructed_by': str, 'n_measured_voxels': int, 'measured_pct': float,
+    'n_files': int, 'd_min': float, 'hot_pixel_cutoff': float,
+    'polarization_axis': str, 'geometry_method': str, 'source_manifest': str,
+}
+
 
 def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
                    compression_level: int = 4) -> None:
@@ -1138,16 +1539,24 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
         f.create_dataset('H', data=vol.H, **comp_opts)
         f.create_dataset('K', data=vol.K, **comp_opts)
         f.create_dataset('L', data=vol.L, **comp_opts)
+        if vol.counts is not None:
+            f.create_dataset('counts', data=vol.counts, **comp_opts)
 
         # Metadata as attributes
         f.attrs['plane_type'] = vol.plane_type
         f.attrs['wavelength'] = vol.metadata.get('wavelength', 0.0)
+        f.attrs['grid_kind'] = vol.metadata.get('grid_kind', 'unwarp_raster')
         if 'laue_group' in vol.metadata:
             f.attrs['laue_group'] = vol.metadata['laue_group']
         f.attrs['bin_xy'] = vol.metadata.get('bin_xy', 1)
         f.attrs['bin_z'] = vol.metadata.get('bin_z', 1)
         if 'source_folder' in vol.metadata:
             f.attrs['source_folder'] = vol.metadata['source_folder']
+        # Processing provenance (rejection, symmetry, reconstruction)
+        for key in _PROVENANCE_KEYS:
+            value = vol.metadata.get(key)
+            if value is not None:
+                f.attrs[key] = value
 
         # Unit cell parameters
         cell = vol.metadata.get('cell')
@@ -1177,22 +1586,40 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
         if 'cy' in vol.metadata:
             f.attrs['cy'] = vol.metadata['cy']
 
+        # Coverage-mask diagnostics
+        for key in ('morph_size',
+                    'morph_mode',
+                    'morph_s_per_pixel',
+                    'morph_recip_period',
+                    'n_unmeasured_per_frame_mean',
+                    'n_unmeasured_per_frame_min',
+                    'n_unmeasured_per_frame_max',
+                    'n_unmeasured_per_frame_pct',
+                    'frame_npix'):
+            if key in vol.metadata and vol.metadata[key] is not None:
+                f.attrs[key] = vol.metadata[key]
+
 
 def load_volume_h5(path: str) -> VolumeData:
-    """Load a volume from an HDF5 file."""
+    """Load a volume from an HDF5 file (2.0.0 files load unchanged)."""
     import h5py
     with h5py.File(path, 'r') as f:
         intensity = np.array(f['data'])
         H = np.array(f['H'])
         K = np.array(f['K'])
         L = np.array(f['L'])
+        counts = np.array(f['counts']) if 'counts' in f else None
         metadata = {
             'wavelength': float(f.attrs.get('wavelength', 0)),
             'laue_group': str(f.attrs.get('laue_group', '')),
             'source_folder': str(f.attrs.get('source_folder', '')),
             'bin_xy': int(f.attrs.get('bin_xy', 1)),
             'bin_z': int(f.attrs.get('bin_z', 1)),
+            'grid_kind': str(f.attrs.get('grid_kind', 'unwarp_raster')),
         }
+        for key, kind in _PROVENANCE_KEYS.items():
+            if key in f.attrs:
+                metadata[key] = kind(f.attrs[key])
         # M_inv, UB, cell, Cartesian step
         if 'M_inv' in f:
             metadata['M_inv'] = np.array(f['M_inv'])
@@ -1213,10 +1640,31 @@ def load_volume_h5(path: str) -> VolumeData:
                 'beta': float(f.attrs['cell_beta']),
                 'gamma': float(f.attrs['cell_gamma']),
             }
+        # Coverage-mask diagnostics
+        int_keys = {'morph_size', 'n_unmeasured_per_frame_min',
+                    'n_unmeasured_per_frame_max', 'frame_npix'}
+        str_keys = {'morph_mode'}
+        for key in ('morph_size',
+                    'morph_mode',
+                    'morph_s_per_pixel',
+                    'morph_recip_period',
+                    'n_unmeasured_per_frame_mean',
+                    'n_unmeasured_per_frame_min',
+                    'n_unmeasured_per_frame_max',
+                    'n_unmeasured_per_frame_pct',
+                    'frame_npix'):
+            if key in f.attrs:
+                v = f.attrs[key]
+                if key in int_keys:
+                    metadata[key] = int(v)
+                elif key in str_keys:
+                    metadata[key] = str(v)
+                else:
+                    metadata[key] = float(v)
         plane_type = str(f.attrs.get('plane_type', 'HK'))
     return VolumeData(
         intensity=intensity, H=H, K=K, L=L,
-        plane_type=plane_type, metadata=metadata,
+        plane_type=plane_type, metadata=metadata, counts=counts,
     )
 
 

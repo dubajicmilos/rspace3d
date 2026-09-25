@@ -442,14 +442,18 @@ class UnifiedViewer(QMainWindow):
         plane_type = self._get_vol_plane_type()
         ub = self.vol.metadata.get('ub')
         wl = self.vol.metadata.get('wavelength', 1.0)
-        is_native = plane_type == self.vol.plane_type
+        # Only a CrysAlisPro unwarp raster is displayed in Cartesian coordinates
+        # (isotropic pixel step `s`, Miller grid through M_inv). A regular hkl
+        # grid (rawrecon) and every non-native cut are already in Miller-index
+        # coordinates: straight grid lines, identity M_inv.
+        raster = self.vol.metadata.get('grid_kind', 'unwarp_raster') == 'unwarp_raster'
+        is_native = plane_type == self.vol.plane_type and raster
         if is_native:
             if ub is not None:
                 self._current_M_inv = compute_plane_M_inv(ub, wl, plane_type)
             else:
                 self._current_M_inv = self.vol.metadata.get('M_inv')
         else:
-            # Non-native data is already in Miller-index coordinates
             self._current_M_inv = np.eye(2)
 
         # Y-flip for native plane
@@ -467,8 +471,10 @@ class UnifiedViewer(QMainWindow):
         s = self.vol.metadata.get('s')
         if is_native and s is not None:
             ny_sl, nx_sl = sl.shape
-            cx_e = (nx_sl + 1) / 2.0
-            cy_e = (ny_sl + 1) / 2.0
+            # raster centre from the volume geometry (odd rasters are not
+            # centred on (n+1)/2; bin_volume keeps cx/cy consistent)
+            cx_e = float(self.vol.metadata.get('cx', (nx_sl + 1) / 2.0))
+            cy_e = float(self.vol.metadata.get('cy', (ny_sl + 1) / 2.0))
             x_min = (0.5 - cx_e) * s
             x_max = (nx_sl + 0.5 - cx_e) * s
             y_first = (0.5 - cy_e) * s
@@ -525,13 +531,21 @@ class UnifiedViewer(QMainWindow):
         if self._display_data is None:
             return
         data = self._display_data
-        pos = data[data > 0]
-        vmin = float(np.percentile(pos, 1)) if len(pos) > 0 else 0
-        vmax = float(np.percentile(data, 99.5))
+        finite = data[np.isfinite(data)]
+        if finite.size == 0:
+            d_lo, d_hi, vmin, vmax = 0.0, 1.0, 0.0, 1.0
+        else:
+            d_lo = float(finite.min())
+            d_hi = float(finite.max())
+            pos = finite[finite > 0]
+            vmin = float(np.percentile(pos, 1)) if pos.size > 0 else d_lo
+            vmax = float(np.percentile(finite, 99.5))
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                vmin, vmax = d_lo, max(d_hi, d_lo + 1.0)
         self.min_spin.blockSignals(True)
         self.max_spin.blockSignals(True)
-        self.min_spin.setRange(float(data.min()), float(data.max()))
-        self.max_spin.setRange(float(data.min()), float(data.max()))
+        self.min_spin.setRange(d_lo, d_hi)
+        self.max_spin.setRange(d_lo, d_hi)
         self.min_spin.setValue(vmin)
         self.max_spin.setValue(vmax)
         self.min_spin.blockSignals(False)
@@ -936,9 +950,13 @@ class UnifiedViewer(QMainWindow):
         lines.append(f'L range:    [{v.L[0]:.4f}, {v.L[-1]:.4f}]  ({len(v.L)} pts, step {v.L[1]-v.L[0]:.6f})')
         lines.append(f'')
 
-        nz = (v.intensity != 0).sum()
-        lines.append(f'Nonzero:    {nz:,} / {v.intensity.size:,} ({nz/v.intensity.size*100:.1f}%)')
-        lines.append(f'Intensity:  [{v.intensity.min():.1f}, {v.intensity.max():.1f}]')
+        finite = np.isfinite(v.intensity)
+        n_meas = int(finite.sum())
+        lines.append(f'Measured:   {n_meas:,} / {v.intensity.size:,} ({n_meas/v.intensity.size*100:.1f}%)')
+        if n_meas > 0:
+            lines.append(f'Intensity:  [{np.nanmin(v.intensity):.1f}, {np.nanmax(v.intensity):.1f}]')
+        else:
+            lines.append(f'Intensity:  (no measured voxels)')
         lines.append(f'')
 
         cell = m.get('cell')

@@ -8,7 +8,7 @@ GPU acceleration.
 Works with any unit cell (cubic to triclinic).
 """
 
-__version__ = '0.1.0'
+__version__ = '2.1.0'
 
 # Rigaku Oxford detector type 8 ships with newer CrysAlisPro experiments but is
 # missing from fabio < 2026-04. Patch in place so .img reads don't KeyError.
@@ -21,11 +21,16 @@ from .volume_builder import (
     VolumeData,
     load_unwarp_folder,
     bin_volume,
+    bin_native,
+    build_coverage_mask,
+    adaptive_morph_size,
     symmetrize_volume,
-    reject_outliers,
     save_volume_h5,
     load_volume_h5,
     extract_volume_slice,
+    volume_affine,
+    index_space_ops,
+    laue_metric_residual,
     compute_plane_M_inv,
     cell_from_ub,
     get_symmetry_operations,
