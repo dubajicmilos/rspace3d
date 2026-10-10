@@ -226,7 +226,8 @@ agrees with the independent route.
 | `bragg_registration_rms(vol)` | `engine` | reference-free integer-registration check (see caveat §6) |
 
 `Volume`: `data (nh,nk,nl; NaN=unmeasured)`, `H,K,L` axes, `UB` (1/d), `counts`,
-`wavelength`. The grid may be anisotropic (independent min/max per axis, common `dq`).
+`wavelength`, `variance (nh,nk,nl; NaN=unmeasured)`. The grid may be anisotropic
+(independent min/max per axis, common `dq`).
 
 ---
 
@@ -245,6 +246,37 @@ heuristic:
 
 `symmetrize_volume` masks on `isfinite`, so unmeasured (NaN) voxels are excluded and
 measured zeros are kept.
+
+### Variance and `/uncertainty`
+
+The engine also calculates the variance (σ²) of each voxel value. A voxel value is
+the mean of the N pixels that contribute to it:
+
+    I_voxel = Σ_p g_p r_p / N
+
+Here r_p is the raw count of pixel p and g_p is its correction factor (solid angle
+and polarisation, 1 without corrections). The raw counts are Poisson. Thus the
+variance of the voxel value is:
+
+    σ² = Σ_p g_p² max(r_p, 1) / N²
+
+The floor of 1 count per pixel is the same floor as the Poisson floor of the outlier
+rejection. A voxel with N = 0 has a NaN variance. The engine keeps a third float64
+accumulator for Σ g² max(r, 1). The accumulation thus needs 20 bytes per voxel
+(float64 sum, int32 count, float64 sum of squares).
+
+`reconstruct_to_volumedata` puts the variance in `VolumeData.variance` and sets
+`metadata['variance_model'] = 'poisson_counts'`. `save_volume_h5` writes the
+dataset `/uncertainty` = √variance (float32, NaN = unmeasured). `load_volume_h5`
+reads it back as `variance = uncertainty²`. The attribute `sigma` is a different
+value: the outlier threshold of the symmetrisation. `bin_volume` weights each voxel
+with its pixel count.
+Thus a binned value is equal to the value of a reconstruction with the larger
+voxel, and the binned variance is Σ N_i² σ_i² / (Σ N_i)².
+
+The unwarp route (`load_unwarp_folder`) uses a different model,
+`'poisson_stored_units'`: the stored `.img` values are treated as Poisson counts,
+with the variance max(I, 1) per pixel.
 
 > Viewer compatibility: the h5 file must carry a non-zero `wavelength` attribute and
 > the UB in CrysAlisPro's λ-scaled convention (`UB_stored = UB_1d · λ`). Without the

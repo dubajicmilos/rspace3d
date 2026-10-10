@@ -28,6 +28,7 @@ import numpy as np
 from rspace3d.volume_builder import (
     load_unwarp_folder, bin_native, symmetrize_volume,
     save_volume_h5, load_volume_h5, resolve_unit_cell, raw_cache_mismatch,
+    format_symmetry_diagnostics,
     _read_header_fast, _filter_numbered_imgs, _img_number,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
@@ -238,6 +239,9 @@ def _main() -> None:
     n_removed = vol.metadata.get('n_outliers_removed', 0)
     print(f'{dt_sym:.1f}s  ({n_removed:,} voxels flagged as outliers, '
           f'{vol.metadata["symmetry_mapping"]} index maps)')
+    print('      Symmetry diagnostics per |q| shell:')
+    for line in format_symmetry_diagnostics(vol.metadata.get('symmetry_diagnostics')).splitlines():
+        print('      ' + line)
 
     # Save
     sym_path = os.path.join(folder, f'{base}_sym_{laue_clean}.h5')

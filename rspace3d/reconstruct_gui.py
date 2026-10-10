@@ -30,7 +30,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
 from . import rawrecon
 from .volume_builder import (
-    bin_volume, symmetrize_volume, save_volume_h5,
+    bin_volume, symmetrize_volume, save_volume_h5, format_symmetry_diagnostics,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
 
@@ -282,7 +282,8 @@ class ReconstructGUI(QMainWindow):
         ns = self._grid_counts()
         nvox = ns[0] * ns[1] * ns[2]
         # GPU working set during accumulation: float64 sum + int32 count
-        gb = nvox * 12 / 1e9
+        # + float64 sum of squares (variance)
+        gb = nvox * 20 / 1e9
         txt = f'{ns[0]} x {ns[1]} x {ns[2]} = {nvox:,} voxels  (~{gb:.1f} GB GPU)'
         too_big = self._gpu_free_gb and gb > 0.7 * self._gpu_free_gb
         if any(hi <= lo for lo, hi in self._ranges()):
@@ -493,6 +494,8 @@ class ReconstructGUI(QMainWindow):
         if mapping != 'exact':
             log('  Not all operations are exact index maps. If you changed the bin\n'
                 '  factors after the reconstruction, reconstruct again with them.')
+        log('  symmetry diagnostics per |q| shell:')
+        log(format_symmetry_diagnostics(sym.metadata.get('symmetry_diagnostics')))
         t = time.time()
         save_volume_h5(path, sym)
         log(f'  wrote {os.path.getsize(path)/1e6:.0f} MB in {time.time()-t:.0f}s')

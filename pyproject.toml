@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rspace3d"
-version = "2.2.0"
+version = "2.3.0"
 description = "Reciprocal Space 3D Processing Toolkit for single-crystal X-ray diffuse scattering"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -32,9 +32,10 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
+cpu = ["numba"]
 viz3d = ["pyvista"]
 plotly = ["plotly"]
-all = ["cupy-cuda12x", "pyvista", "plotly"]
+all = ["cupy-cuda12x", "numba", "pyvista", "plotly"]
 
 [project.scripts]
 rspace3d-process = "rspace3d.volume_process:main"

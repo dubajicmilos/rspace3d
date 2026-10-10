@@ -30,7 +30,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from .volume_builder import (
     load_unwarp_folder, bin_volume, symmetrize_volume,
     save_volume_h5, load_volume_h5, adaptive_morph_size, bin_native,
-    raw_cache_mismatch, _read_header_fast, resolve_unit_cell,
+    raw_cache_mismatch, _read_header_fast, resolve_unit_cell, format_symmetry_diagnostics,
     _filter_numbered_imgs, _img_number,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
@@ -549,6 +549,8 @@ class SimpleVolumeGUI(QMainWindow):
             f'({n_removed:,} orbit members flagged as outliers)')
         log(f'  Range: [{np.nanmin(vol.intensity):.3f}, '
             f'{np.nanmax(vol.intensity):.3f}]')
+        log('  Symmetry diagnostics per |q| shell:')
+        log(format_symmetry_diagnostics(vol.metadata.get('symmetry_diagnostics')))
 
         # Save with Laue group suffix
         laue_suffix = laue.replace('/', '').replace('-', 'bar')

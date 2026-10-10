@@ -332,3 +332,188 @@ def test_loader_stores_hl_folder_in_physical_order(monkeypatch, tmp_path):
     assert np.all(vol.intensity[:, 1, :] == 20)
     sl, x_ax, y_ax, xl, yl, fl, fv, n = extract_volume_slice(vol, 1, 1.0)   # native HL cut
     assert (xl, yl, fl) == ('h', 'l', 'k') and sl.shape == (ny, nx) and np.all(sl == 20)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-voxel variance: rawrecon engine, loader, raw cache, binning
+# ──────────────────────────────────────────────────────────────────
+
+class _SyntheticDetector:
+    """Detector whose pixels have fixed scattering vectors (no geometry)."""
+    wavelength = 0.5
+
+    def __init__(self, r_lab, shape):
+        self.r_lab = np.asarray(r_lab, np.float64)
+        self.shape = shape
+
+    def scattering_vectors(self, px):
+        assert len(px) == len(self.r_lab)
+        return self.r_lab
+
+
+def test_rawrecon_variance_matches_exact_formula():
+    """variance = sum(g^2 max(r, 1)) / N^2, value = sum(g r) / N, on CPU."""
+    rng = np.random.default_rng(3)
+    shape = (6, 7)
+    npix = shape[0] * shape[1]
+    step = 0.25
+    (n, _, _), (H, _, _), _ = engine._axes(((-0.5, 0.5),) * 3, step)
+    vox = rng.integers(0, n, (npix, 3))
+    det = _SyntheticDetector(H[vox], shape)            # every pixel on a voxel centre
+    g = rng.uniform(0.5, 2.0, npix)
+    imgs = {}
+    for f in ('a', 'b', 'c'):
+        img = rng.poisson(3.0, shape).astype(np.int32)
+        img.flat[rng.integers(0, npix)] = -1           # a flagged pixel is excluded
+        imgs[f] = img
+    vol = engine.reconstruct_volume(list(imgs), [0.0] * 3, np.eye(3), np.eye(3), det,
+                                    phi0=0.0, ranges=((-0.5, 0.5),) * 3, step=step,
+                                    read_fn=imgs.__getitem__, corrections=g)
+    N = np.zeros((n,) * 3); S = np.zeros((n,) * 3); Q = np.zeros((n,) * 3)
+    for img in imgs.values():
+        for p, r in enumerate(img.ravel()):
+            if r < 0:
+                continue
+            i = tuple(vox[p])
+            N[i] += 1; S[i] += g[p] * r; Q[i] += g[p] ** 2 * max(r, 1)
+    hit = N > 0
+    assert 0 < hit.sum() < hit.size
+    assert np.array_equal(vol.counts, N.astype(np.int64))
+    assert vol.data.dtype == np.float32 and vol.variance.dtype == np.float32
+    assert np.allclose(vol.data[hit], S[hit] / N[hit], rtol=1e-6)
+    assert np.allclose(vol.variance[hit], Q[hit] / N[hit] ** 2, rtol=1e-6)
+    assert np.all(np.isnan(vol.data[~hit])) and np.all(np.isnan(vol.variance[~hit]))
+    vd = engine.reconstruct_to_volumedata(vol)
+    assert vd.variance is vol.variance
+    assert vd.metadata['variance_model'] == 'poisson_counts'
+
+
+def test_count_weighted_binning_equals_coarse_reconstruction():
+    """bin_volume(fine, 2, 2, 2) of a rawrecon volume = reconstruction at 2 dq."""
+    from rspace3d.volume_builder import bin_volume
+    rng = np.random.default_rng(5)
+    shape = (30, 40)
+    det = _SyntheticDetector(rng.uniform(-0.6, 0.6, (shape[0] * shape[1], 3)), shape)
+    g = rng.uniform(0.5, 2.0, shape[0] * shape[1])
+    frames = [f'f{i}' for i in range(8)]
+    imgs = {f: rng.poisson(4.0, shape).astype(np.int32) for f in frames}
+    kw = dict(phi0=0.0, osc_axis=(0.3, 1.0, 0.2), ranges=((-0.5, 0.5),) * 3,
+              read_fn=imgs.__getitem__, corrections=g)
+    phis = np.arange(8) * 7.0
+    ub = np.diag([1.0, 1.25, 0.8])
+    # dq = 1/16 and 1/8: powers of two, so the voxel edges agree bit for bit
+    fine = engine.reconstruct_volume(frames, phis, ub, np.eye(3), det, step=0.0625,
+                                     bins=(2, 2, 2), **kw)
+    coarse = engine.reconstruct_volume(frames, phis, ub, np.eye(3), det, step=0.125, **kw)
+    b = bin_volume(engine.reconstruct_to_volumedata(fine), 2, 2, 2)
+    assert b.intensity.shape == coarse.data.shape
+    assert np.allclose(b.H, coarse.H) and np.allclose(b.L, coarse.L)
+    assert np.array_equal(b.counts, coarse.counts)
+    hit = coarse.counts > 0
+    assert hit.sum() > 100
+    assert np.array_equal(np.isnan(b.intensity), ~hit)
+    assert np.allclose(b.intensity[hit], coarse.data[hit], rtol=1e-6)
+    assert np.array_equal(np.isnan(b.variance), ~hit)
+    assert np.allclose(b.variance[hit], coarse.variance[hit], rtol=1e-6)
+    # without counts, the plain mean of the sub-voxels is a different estimate
+    unweighted = engine.reconstruct_to_volumedata(fine)
+    unweighted.counts = None
+    assert not np.allclose(bin_volume(unweighted, 2, 2, 2).intensity[hit],
+                           coarse.data[hit], rtol=1e-6)
+
+
+def _variance_frames(tmp_path, nx=12, ny=12):
+    """Three HK layers; the -1 strip is on the first layer only."""
+    frames = {}
+    for i, l in enumerate([-0.5, 0.0, 0.5]):
+        name = f'run_{i + 1}.img'
+        (tmp_path / name).write_bytes(_img_header(nx, ny, 'HK', l))
+        f = np.full((ny, nx), 100 * (i + 1), np.int32)
+        if i == 0:
+            f[:, :4] = -1
+        f[5, 5] = 0                        # an isolated real zero count
+        frames[name] = f
+    return frames
+
+
+def test_loader_variance_and_counts_with_per_frame_binning(monkeypatch, tmp_path):
+    from rspace3d.volume_builder import load_unwarp_folder
+    frames = _variance_frames(tmp_path)
+    _stub_decode(monkeypatch, frames)
+    vol = load_unwarp_folder(str(tmp_path), bin_xy=2, morph_size=3, max_workers=1)
+    assert vol.metadata['variance_model'] == 'poisson_stored_units'
+    assert vol.counts.dtype == np.uint16 and vol.variance.dtype == np.float32
+    # block (1, 2): x pixels 3, 4 and y pixels 5, 6; pixel column 3 is -1 on layer 0
+    assert vol.counts[1, 2, 0] == 2 and vol.intensity[1, 2, 0] == 100.0
+    assert vol.variance[1, 2, 0] == pytest.approx(200 / 2 ** 2)
+    assert vol.counts[1, 2, 1] == 4 and vol.variance[1, 2, 1] == pytest.approx(800 / 4 ** 2)
+    # block with the real zero: the zero enters with the 1-count floor
+    assert vol.counts[2, 2, 0] == 4 and vol.intensity[2, 2, 0] == pytest.approx(75.0)
+    assert vol.variance[2, 2, 0] == pytest.approx((3 * 100 + 1) / 4 ** 2)
+    # fully unmeasured block
+    assert vol.counts[0, 2, 0] == 0
+    assert np.isnan(vol.intensity[0, 2, 0]) and np.isnan(vol.variance[0, 2, 0])
+    assert np.array_equal(np.isnan(vol.variance), np.isnan(vol.intensity))
+    # bin_z: the counts weight the layers
+    volz = load_unwarp_folder(str(tmp_path), bin_xy=2, bin_z=3, morph_size=3, max_workers=1)
+    assert volz.counts[1, 2, 0] == 2 + 4 + 4
+    assert volz.intensity[1, 2, 0] == pytest.approx((2 * 100 + 4 * 200 + 4 * 300) / 10)
+    assert volz.variance[1, 2, 0] == pytest.approx((200 + 800 + 1200) / 10 ** 2)
+    # unbinned: the variance max(I, 1) per covered pixel is derived, not stored
+    from rspace3d.volume_builder import bin_volume, variance_is_derived, voxel_variance
+    vol1 = load_unwarp_folder(str(tmp_path), bin_xy=1, morph_size=3, max_workers=1)
+    assert vol1.counts is None and vol1.variance is None
+    assert variance_is_derived(vol1)
+    var1 = voxel_variance(vol1)
+    assert var1.dtype == np.float32
+    raw0 = frames['run_1.img'].T
+    covered = raw0 != -1
+    assert np.array_equal(var1[..., 0][covered], np.maximum(raw0[covered], 1))
+    assert np.all(np.isnan(var1[..., 0][~covered]))
+    assert var1[5, 5, 1] == 1.0                              # real zero -> floor
+    assert np.array_equal(voxel_variance(vol1, (slice(2, 5), 3)), var1[2:5, 3], equal_nan=True)
+    # bin_z of a derived variance: compact counts, stored variance
+    volz1 = load_unwarp_folder(str(tmp_path), bin_xy=1, bin_z=3, morph_size=3, max_workers=1)
+    assert volz1.counts.dtype == np.uint16 and volz1.variance is not None
+    assert not variance_is_derived(volz1)
+    assert volz1.counts[5, 5, 0] == 3                        # the zeros are measurements
+    assert volz1.variance[5, 5, 0] == pytest.approx(3 / 3 ** 2)     # 1-count floor
+    assert volz1.counts[0, 0, 0] == 2                        # x = 0 is -1 on layer 0
+    assert volz1.variance[0, 0, 0] == pytest.approx((200 + 300) / 2 ** 2)
+    stored = bin_volume(type(vol1)(vol1.intensity, vol1.H, vol1.K, vol1.L, vol1.plane_type,
+                                   dict(vol1.metadata), variance=var1), 1, 1, 3)
+    assert np.array_equal(stored.variance.view(np.int32), volz1.variance.view(np.int32))
+
+
+def test_raw_cache_round_trip_keeps_variance(monkeypatch, tmp_path):
+    import h5py
+    from rspace3d.volume_builder import (load_unwarp_folder, load_volume_h5,
+                                         raw_cache_mismatch, save_volume_h5,
+                                         variance_is_derived, voxel_variance)
+    data_dir = tmp_path / 'unwarp'
+    data_dir.mkdir()
+    _stub_decode(monkeypatch, _variance_frames(data_dir))
+    vol = load_unwarp_folder(str(data_dir), bin_xy=1, morph_size=3, max_workers=1)
+    path = str(tmp_path / 'run_raw.h5')
+    save_volume_h5(path, vol)
+    with h5py.File(path, 'r') as f:
+        assert 'uncertainty' not in f           # a derived variance is not written
+    cached = load_volume_h5(path)
+    assert raw_cache_mismatch(cached, str(data_dir), 3) is None
+    assert cached.metadata['variance_model'] == 'poisson_stored_units'
+    assert variance_is_derived(cached)
+    assert np.array_equal(voxel_variance(cached), voxel_variance(vol), equal_nan=True)
+    # a raw cache written by rspace3d 2.2 has no variance model: it is accepted
+    with h5py.File(path, 'a') as f:
+        del f.attrs['variance_model']
+    legacy = load_volume_h5(path)
+    assert legacy.metadata['variance_model'] == 'poisson_stored_units'
+    assert raw_cache_mismatch(legacy, str(data_dir), 3) is None
+    # a per-frame binned cache needs its variance and its counts
+    binned = load_unwarp_folder(str(data_dir), bin_xy=2, morph_size=3, max_workers=1)
+    assert raw_cache_mismatch(binned, str(data_dir), 3) is None
+    binned.variance = None
+    assert 'variance' in raw_cache_mismatch(binned, str(data_dir), 3)
+    binned = load_unwarp_folder(str(data_dir), bin_xy=2, morph_size=3, max_workers=1)
+    binned.counts = None
+    assert 'counts' in raw_cache_mismatch(binned, str(data_dir), 3)

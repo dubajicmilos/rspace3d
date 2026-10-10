@@ -11,6 +11,15 @@ contributing pixels is UNMEASURED and set to NaN. Because the pixel `counts` are
 known exactly, measured-but-zero voxels (0.0) and unmeasured voxels (NaN) are
 unambiguous - no coverage-mask heuristic is needed (unlike the .img/unwarp path).
 
+Each voxel also gets a variance (sigma^2 of the voxel mean). A voxel value is
+sum_p(g_p r_p) / N, with the raw count r_p and the correction factor g_p of
+each contributing pixel p. The raw counts are Poisson, so
+
+    variance = sum_p(g_p^2 max(r_p, 1)) / N^2 .
+
+The floor of 1 count per pixel is the same floor that the outlier rejection
+uses (`poisson_floor`). A voxel with N = 0 has a NaN variance.
+
 The grid may be anisotropic: independent (min,max) per axis, common voxel size dq.
 """
 from __future__ import annotations
@@ -36,6 +45,7 @@ class Volume:
     UB: np.ndarray          # columns a*,b*,c* in 1/d (CrysAlis UB / lambda)
     counts: np.ndarray      # (nh,nk,nl) contributing pixels per voxel
     wavelength: float
+    variance: np.ndarray | None = None   # (nh,nk,nl) sigma^2 of data, NaN where unmeasured
 
 
 # ---------------------------------------------------------------- grid / cell
@@ -134,6 +144,15 @@ def has_cupy(device=0):
         return False
 
 
+def _mean_and_variance(ssum, scount, ssq):
+    """Voxel mean sum/N and its variance ssq/N^2 (float32, NaN where N = 0)."""
+    measured = scount > 0
+    n = np.maximum(scount, 1).astype(np.float64)
+    vol = np.where(measured, ssum / n, np.nan).astype(np.float32)
+    var = np.where(measured, ssq / (n * n), np.nan).astype(np.float32)
+    return vol, var
+
+
 # ---------------------------------------------------------------- GPU engine
 def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
                            osc_axis=(0, 1, 0), sense=1,
@@ -165,6 +184,7 @@ def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
 
     ssum = cp.zeros(nvox, cp.float64)
     scount = cp.zeros(nvox, cp.int32)
+    ssq = cp.zeros(nvox, cp.float64)          # sum of g^2 * max(r, 1)
     UBinv = np.linalg.inv(UB)
 
     for i, (phi, img_host) in enumerate(zip(phis, _prefetch(frames, read_fn, prefetch))):
@@ -178,23 +198,29 @@ def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
         if hot is not None:
             inb &= img < hot
         flat = (h0.astype(cp.int64) * nkl + k0 * nl + l0)[inb]     # int64: any grid size
-        w = img[inb].astype(cp.float64)
+        r = img[inb].astype(cp.float64)
+        w = r
+        w2 = cp.maximum(r, 1.0)
         if corr_g is not None:
-            w = w * corr_g[inb]
+            g = corr_g[inb]
+            w = r * g
+            w2 = w2 * g * g
         cupyx.scatter_add(ssum, flat, w)
         cupyx.scatter_add(scount, flat, 1)
+        cupyx.scatter_add(ssq, flat, w2)
         if progress_callback:
             progress_callback(i + 1, len(frames))
 
     ssum_h = cp.asnumpy(ssum)
     scount_h = cp.asnumpy(scount).astype(np.int64)
-    del ssum, scount, r_lab_g, corr_g
+    ssq_h = cp.asnumpy(ssq)
+    del ssum, scount, ssq, r_lab_g, corr_g
     cp.get_default_memory_pool().free_all_blocks()
 
-    with np.errstate(invalid="ignore"):
-        vol = np.where(scount_h > 0, ssum_h / np.maximum(scount_h, 1), np.nan)
-    return Volume(vol.reshape(nh, nk, nl).astype(np.float32), H, K, L,
-                  np.asarray(UB), scount_h.reshape(nh, nk, nl), detector.wavelength)
+    vol, var = _mean_and_variance(ssum_h, scount_h, ssq_h)
+    return Volume(vol.reshape(nh, nk, nl), H, K, L,
+                  np.asarray(UB), scount_h.reshape(nh, nk, nl), detector.wavelength,
+                  var.reshape(nh, nk, nl))
 
 
 # ---------------------------------------------------------------- CPU fallback
@@ -220,6 +246,7 @@ def reconstruct_volume(frames, phis, UB, R0, detector, *, phi0,
     lo = np.asarray([lo_h, lo_k, lo_l], np.float32)
     ssum = np.zeros(nvox, np.float64)
     scount = np.zeros(nvox, np.int64)
+    ssq = np.zeros(nvox, np.float64)          # sum of g^2 * max(r, 1)
     UBinv = np.linalg.inv(UB)
 
     for i, (phi, img_host) in enumerate(zip(phis, _prefetch(frames, read_fn, 2))):
@@ -234,18 +261,23 @@ def reconstruct_volume(frames, phis, UB, R0, detector, *, phi0,
         if hot is not None:
             inb &= img < hot
         flat = vi[inb, 0] * nkl + vi[inb, 1] * nl + vi[inb, 2]
-        w = img[inb].astype(np.float64)
+        r = img[inb].astype(np.float64)
+        w = r
+        w2 = np.maximum(r, 1.0)
         if corr is not None:
-            w = w * corr[inb]
+            g = corr[inb]
+            w = r * g
+            w2 = w2 * g * g
         ssum += np.bincount(flat, weights=w, minlength=nvox)
         scount += np.bincount(flat, minlength=nvox)
+        ssq += np.bincount(flat, weights=w2, minlength=nvox)
         if progress_callback:
             progress_callback(i + 1, len(frames))
 
-    with np.errstate(invalid="ignore"):
-        vol = np.where(scount > 0, ssum / np.maximum(scount, 1), np.nan)
-    return Volume(vol.reshape(nh, nk, nl).astype(np.float32), H, K, L,
-                  np.asarray(UB), scount.reshape(nh, nk, nl), detector.wavelength)
+    vol, var = _mean_and_variance(ssum, scount, ssq)
+    return Volume(vol.reshape(nh, nk, nl), H, K, L,
+                  np.asarray(UB), scount.reshape(nh, nk, nl), detector.wavelength,
+                  var.reshape(nh, nk, nl))
 
 
 # ---------------------------------------------------------------- adapters
@@ -278,7 +310,8 @@ def reconstruct_to_volumedata(vol: Volume, source_folder=None, extra_meta=None):
     `cy`, `M_inv`), so the viewer and the non-native cuts use the H/K/L axes
     directly instead of inferring a raster step from |a*| (wrong for a != b)
     or injecting a raster shear that this grid does not have. The per-voxel
-    pixel counts travel along as `counts`."""
+    pixel counts travel along as `counts` and the per-voxel variance as
+    `variance` (`metadata['variance_model'] = 'poisson_counts'`)."""
     from ..volume_builder import VolumeData
 
     recip = np.asarray(vol.UB, float)
@@ -293,12 +326,15 @@ def reconstruct_to_volumedata(vol: Volume, source_folder=None, extra_meta=None):
         "n_measured_voxels": int((vol.counts > 0).sum()),
         "measured_pct": float(100.0 * (vol.counts > 0).mean()),
     }
+    if vol.variance is not None:
+        meta["variance_model"] = "poisson_counts"
     if source_folder:
         meta["source_folder"] = source_folder
     if extra_meta:
         meta.update(extra_meta)
     return VolumeData(intensity=vol.data, H=vol.H, K=vol.K, L=vol.L,
-                      plane_type="HK", metadata=meta, counts=vol.counts)
+                      plane_type="HK", metadata=meta, counts=vol.counts,
+                      variance=vol.variance)
 
 
 # ---------------------------------------------------------------- high level

@@ -273,7 +273,8 @@ def test_bin_volume_scales_raster_geometry_and_sums_counts():
     assert b.intensity.shape == (3, 3, 3)
     assert b.metadata['s'] == 1.0 and b.metadata['bin_xy'] == 2 and b.metadata['bin_z'] == 2
     assert b.metadata['cx'] == 2.0 and b.metadata['cy'] == 2.0
-    assert b.counts[0, 0, 0] == 8 and b.intensity[0, 0, 0] == 2.0   # NaN excluded
+    # the NaN sub-voxel and its count are excluded (counts sum over finite sub-voxels)
+    assert b.counts[0, 0, 0] == 7 and b.intensity[0, 0, 0] == 2.0
     assert np.allclose(b.H, [-1.0, 0.0, 1.0])
     t = bin_volume(vol, 2, 2, 4)
     assert t.metadata['bin_dropped_layers_hkl'] == [2, 2, 2]
@@ -485,3 +486,140 @@ def test_hdf5_round_trip_keeps_counts_and_provenance():
                 'symmetry_mapping', 'reconstructed_by', 'poisson_floor'):
         assert back.metadata[key] == sym.metadata[key], key
     assert np.array_equal(np.isnan(back.intensity), np.isnan(sym.intensity))
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-voxel variance: bin_volume weights and propagation, HDF5 /sigma
+# ──────────────────────────────────────────────────────────────────
+
+def _bin_volume_2_2_0(vol, bh, bk, bl):
+    """Copy of the rspace3d 2.2.0 bin_volume value formula (no counts)."""
+    import warnings
+    x_axis, y_axis = {'HK': (0, 1), 'HL': (0, 2), 'KL': (1, 2)}[vol.plane_type]
+    factors = [bh, bk, bl]
+    nh, nk, nl = vol.intensity.shape
+    sh, sk, sl = vb.bin_starts([vol.H, vol.K, vol.L], factors, couple=(x_axis, y_axis))
+    nh_t = ((nh - sh) // bh) * bh
+    nk_t = ((nk - sk) // bk) * bk
+    nl_t = ((nl - sl) // bl) * bl
+    box = (slice(sh, sh + nh_t), slice(sk, sk + nk_t), slice(sl, sl + nl_t))
+    trimmed = vol.intensity[box].astype(np.float32)
+    blocks = (nh_t // bh, bh, nk_t // bk, bk, nl_t // bl, bl)
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.nanmean(trimmed.reshape(blocks), axis=(1, 3, 5)).astype(np.float32)
+
+
+@pytest.mark.parametrize('n, factors', [((9, 8, 7), (2, 2, 3)), ((12, 12, 6), (3, 3, 2)),
+                                         ((10, 10, 9), (2, 2, 1))])
+def test_bin_volume_without_counts_matches_2_2_0(n, factors):
+    rng = np.random.default_rng(11)
+    vol = _sheared_unwarp_volume(0.3, n)
+    vol.intensity[:] = rng.normal(50, 20, n).astype(np.float32)
+    vol.intensity[rng.random(n) < 0.3] = np.nan
+    vol.intensity[:2, :2, :2] = np.nan                  # an all-NaN block
+    expected = _bin_volume_2_2_0(vol, *factors)
+    b = bin_volume(vol, *factors)
+    assert np.array_equal(b.intensity, expected, equal_nan=True)   # bit for bit
+    assert b.variance is None
+    # binned counts = number of finite sub-voxels
+    assert np.array_equal(b.counts == 0, np.isnan(expected))
+
+
+def test_bin_volume_propagates_variance_with_count_weights():
+    rng = np.random.default_rng(12)
+    n = (9, 8, 6)
+    vol = _regular_volume((4.0, 4.0, 4.0, 90, 90, 90), n=n, step=0.25,
+                          data=rng.normal(10, 3, n))
+    vol.counts = rng.integers(1, 9, n)
+    vol.variance = rng.uniform(0.5, 4.0, n).astype(np.float32)
+    nan = rng.random(n) < 0.25
+    vol.intensity[nan] = np.nan
+    vol.variance[nan] = np.nan
+    vol.counts[nan] = 0
+    factors = (2, 2, 3)
+    b = bin_volume(vol, *factors)
+    starts = vb.bin_starts([vol.H, vol.K, vol.L], list(factors), couple=(0, 1))
+    for idx in np.ndindex(b.intensity.shape):
+        sl = tuple(slice(s + i * f, s + (i + 1) * f) for s, i, f in zip(starts, idx, factors))
+        x = vol.intensity[sl].astype(np.float64)
+        ok = np.isfinite(x)
+        w = vol.counts[sl][ok].astype(np.float64)
+        if not ok.any():
+            assert b.counts[idx] == 0
+            assert np.isnan(b.intensity[idx]) and np.isnan(b.variance[idx])
+            continue
+        assert b.counts[idx] == w.sum()
+        assert b.intensity[idx] == pytest.approx((w * x[ok]).sum() / w.sum(), rel=1e-6)
+        assert b.variance[idx] == pytest.approx(
+            (w ** 2 * vol.variance[sl][ok]).sum() / w.sum() ** 2, rel=1e-6)
+    assert b.variance.dtype == np.float32 and b.counts.dtype == np.int64
+    # without counts the weight is 1: variance = sum(var) / n_finite^2
+    vol.counts = None
+    b1 = bin_volume(vol, *factors)
+    sl = tuple(slice(s, s + f) for s, f in zip(starts, factors))
+    ok = np.isfinite(vol.intensity[sl])
+    assert b1.variance[0, 0, 0] == pytest.approx(vol.variance[sl][ok].sum() / ok.sum() ** 2,
+                                                 rel=1e-6)
+
+
+def test_hdf5_round_trip_keeps_the_uncertainty():
+    import h5py
+    rng = np.random.default_rng(13)
+    n = (6, 5, 4)
+    vol = _regular_volume((4.0, 4.0, 4.0, 90, 90, 90), n=n, data=rng.normal(10, 3, n))
+    vol.variance = rng.uniform(0.1, 1e4, n).astype(np.float32)
+    vol.intensity[0, 0, :] = np.nan
+    vol.variance[0, 0, :] = np.nan
+    vol.metadata['variance_model'] = 'poisson_counts'
+    var0 = vol.variance.copy()
+    fd, path = tempfile.mkstemp(suffix='.h5'); os.close(fd)
+    fd, path0 = tempfile.mkstemp(suffix='.h5'); os.close(fd)
+    try:
+        save_volume_h5(path, vol)
+        with h5py.File(path, 'r') as f:
+            assert 'sigma' not in f
+            assert f['uncertainty'].dtype == np.float32
+            assert f['uncertainty'].chunks == f['data'].chunks
+            assert f['uncertainty'].compression == 'gzip'
+            assert np.allclose(f['uncertainty'][1:], np.sqrt(vol.variance[1:]), rtol=1e-6)
+        back = load_volume_h5(path)
+        vol.variance = None
+        save_volume_h5(path0, vol)
+        with h5py.File(path0, 'r') as f:
+            assert 'uncertainty' not in f
+        assert load_volume_h5(path0).variance is None
+    finally:
+        os.remove(path)
+        os.remove(path0)
+    assert back.metadata['variance_model'] == 'poisson_counts'
+    assert back.variance.dtype == np.float32
+    assert np.all(np.isnan(back.variance[0, 0, :]))
+    assert np.allclose(back.variance[1:], var0[1:], rtol=1e-6)
+    assert np.array_equal(back.intensity, vol.intensity, equal_nan=True)
+
+
+def test_symmetrize_accepts_a_volume_with_variance(orbit_reference):
+    rng = np.random.default_rng(14)
+    n = (7, 7, 7)
+    vol = _regular_volume((4.0, 4.0, 4.0, 90, 90, 90), n=n, data=rng.normal(10, 3, n))
+    vol.counts = rng.integers(1, 5, n)
+    vol.variance = rng.uniform(0.5, 2.0, n).astype(np.float32)
+    vol.metadata['variance_model'] = 'poisson_counts'
+    plain = _regular_volume((4.0, 4.0, 4.0, 90, 90, 90), n=n, data=vol.intensity)
+    sym = symmetrize_volume(vol, 'm-3m', sigma=3.0, use_gpu=False)
+    ref = symmetrize_volume(plain, 'm-3m', sigma=3.0, use_gpu=False)
+    # the variance does not change the intensity or the outlier count
+    assert np.array_equal(sym.intensity, ref.intensity, equal_nan=True)
+    assert sym.metadata['n_outliers_removed'] == ref.metadata['n_outliers_removed']
+    assert ref.variance is None and 'variance_model' not in ref.metadata
+    # the output variance exists and is sum_j (c_j / m)^2 var_j over the survivors
+    assert sym.variance is not None and sym.variance.dtype == np.float32
+    assert sym.metadata['variance_model'] == 'poisson_counts'
+    _, expected, _ = orbit_reference(vol, 'm-3m', sigma=3.0, variance=vol.variance)
+    assert np.array_equal(np.isnan(sym.variance), np.isnan(expected))
+    assert np.allclose(sym.variance, expected, rtol=1e-6, equal_nan=True)
+    # all 48 members of the origin read one voxel: the variance does not decrease
+    assert sym.variance[3, 3, 3] == pytest.approx(vol.variance[3, 3, 3], rel=1e-6)
+    # a general voxel has 48 distinct members: the variance decreases
+    assert sym.variance[0, 1, 2] < 0.1 * vol.variance.min()

@@ -105,6 +105,17 @@ pip install cupy-cuda12x      # CUDA 12 driver; use cupy-cuda11x for CUDA 11
 CuPy is detected automatically; without it everything runs on the CPU. Optional
 3D isosurface backends: `pip install pyvista` or `pip install plotly`.
 
+Without a GPU, install numba with the extra `cpu`:
+
+```bash
+pip install -e ".[cpu]"       # or: pip install numba
+```
+
+rspace3d then does the symmetrisation on all CPU cores, about 20 to 30 times
+faster than without numba. numba is optional. Without it, a NumPy engine
+gives the same result. The extra `all` installs CuPy, numba, PyVista and
+Plotly.
+
 ### Updating
 
 ```bash
@@ -177,9 +188,10 @@ rspace3d-reconstruct          # or: python -m rspace3d.reconstruct_gui
 2. **Reconstruction grid.** Set the `h`, `k` and `l` minimum and maximum in
    reciprocal-lattice units (they need not be symmetric or equal) and the voxel
    size `dq` (default 0.025 r.l.u.). The *Grid* line shows the voxel count and
-   the GPU memory needed during accumulation (12 bytes per voxel), and turns red
+   the GPU memory needed during accumulation (20 bytes per voxel: float64 sum,
+   int32 pixel count and float64 sum of squares for the variance), and turns red
    when this approaches the free VRAM. A 481 × 481 × 481 grid (-6 to 6 at 0.025)
-   needs about 1.3 GB.
+   needs about 2.2 GB.
    - *bin H,K / L*: the bin factors for the symmetrised volume. Set them before
      you reconstruct. The voxel centres are multiples of `dq` × bin, so hkl = 0
      is a voxel centre after the binning. Then the operations of all 11 Laue
@@ -409,6 +421,55 @@ Trigonal and hexagonal groups use the Miller-index operators, and on sheared
 unwarp rasters (monoclinic or triclinic cells) the operations are applied by
 interpolation.
 
+### Engines, variance and diagnostics
+
+The symmetrisation processes each voxel on its own: one CUDA thread per voxel
+on the GPU, the same code on all CPU cores with numba, or a vectorised NumPy
+engine. The three engines give bit-identical intensities, variances and
+outlier counts, and the same result as rspace3d 2.2. If the volume does not
+fit in GPU memory, or if the CUDA code does not compile or fails on the
+device, a warning is given and the CPU is used. For a
+2162 × 2068 × 61 unwarp volume under 4/mmm, the GPU kernel takes about 1 s
+(2 s with the variance), numba on 24 cores about 12 s and the NumPy engine
+about 4 min. rspace3d 2.2 took 14 s on the GPU and 12 min on the CPU.
+
+If the volume has a variance (see [HDF5 output format](#hdf5-output-format)),
+the output has a variance too. A member that reads one voxel has the
+variance of that voxel. An interpolated member has the variance
+Σ (w_k / W)² σ_k² of its measured corners. The output variance is
+Σ_j (c_j / m)² σ_j² over the distinct source voxels j of the m members that
+remain, where c_j is the number of these members that read voxel j. A voxel
+on a special position (for example h = 0 under a mirror) reads the same
+voxel more than once. These reads are not independent, and the formula
+counts them so.
+
+The output variance is one more float32 array in memory (4 bytes per voxel,
+1.09 GB for the volume above). `save_volume_h5` writes it as the dataset
+`/uncertainty`, which takes about as much disk space as `/data`.
+`symmetrize_volume(..., propagate_variance=False)` does not propagate the
+variance. It gives the output of rspace3d 2.2 (the same intensity and
+outlier count, no variance, no χ²) and uses less memory and time.
+
+`metadata['symmetry_diagnostics']` holds sums in 10 shells of equal width in
+|q| = 1/d: the voxels and members, the rejected fraction, the fraction of
+voxels whose threshold is set by the Poisson floor, R_sym = Σ|x − mean| / Σ|x|
+over the members that remain and, with a variance, χ²/ν over the distinct
+members. All voxels of an orbit have the same members. Thus each voxel adds
+its χ², ν and R_sym sums divided by the number of distinct source voxels
+of its members, so that each orbit counts once. With interpolated members
+(sheared rasters) this weight is approximate. The voxel, member, rejected
+and floor counts count each voxel.
+
+How to read χ²/ν: if the variance is correct and the equivalent voxels agree
+within it, χ²/ν is near 1. A value much larger than 1 shows a scatter that
+the variance does not explain, for example a wrong Laue group, absorption or
+a variance model that is too small. A value smaller than 1 shows a variance
+that is too large. The variance model `poisson_stored_units` treats the
+`.img` values as counts, thus χ²/ν of route B is only a relative measure.
+Outlier rejection removes the far members and makes χ²/ν a little smaller
+than 1. `rspace3d-process`, `rspace3d-builder` and `rspace3d-reconstruct`
+print the table after the symmetrisation (`format_symmetry_diagnostics`).
+
 ## Viewing volumes
 
 ```bash
@@ -444,16 +505,25 @@ layer = read_rsp_layer("path/to/file.img")          # single layer with Miller g
 
 `VolumeData` holds `intensity[ih, ik, il]` (float32, `NaN` = unmeasured) in
 physical (h, k, l) order, the 1D axes `H`, `K` and `L`, optional `counts`
-(reconstructions) and `metadata` (unit cell, UB, wavelength, `grid_kind`, and
+(pixels per voxel), optional `variance` (sigma² of each voxel, see
+[HDF5 output format](#hdf5-output-format)) and `metadata` (unit cell, UB, wavelength, `grid_kind`, and
 for unwarp rasters `M_inv`, the Cartesian step `s`, the centre `cx`/`cy` and
 the binning). `volume_affine(vol)` returns the index-to-hkl map used by the
-symmetry and slicing code.
+symmetry and slicing code. An unbinned unwarp volume does not store its
+variance, because it is max(I, 1). `voxel_variance(vol)` returns the stored
+variance or calculates this one (`variance_is_derived(vol)`).
 
 ## HDF5 output format
 
 Datasets: `/data` (nh × nk × nl, float32, `NaN` = unmeasured), `/H`, `/K`,
 `/L`, `/UB` (3 × 3, CrysAlisPro convention, includes the wavelength factor),
-`/M_inv` (2 × 2, unwarp rasters) and `/counts` (reconstructions). Attributes:
+`/M_inv` (2 × 2, unwarp rasters), `/counts` (pixels per voxel) and
+`/uncertainty` (nh × nk × nl, float32, the standard deviation of each voxel
+value, `NaN` = unmeasured). An unbinned unwarp volume (`_raw.h5`) has no
+`/uncertainty`, because its variance is max(I, 1). `/counts` of a binned
+unwarp volume is uint16 (pixels binned in the frame by `load_unwarp_folder`,
+or voxels binned by `bin_volume` without input counts). The group
+`/diagnostics` holds the per-shell sums of `symmetry_diagnostics`. Attributes:
 `plane_type`, `grid_kind`, `wavelength`, `cell_a/b/c/alpha/beta/gamma`, `s`,
 `cx`, `cy`, `bin_xy`, `bin_z`, `source_folder`, `source_manifest`,
 `laue_group`, `sigma`, `min_valid`, `poisson_floor`, `n_outliers_removed`,
@@ -461,8 +531,27 @@ Datasets: `/data` (nh × nk × nl, float32, `NaN` = unmeasured), `/H`, `/K`,
 (symmetrised volumes); the coverage-mask diagnostics of route B (`morph_size`,
 `n_unmeasured_per_frame_*`, `frame_npix`); and the reconstruction provenance of
 route A (`reconstructed_by`, `polarization_axis`, `hot_pixel_cutoff`,
-`geometry_method`). The files can be read from MATLAB with
+`geometry_method`), and `variance_model`. The files can be read from MATLAB with
 `h5read(file, '/data')` and similar calls.
+
+The attribute `sigma` is the outlier threshold of the symmetrisation. The
+dataset `/uncertainty` is the standard deviation of the voxel values.
+`load_volume_h5` reads `/uncertainty` back as `variance = uncertainty²`.
+The attribute `variance_model` tells how the variance was calculated:
+
+- `poisson_counts` (route A): the raw detector counts are Poisson. A voxel
+  value is the mean Σ g·r / N of the N pixels that contribute, with the raw
+  count r and the correction factor g of each pixel. Its variance is
+  Σ g²·max(r, 1) / N².
+- `poisson_stored_units` (route B): the stored `.img` values are treated as
+  Poisson counts. A pixel with the value I has the variance max(I, 1). A
+  pixel binned from n covered sub-pixels has the variance Σ max(I, 1) / n²,
+  and `/counts` holds n.
+
+Both models use a floor of 1 count per pixel. This is the same floor as the
+Poisson floor of the outlier rejection. `bin_volume` weights each voxel with
+its `counts` (1 if there are no counts) and propagates the variance as
+Σ w²·σ² / (Σ w)².
 
 ## Laue groups
 

@@ -51,6 +51,25 @@ class VolumeData:
     `H`, `K`, `L` are the Miller indices along each array axis at the raster
     centre line (for a sheared unwarp raster the in-plane index also shifts
     with the other in-plane index, see `volume_affine`).
+
+    `counts` is the number of detector pixels that contribute to each voxel.
+    `bin_volume` uses it as the weight of each voxel. `None` gives each
+    measured voxel the weight 1.
+
+    `variance` is the variance (sigma^2) of each voxel value. It is float32,
+    has the same shape as `intensity` and is NaN where `intensity` is NaN.
+    `None` means that the variance is not known. `metadata['variance_model']`
+    tells how the variance was calculated:
+
+    * 'poisson_counts' (rawrecon): the raw detector counts are Poisson.
+    * 'poisson_stored_units' (unwarp .img): the stored .img values are
+      treated as Poisson counts.
+
+    Both models use a floor of 1 count per pixel.
+
+    An unbinned unwarp volume does not store its variance. Its variance is
+    max(I, 1), and `voxel_variance` calculates it when it is necessary (see
+    `variance_is_derived`).
     """
     intensity: npt.NDArray[Any]          # (nh, nk, nl) — float32; NaN = unmeasured
     H: npt.NDArray[np.floating]          # (nh,) 1D array of h values
@@ -58,7 +77,37 @@ class VolumeData:
     L: npt.NDArray[np.floating]          # (nl,) 1D array of l values
     plane_type: str                      # native raster plane: 'HK', 'HL', or 'KL'
     metadata: dict[str, Any]             # wavelength, UB, cell params, etc.
-    counts: npt.NDArray[Any] | None = None   # (nh, nk, nl) contributing pixels (rawrecon)
+    counts: npt.NDArray[Any] | None = None   # (nh, nk, nl) contributing pixels per voxel
+    variance: npt.NDArray[Any] | None = None  # (nh, nk, nl) float32 sigma^2; NaN = unmeasured
+
+
+def variance_is_derived(vol: VolumeData) -> bool:
+    """True if the variance of `vol` is max(I, 1) and is not stored.
+
+    This is the case for an unbinned unwarp volume: `variance` and `counts`
+    are None, `metadata['variance_model']` is 'poisson_stored_units' and the
+    bin factors `bin_xy` and `bin_z` are 1.
+    """
+    meta = vol.metadata
+    return (vol.variance is None and vol.counts is None
+            and meta.get('variance_model') == 'poisson_stored_units'
+            and int(meta.get('bin_xy', 1)) == 1 and int(meta.get('bin_z', 1)) == 1)
+
+
+def voxel_variance(vol: VolumeData, index: Any = ()) -> npt.NDArray[np.float32] | None:
+    """Variance of the voxels `vol.intensity[index]`, or None if it is not known.
+
+    The function returns `vol.variance[index]` if the variance is stored. For
+    a derived variance (`variance_is_derived`) it calculates max(I, 1) as
+    float32, NaN where I is NaN. This value is bit-identical to the variance
+    that the unwarp loader stores for a binned volume of factor 1.
+    """
+    if vol.variance is not None:
+        return vol.variance[index]
+    if not variance_is_derived(vol):
+        return None
+    x = np.asarray(vol.intensity[index], dtype=np.float32)
+    return np.maximum(x, np.float32(1.0))       # NaN stays NaN
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -330,7 +379,8 @@ def compute_1d_axes(
 
 def bin_2d_covered(raw: npt.NDArray[Any], mask: npt.NDArray[np.bool_],
                    by: int, bx: int, start_y: int = 0, start_x: int = 0,
-                   ) -> npt.NDArray[np.float32]:
+                   with_variance: bool = False,
+                   ) -> Any:
     """Bin a raw frame by the mean over its *covered* sub-pixels only.
 
     `mask` is the coverage mask (True = measured). Unmeasured sub-pixels
@@ -339,6 +389,11 @@ def bin_2d_covered(raw: npt.NDArray[Any], mask: npt.NDArray[np.bool_],
     towards -1/0 (`[[100, -1], [-1, -1]]` -> 100, not 24.25). Cells without
     any covered sub-pixel are NaN. `start_y`/`start_x` leading pixels are
     skipped so the blocks can be aligned to the raster centre (`bin_starts`).
+
+    With `with_variance=True` the function returns `(mean, variance, n_cov)`.
+    Each covered pixel value I is a Poisson count with variance max(I, 1),
+    so the variance of the mean is sum(max(I, 1)) / n_cov^2 (float32, NaN
+    where n_cov = 0). `n_cov` (int32) is the number of covered sub-pixels.
     """
     ny, nx = raw.shape[0] - start_y, raw.shape[1] - start_x
     ny_t = (ny // by) * by
@@ -350,7 +405,12 @@ def bin_2d_covered(raw: npt.NDArray[Any], mask: npt.NDArray[np.bool_],
     n_cov = m.sum(axis=(1, 3))
     with np.errstate(invalid='ignore', divide='ignore'):
         out = np.where(n_cov > 0, summed / np.maximum(n_cov, 1), np.nan)
-    return out.astype(np.float32)
+    if not with_variance:
+        return out.astype(np.float32)
+    ssq = np.where(m, np.maximum(values, 1), 0).sum(axis=(1, 3)).astype(np.float64)
+    n = np.maximum(n_cov, 1).astype(np.float64)
+    var = np.where(n_cov > 0, ssq / (n * n), np.nan)
+    return out.astype(np.float32), var.astype(np.float32), n_cov.astype(np.int32)
 
 
 MORPH_MAX_KERNEL = 101   # px; ~11x the largest real 'auto' kernel (I19-2: 9 px)
@@ -493,12 +553,33 @@ def bin_starts(axes: list[npt.NDArray[np.floating]], factors: list[int],
     return starts
 
 
+_BIN_SLAB_VOXELS = 1 << 25    # input voxels per slab of bin_volume
+
+
 def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
     """Bin the 3D volume by averaging (NaN-aware).
 
     NaN voxels (unmeasured) are excluded from the bin mean. A binned cell
-    becomes NaN only if every sub-cell was NaN. `counts` (rawrecon pixel
-    counts) are summed. Blocks are aligned to the grid centre (`bin_starts`)
+    becomes NaN only if every sub-cell was NaN.
+
+    Each finite sub-voxel has the weight w = `counts` (1 if `counts` is
+    None). The binned value is sum(w x) / sum(w) over the finite sub-voxels.
+    For a rawrecon volume this is the value of a reconstruction with the
+    larger voxel. Without `counts` the value is the plain `nanmean`, as in
+    rspace3d 2.2. The binned `counts` are sum(w) over the finite sub-voxels.
+    The binned `variance` is sum(w^2 var) / sum(w)^2 over the finite
+    sub-voxels (float32, NaN where no sub-voxel is finite). It is None if
+    the input has no variance.
+
+    If the input has no `counts`, the binned `counts` are uint16 (uint32 if
+    bh x bk x bl is more than 65535). If the input has `counts`, they are
+    int64. A derived input variance (`variance_is_derived`) is calculated
+    for one slab at a time. The binned variance is always stored.
+
+    The function works on slabs of output h-layers, so that the temporary
+    arrays are much smaller than the volume.
+
+    Blocks are aligned to the grid centre (`bin_starts`)
     so that symmetry operations remain exact index maps on the binned grid.
     An odd layer count binned by an even factor has no such alignment (see
     `bin_starts`). The (fewer than 2b per axis) edge layers that the
@@ -518,20 +599,59 @@ def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
     nl_t = ((nl - sl) // bl) * bl
     dropped = [nh - nh_t, nk - nk_t, nl - nl_t]     # alignment + remainder, < 2b each
     box = (slice(sh, sh + nh_t), slice(sk, sk + nk_t), slice(sl, sl + nl_t))
-    trimmed = vol.intensity[box].astype(np.float32)
-    blocks = (nh_t // bh, bh, nk_t // bk, bk, nl_t // bl, bl)
-
-    with np.errstate(invalid='ignore'), warnings.catch_warnings():
-        warnings.simplefilter('ignore', RuntimeWarning)       # all-NaN blocks are fine
-        binned = np.nanmean(trimmed.reshape(blocks), axis=(1, 3, 5)).astype(np.float32)
-    counts = None
+    out_shape = (nh_t // bh, nk_t // bk, nl_t // bl)
+    has_variance = vol.variance is not None or variance_is_derived(vol)
     if vol.counts is not None:
-        counts = vol.counts[box].astype(np.int64).reshape(blocks).sum(axis=(1, 3, 5))
+        count_dtype: Any = np.int64
+    else:
+        count_dtype = np.uint16 if bh * bk * bl <= 0xFFFF else np.uint32
+    binned = np.empty(out_shape, np.float32)
+    counts = np.empty(out_shape, count_dtype)
+    variance = np.empty(out_shape, np.float32) if has_variance else None
+
+    # One slab of output h-layers at a time. Each output voxel uses only its
+    # own block, so the result does not depend on the slab size.
+    rows = max(1, _BIN_SLAB_VOXELS // max(1, bh * nk_t * nl_t))
+    for i0 in range(0, out_shape[0], rows):
+        i1 = min(out_shape[0], i0 + rows)
+        sub = (slice(sh + i0 * bh, sh + i1 * bh), box[1], box[2])
+        blocks = (i1 - i0, bh, out_shape[1], bk, out_shape[2], bl)
+        trimmed = vol.intensity[sub].astype(np.float32).reshape(blocks)
+        finite = np.isfinite(trimmed)
+        weight = None                              # None: weight 1 per finite sub-voxel
+        if vol.counts is None:
+            with np.errstate(invalid='ignore'), warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN blocks are fine
+                binned[i0:i1] = np.nanmean(trimmed, axis=(1, 3, 5))
+            cnt = finite.sum(axis=(1, 3, 5), dtype=np.int64)
+        else:
+            weight = np.where(finite, vol.counts[sub].astype(np.int64).reshape(blocks), 0)
+            cnt = weight.sum(axis=(1, 3, 5))
+        counts[i0:i1] = cnt
+        has_weight = cnt > 0
+        denom = np.maximum(cnt, 1).astype(np.float64)
+        if weight is not None:
+            wx = np.where(finite, trimmed.astype(np.float64) * weight, 0.0)
+            binned[i0:i1] = np.where(has_weight, wx.sum(axis=(1, 3, 5)) / denom, np.nan)
+            del wx
+        if variance is not None:
+            var = voxel_variance(vol, sub).reshape(blocks)
+            if weight is None:
+                w2v = np.where(finite, var, np.float32(0.0))
+            else:
+                w2v = np.where(finite, var.astype(np.float64) * (weight * weight), 0.0)
+            variance[i0:i1] = np.where(has_weight, w2v.sum(axis=(1, 3, 5), dtype=np.float64)
+                                       / (denom * denom), np.nan)
+            del w2v, var
+        del trimmed, finite, weight
 
     # Update metadata to reflect the binned raster. The in-plane bin factor
     # of the native raster scales its Cartesian step `s`; the raster centre
     # follows the block layout (blocks start at pixel 1).
     meta = vol.metadata.copy()
+    # These values describe the symmetrisation of the unbinned grid
+    for key in ('symmetry_diagnostics', 'n_outliers_removed', 'symmetry_max_index_error'):
+        meta.pop(key, None)
     if 's' in meta:
         meta['s'] = meta['s'] * bx
     if 'cx' in meta:
@@ -552,6 +672,7 @@ def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
         plane_type=vol.plane_type,
         metadata=meta,
         counts=counts,
+        variance=variance,
     )
 
 
@@ -599,6 +720,12 @@ def raw_cache_mismatch(cached: VolumeData, folder: str, morph_size: int) -> str 
     stamp = cached.metadata.get('source_manifest')
     if not stamp:
         return "the cache predates source fingerprinting (rspace3d < 2.1)"
+    # An unbinned cache does not need a stored variance (`variance_is_derived`).
+    # A cache with per-frame binning needs its variance and its pixel counts.
+    if cached.variance is None and not variance_is_derived(cached):
+        return "the cache has no per-voxel variance (rspace3d <= 2.2)"
+    if int(cached.metadata.get('bin_xy', 1)) > 1 and cached.counts is None:
+        return "the binned cache has no pixel counts (rspace3d <= 2.2)"
     if stamp != unwarp_source_manifest(folder):
         return "the .img files or the .par file changed since the cache was written"
     return None
@@ -721,6 +848,17 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
     skips `NaN` voxels, so downstream statistics never mix real zeros with
     unmeasured pixels.
 
+    The stored .img values are treated as Poisson counts in the stored units
+    (`metadata['variance_model'] = 'poisson_stored_units'`). The variance of
+    a covered pixel is max(I, 1). With `bin_xy > 1` a binned pixel has the
+    variance sum(max(I, 1)) / n_cov^2 over its n_cov covered sub-pixels, and
+    `counts` holds n_cov (uint16, uint32 if bin_xy^2 is more than 65535), so
+    that `bin_volume` can weight each voxel
+    correctly. With `bin_xy = 1`, `counts` is None (weight 1 per pixel) and
+    the variance is not stored (`variance` is None), because it is max(I, 1).
+    `voxel_variance` calculates it when it is necessary. This keeps the
+    memory of the volume at one float32 array.
+
     Parameters
     ----------
     morph_size : int or 'auto', default 'auto'
@@ -793,11 +931,15 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
     shape = [nx_bin, ny_bin]
     shape.insert(layer_axis, n_files)
     volume = np.full(tuple(shape), np.nan, dtype=np.float32)
+    # bin_xy = 1: the variance is max(I, 1) and is not stored (`voxel_variance`)
+    variance = np.full(tuple(shape), np.nan, dtype=np.float32) if bin_xy > 1 else None
+    count_dtype = np.uint16 if bin_xy * bin_xy <= 0xFFFF else np.uint32
+    counts = np.zeros(tuple(shape), dtype=count_dtype) if bin_xy > 1 else None
 
-    def put(i: int, frame: npt.NDArray[np.float32]) -> None:
+    def put(target: npt.NDArray[Any], i: int, frame: npt.NDArray[Any]) -> None:
         index: list[Any] = [slice(None), slice(None)]
         index.insert(layer_axis, i)
-        volume[tuple(index)] = frame
+        target[tuple(index)] = frame
 
     workers = max_workers if max_workers > 0 else min(8, os.cpu_count() or 1)
 
@@ -805,14 +947,18 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
         idx, path, fixed_val = args
         raw = _read_intensity(path)                           # int32 (ny, nx)
         mask_raw = build_coverage_mask(raw, morph_size=morph_size)  # bool
+        n_cov = var_T = None
         if bin_xy > 1:
             # mean over the covered sub-pixels only; NaN where none is covered
-            binned = bin_2d_covered(raw, mask_raw, bin_xy, bin_xy, start_y, start_x)
+            binned, var, n_cov = bin_2d_covered(raw, mask_raw, bin_xy, bin_xy,
+                                                start_y, start_x, with_variance=True)
+            n_cov = np.ascontiguousarray(n_cov.T)
+            var_T = np.ascontiguousarray(var.T)
         else:
             binned = np.where(mask_raw, raw, np.nan).astype(np.float32)
         data_T = np.ascontiguousarray(binned.T)               # (x, y)
         n_unmeasured = int(np.count_nonzero(np.isnan(data_T)))
-        return idx, fixed_val, data_T, n_unmeasured
+        return idx, fixed_val, data_T, var_T, n_cov, n_unmeasured
 
     n_done = 0
     n_unmeasured_per_frame = np.zeros(n_files, dtype=np.int64)
@@ -820,8 +966,11 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
         futs = [exe.submit(_load_frame, (i, path, fv))
                 for i, (path, fv) in enumerate(file_list)]
         for fut in as_completed(futs):
-            idx, fixed_val, data_T, n_unmeasured = fut.result()
-            put(idx, data_T)
+            idx, fixed_val, data_T, var_T, n_cov, n_unmeasured = fut.result()
+            put(volume, idx, data_T)
+            if counts is not None:
+                put(variance, idx, var_T)
+                put(counts, idx, n_cov)
             layer_values[idx] = fixed_val
             n_unmeasured_per_frame[idx] = n_unmeasured
             n_done += 1
@@ -866,6 +1015,7 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
         'n_unmeasured_per_frame_pct': float(
             100.0 * n_unmeasured_per_frame.mean() / frame_npix_post_bin),
         'frame_npix': int(frame_npix_post_bin),
+        'variance_model': 'poisson_stored_units',
     }
 
     axes = {'HK': (axis_x, axis_y, layer_values),
@@ -874,6 +1024,7 @@ def load_unwarp_folder(folder: str, bin_xy: int = 1, bin_z: int = 1,
     vol = VolumeData(
         intensity=volume, H=axes[0], K=axes[1], L=axes[2],
         plane_type=plane_type, metadata=metadata,
+        counts=counts, variance=variance,
     )
 
     if bin_z > 1:
@@ -1091,99 +1242,30 @@ def index_space_ops(vol: VolumeData, laue_group: str) -> list[dict[str, Any]]:
     return result
 
 
-def _gather_perm(data: Any, xp: Any, M: npt.NDArray[Any], t: npt.NDArray[Any],
-                 h_start: int, h_end: int) -> tuple[Any, float]:
-    """Orbit member for a (signed-permutation-structured) map via broadcast 1D
-    index arrays; non-integer scale/offset are rounded to the nearest source
-    voxel. Returns (values, max rounding error in voxels)."""
-    nh, nk, nl = data.shape
-    sizes = (nh, nk, nl)
-    target_len = (h_end - h_start, nk, nl)
-    target_off = (h_start, 0, 0)
-    idx = []
-    valid = None
-    max_err = 0.0
-    for d in range(3):
-        j = int(np.nonzero(M[d])[0][0])          # target axis feeding source axis d
-        m = np.arange(target_off[j], target_off[j] + target_len[j], dtype=np.float64)
-        pos = float(M[d, j]) * m + float(t[d])
-        src = np.rint(pos).astype(np.int64)
-        ok = (src >= 0) & (src < sizes[d])
-        if ok.any():
-            max_err = max(max_err, float(np.abs(pos - src)[ok].max()))
-        shape = [1, 1, 1]
-        shape[j] = target_len[j]
-        idx.append(xp.asarray(np.clip(src, 0, sizes[d] - 1)).reshape(shape))
-        ok_b = xp.asarray(ok).reshape(shape)
-        valid = ok_b if valid is None else (valid & ok_b)
-    vals = data[idx[0], idx[1], idx[2]]
-    return xp.where(valid & xp.isfinite(vals), vals, xp.nan), max_err
+def reciprocal_metric(vol: VolumeData) -> tuple[npt.NDArray[np.float64], str]:
+    """Reciprocal metric tensor G* = B^T B with B = UB / wavelength.
 
-
-def _target_coords(xp: Any, M: npt.NDArray[Any], t: npt.NDArray[Any],
-                   h_start: int, h_end: int, nk: int, nl: int, dtype: Any) -> list[Any]:
-    """Source coordinate arrays (3 x broadcast chunk) for a general map."""
-    ih = xp.arange(h_start, h_end, dtype=dtype)[:, None, None]
-    ik = xp.arange(nk, dtype=dtype)[None, :, None]
-    il = xp.arange(nl, dtype=dtype)[None, None, :]
-    coords = []
-    for d in range(3):
-        c = M[d, 0] * ih + M[d, 1] * ik + M[d, 2] * il + t[d]
-        coords.append(c)
-    return coords
-
-
-def _gather_integer(data: Any, xp: Any, M: npt.NDArray[np.int64], t: npt.NDArray[np.int64],
-                    h_start: int, h_end: int) -> Any:
-    """Orbit member for a general integer map (full 3D index arrays)."""
-    nh, nk, nl = data.shape
-    src = _target_coords(xp, M, t, h_start, h_end, nk, nl, xp.int64)
-    valid = ((src[0] >= 0) & (src[0] < nh) & (src[1] >= 0) & (src[1] < nk)
-             & (src[2] >= 0) & (src[2] < nl))
-    idx = [xp.clip(src[d], 0, data.shape[d] - 1) for d in range(3)]
-    vals = data[idx[0], idx[1], idx[2]]
-    return xp.where(valid & xp.isfinite(vals), vals, xp.nan)
-
-
-def _gather_interp(filled: Any, finite: Any, xp: Any, M: npt.NDArray[np.float64],
-                   t: npt.NDArray[np.float64], h_start: int, h_end: int) -> Any:
-    """Orbit member by trilinear interpolation with support normalisation.
-
-    `filled` is the volume with NaN replaced by 0 and `finite` its float
-    finite-mask; the ratio of their interpolations is the mean of the
-    measured neighbours, NaN where no neighbour is measured.
+    |q| = sqrt(hkl^T G* hkl) is then 1/d in 1/Angstrom. Without a UB matrix
+    the function returns the identity and the unit 'r.l.u.'.
     """
-    nh, nk, nl = filled.shape
-    coords = _target_coords(xp, M, t, h_start, h_end, nk, nl, xp.float64)
-    shape = coords[0].shape[0], nk, nl
-    flat = xp.stack([xp.broadcast_to(c, shape).ravel() for c in coords])
-    # Round-off can move a coordinate on the grid edge a small distance to
-    # the outside of the grid. Example: t = 59.999999999999986 for the
-    # l-mirror of a 61-layer raster. mode='constant' then removes this orbit
-    # member on all of the edge layer. Move these coordinates onto the edge.
-    for d, size in enumerate((nh, nk, nl)):
-        row = flat[d]
-        row[(row < 0) & (row > -_EDGE_SNAP_TOL)] = 0.0
-        row[(row > size - 1) & (row < size - 1 + _EDGE_SNAP_TOL)] = size - 1
-    if xp is np:
-        interp = map_coordinates
-    else:
-        from cupyx.scipy.ndimage import map_coordinates as interp
-    num = interp(filled, flat, order=1, mode='constant', cval=0.0).reshape(shape)
-    den = interp(finite, flat, order=1, mode='constant', cval=0.0).reshape(shape)
-    with np.errstate(invalid='ignore', divide='ignore'):
-        return xp.where(den > 1e-6, num / xp.maximum(den, 1e-6), xp.nan).astype(xp.float32)
+    ub = vol.metadata.get('ub')
+    wavelength = float(vol.metadata.get('wavelength', 0.0) or 0.0)
+    if ub is None or wavelength <= 0:
+        return np.eye(3), 'r.l.u.'
+    B = np.asarray(ub, dtype=np.float64) / wavelength
+    return B.T @ B, '1/Angstrom'
 
 
 # ──────────────────────────────────────────────────────────────────
-# Combined outlier rejection + symmetrization (single orbit gather)
+# Combined outlier rejection + symmetrization (per-voxel orbit engine)
 # ──────────────────────────────────────────────────────────────────
 
 def symmetrize_volume(vol: VolumeData, laue_group: str,
                       sigma: float | None = 3.0, min_valid: int = 3,
                       progress_callback: Callable[[int, int], None] | None = None,
                       use_gpu: bool | None = None,
-                      poisson_floor: bool = True) -> VolumeData:
+                      poisson_floor: bool = True,
+                      propagate_variance: bool = True) -> VolumeData:
     """Outlier-reject and symmetry-average in a single orbit gather.
 
     For each voxel the function:
@@ -1199,7 +1281,7 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
 
     Operations are applied in array-index space through the volume's affine
     grid (`index_space_ops`): exact index maps are gathered directly (fast
-    1D maps for signed permutations, full index arrays for the hexagonal and
+    1D maps for signed permutations, index arithmetic for the hexagonal and
     trigonal 3-/6-fold operations); a permutation-structured map whose scale
     or offset is not integer (layer step != pixel step, dh != dk of a
     pseudo-symmetric cell) takes the nearest source voxel, as 2.0.0 did
@@ -1209,6 +1291,40 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
     measured neighbours. A unit-scale map with an offset of exactly half a
     voxel (an odd layer count binned by 2) is also interpolated.
 
+    The work is done by `orbit_engine`: one CUDA thread per voxel on the GPU.
+    On the CPU, the same per-voxel code runs on all cores if numba is
+    installed, else a NumPy engine runs. The engines give bit-identical
+    intensity, variance and outlier count.
+
+    Variance. If the volume has a variance (stored in `vol.variance`, or
+    derived, see `variance_is_derived`), the output has a variance too:
+      * a member that reads one voxel has the variance of that voxel,
+      * an interpolated member has the variance sum_k (w_k / W)^2 var_k of its
+        measured corners (weights w_k, W = sum_k w_k),
+      * the output variance is sum_j (c_j / m)^2 var_j over the distinct
+        sources j of the m surviving members, where c_j is the number of
+        survivors that read source j. A voxel on a special position (for
+        example h = 0 under a mirror) reads the same source more than once.
+        These reads are not independent, and the formula counts them so.
+    The output variance is always stored, also for a derived input variance.
+    It is one more float32 array (4 bytes per voxel) in memory, and the
+    dataset `/uncertainty` in the HDF5 file (about the size of `/data`).
+    Without a variance, or with `propagate_variance=False`, the output
+    variance is None and `metadata['variance_model']` is removed.
+
+    Diagnostics. `metadata['symmetry_diagnostics']` holds per-shell sums in
+    10 shells of equal width in |q| (1/d in 1/Angstrom from the UB matrix, or
+    r.l.u. without one): voxels with members, finite members, rejected
+    members, voxels tested for outliers and voxels whose scale is set by the
+    Poisson floor, R_sym = sum |x_i - mean| / sum |x_i| over the survivors,
+    and (with variance) chi^2 = sum (x_i - mean)^2 / var_i over the distinct
+    survivors with var_i > 0, with nu = (number of these survivors) - 1.
+    Each voxel of an orbit has the same members. Thus each voxel adds its
+    chi^2, nu and R_sym sums divided by the number of distinct sources among
+    its finite members, so that an exact orbit counts once. With
+    interpolated members this weight is approximate.
+    `format_symmetry_diagnostics` prints them as a table.
+
     Parameters
     ----------
     sigma : float or None
@@ -1216,17 +1332,26 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
         to skip outlier rejection (pure symmetric averaging).
     min_valid : int
         A voxel's orbit must contain at least this many finite measurements
-        for outlier flagging to apply.
+        for outlier flagging to apply. A non-integer value is rounded up
+        (the rule is n_valid >= min_valid).
     poisson_floor : bool
         The robust scale is `max(1.4826 * MAD, sqrt(max(median, 1)))`: the
         MAD is floored at the Poisson noise of the orbit median, so a tied,
         low-count orbit (MAD = 0) does not reject ordinary counting noise
         (an orbit of seven zeros and a one kept its one; rspace3d <= 2.0.0
         rejected it at any sigma). `False` restores the bare MAD.
-
-    Uses GPU (CuPy) if available. Processes in H-chunks sized to the
-    available GPU memory.
+    use_gpu : bool or None
+        None uses the GPU when CuPy finds one. If the input volume does not
+        fit in GPU memory, or if the GPU engine fails, a warning is given and
+        the CPU engine is used.
+    propagate_variance : bool
+        True (default) propagates the variance of the input, if it has one.
+        False gives the output of rspace3d 2.2.0: no variance and no chi^2.
+        This uses less memory and time. The intensity and the outlier count
+        do not change.
     """
+    from . import orbit_engine
+
     if use_gpu is None:
         use_gpu = HAS_GPU
     if sigma is not None and (not np.isfinite(sigma) or sigma <= 0):
@@ -1247,125 +1372,53 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
     kinds = {o['kind'] for o in ops}
     mapping = ('interpolated' if 'interp' in kinds
                else 'nearest' if 'nearest' in kinds else 'exact')
-    max_index_error = 0.0
 
-    if use_gpu:
-        import cupy as cp
-        xp = cp
-    else:
-        xp = np
-    data = xp.asarray(vol.intensity.astype(np.float32, copy=False))
-    filled = finite = None
-    if mapping == 'interpolated':
-        finite_mask = xp.isfinite(data)
-        filled = xp.where(finite_mask, data, xp.float32(0.0))
-        finite = finite_mask.astype(xp.float32)
-        del finite_mask
-
-    MAD_SCALE = 1.4826
-    nh, nk, nl = data.shape
-
-    # Separate output buffer — the orbit gather always reads from the
-    # ORIGINAL data so chunks cannot contaminate each other via symmetry.
-    result = xp.full(data.shape, xp.nan, dtype=xp.float32)
-
-    # Chunk sizing. Peak live memory per chunk ~ 3 * (chunk_size * per_h):
-    #   equiv (orbit buffer) + dev (|equiv - med|) + nanmedian sort buffer;
-    # the general/interpolated gathers add three index/coordinate arrays.
-    per_h = n_ops * nk * nl * 4
-    if kinds - {'perm', 'nearest'}:
-        per_h += 3 * nk * nl * 8
-    if use_gpu:
-        free_mem, _ = cp.cuda.Device(0).mem_info
-        chunk_size = max(1, int(free_mem * 0.4 / (3 * per_h)))
-    else:
-        chunk_size = max(1, int(1e9 / (3 * per_h)))  # ~1 GB per chunk
-    chunk_size = min(chunk_size, nh)
-
-    n_chunks = (nh + chunk_size - 1) // chunk_size
-    n_removed_total = 0
-
-    for chunk_idx, h_start in enumerate(range(0, nh, chunk_size)):
-        if progress_callback:
-            progress_callback(chunk_idx, n_chunks)
-
-        h_end = min(h_start + chunk_size, nh)
-        h_len = h_end - h_start
-
-        # Gather the orbit for every voxel in this H-chunk
-        equiv = xp.full((n_ops, h_len, nk, nl), xp.nan, dtype=xp.float32)
-        for op_index, o in enumerate(ops):
-            if o['kind'] in ('perm', 'nearest'):
-                vals, err = _gather_perm(data, xp, o['M'], o['t'], h_start, h_end)
-                max_index_error = max(max_index_error, err)
-            elif o['kind'] == 'integer':
-                vals = _gather_integer(data, xp, o['M'], o['t'], h_start, h_end)
-            else:
-                vals = _gather_interp(filled, finite, xp, o['M'], o['t'], h_start, h_end)
-            equiv[op_index] = vals
-            del vals
-
-        # Optional outlier rejection — flag and NaN out, then nanmean below.
-        # (all-NaN orbits are legitimate here: numpy's nan-reductions warn
-        # about them, so those warnings are silenced for the chunk)
-        if sigma is not None:
-            n_valid = xp.sum(xp.isfinite(equiv), axis=0)
-            with np.errstate(invalid='ignore'), warnings.catch_warnings():
-                warnings.simplefilter('ignore', RuntimeWarning)
-                med = xp.nanmedian(equiv, axis=0)
-                # `dev` is allocated separately so equiv stays intact for
-                # the nanmean step that follows.
-                dev = xp.abs(equiv - med[None, :, :, :])
-                scale = xp.nanmedian(dev, axis=0) * MAD_SCALE
-                if poisson_floor:
-                    scale = xp.maximum(scale, xp.sqrt(xp.maximum(med, 1.0)))
-                outlier = (dev > sigma * scale[None, :, :, :]) & (
-                    n_valid[None, :, :, :] >= min_valid)
-            del dev, med, scale, n_valid
-
-            # Each voxel is counted once: its own slot in its own orbit.
-            n_removed_total += int(outlier[identity_index].sum())
-            equiv = xp.where(outlier, xp.float32(xp.nan), equiv)
-            del outlier
-
-        # nanmean — orbit average excluding NaNs (unmeasured + rejected);
-        # an all-NaN orbit stays NaN (unmeasured), it is not a measured zero.
-        with np.errstate(invalid='ignore', divide='ignore'), warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            avg = xp.nanmean(equiv, axis=0)
-        del equiv
-
-        result[h_start:h_end] = avg
-        del avg
-
-        if use_gpu:
-            cp.get_default_memory_pool().free_all_blocks()
-
-    if progress_callback:
-        progress_callback(n_chunks, n_chunks)
-
-    if use_gpu:
-        result = cp.asnumpy(result)
-        del data, filled, finite
-        cp.get_default_memory_pool().free_all_blocks()
+    data = np.ascontiguousarray(vol.intensity, dtype=np.float32)
+    variance = (np.ascontiguousarray(vol.variance, dtype=np.float32)
+                if vol.variance is not None and propagate_variance else None)
+    # A derived variance max(I, 1) is calculated by the engine from the data
+    derive = bool(propagate_variance) and variance_is_derived(vol)
+    origin, A = volume_affine(vol)
+    G, q_unit = reciprocal_metric(vol)
+    plan = orbit_engine.build_plan(data.shape, ops, identity_index, origin, A, G,
+                                   q_unit, _EDGE_SNAP_TOL)
+    # The threshold is float32(sigma) * scale, as in rspace3d <= 2.2.
+    sigma_f = None if sigma is None else float(sigma)
+    # The engines test n_valid >= an integer. ceil keeps the rule
+    # n_valid >= min_valid of rspace3d 2.2.0 for a non-integer value.
+    min_valid_i = int(np.clip(np.ceil(float(min_valid)), 0, orbit_engine.MAX_OPS + 1))
+    res = orbit_engine.run(plan, data, variance, sigma_f, min_valid_i,
+                           bool(poisson_floor), bool(use_gpu), progress_callback,
+                           derive_variance=derive)
 
     meta: dict[str, Any] = {**vol.metadata, 'laue_group': laue_group,
                             'symmetry_ops_applied': n_ops,
                             'symmetry_mapping': mapping,
-                            'symmetry_max_index_error': max_index_error}
+                            'symmetry_max_index_error': plan.max_index_error,
+                            'symmetry_diagnostics': orbit_engine.result_diagnostics(plan, res)}
+    if res.variance is None:
+        meta.pop('variance_model', None)
     if residual is not None:
         meta['laue_metric_residual'] = residual
     if sigma is not None:
         meta['sigma'] = sigma
         meta['min_valid'] = min_valid
         meta['poisson_floor'] = poisson_floor
-        meta['n_outliers_removed'] = n_removed_total
+        meta['n_outliers_removed'] = res.n_outliers_removed
     return VolumeData(
-        intensity=result,
+        intensity=res.intensity,
         H=vol.H.copy(), K=vol.K.copy(), L=vol.L.copy(),
         plane_type=vol.plane_type,
         metadata=meta,
+        variance=res.variance,
     )
+
+
+def format_symmetry_diagnostics(diag: dict[str, Any] | None) -> str:
+    """Short text table of `metadata['symmetry_diagnostics']`."""
+    from .orbit_engine import format_symmetry_diagnostics as fmt
+    return fmt(diag)
+
 
 # ──────────────────────────────────────────────────────────────────
 # Volume slice extraction (shared by all viewers)
@@ -1545,6 +1598,7 @@ _PROVENANCE_KEYS: dict[str, Callable[[Any], Any]] = {
     'reconstructed_by': str, 'n_measured_voxels': int, 'measured_pct': float,
     'n_files': int, 'd_min': float, 'hot_pixel_cutoff': float,
     'polarization_axis': str, 'geometry_method': str, 'source_manifest': str,
+    'variance_model': str,
 }
 
 
@@ -1554,6 +1608,17 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
 
     Datasets: /data (3D intensity), /H, /K, /L (1D axes),
     plus metadata attributes.  Uses gzip compression by default.
+    Optional datasets: /counts (contributing pixels per voxel) and
+    /uncertainty (float32, the standard deviation sqrt(`vol.variance`) of
+    each voxel value, NaN where unmeasured, same chunks as /data).
+    `load_volume_h5` reads /uncertainty back as `variance = uncertainty^2`.
+    The attribute `sigma` is a different value: the outlier threshold of
+    the symmetrisation.
+    A derived variance (`variance_is_derived`) is not written. The
+    attribute `variance_model` and the bin factors are sufficient to
+    calculate it again.
+    Optional group: /diagnostics (the per-shell sums of
+    `metadata['symmetry_diagnostics']`, one 1D dataset per sum).
 
     Can be read in MATLAB with:
         data = h5read('file.h5', '/data');
@@ -1568,12 +1633,17 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
                      'compression_opts': compression_level}
 
     with h5py.File(path, 'w') as f:
-        f.create_dataset('data', data=vol.intensity, **comp_opts)
+        dset = f.create_dataset('data', data=vol.intensity, **comp_opts)
         f.create_dataset('H', data=vol.H, **comp_opts)
         f.create_dataset('K', data=vol.K, **comp_opts)
         f.create_dataset('L', data=vol.L, **comp_opts)
         if vol.counts is not None:
             f.create_dataset('counts', data=vol.counts, **comp_opts)
+        if vol.variance is not None:
+            # standard uncertainty of each voxel, chunked like /data
+            unc = np.sqrt(np.asarray(vol.variance, dtype=np.float32))
+            f.create_dataset('uncertainty', data=unc, chunks=dset.chunks, **comp_opts)
+            del unc
 
         # Metadata as attributes
         f.attrs['plane_type'] = vol.plane_type
@@ -1590,6 +1660,16 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
             value = vol.metadata.get(key)
             if value is not None:
                 f.attrs[key] = value
+
+        # Symmetrisation diagnostics per |q| shell
+        diag = vol.metadata.get('symmetry_diagnostics')
+        if diag:
+            from .orbit_engine import diagnostics_to_arrays
+            grp = f.create_group('diagnostics')
+            grp.attrs['q_unit'] = diag['q_unit']
+            grp.attrs['has_variance'] = bool(diag['has_variance'])
+            for name, arr in diagnostics_to_arrays(diag).items():
+                grp.create_dataset(name, data=arr)
 
         # Unit cell parameters
         cell = vol.metadata.get('cell')
@@ -1642,6 +1722,10 @@ def load_volume_h5(path: str) -> VolumeData:
         K = np.array(f['K'])
         L = np.array(f['L'])
         counts = np.array(f['counts']) if 'counts' in f else None
+        variance = None
+        if 'uncertainty' in f:
+            variance = np.array(f['uncertainty'], dtype=np.float32)
+            np.square(variance, out=variance)
         metadata = {
             'wavelength': float(f.attrs.get('wavelength', 0)),
             'laue_group': str(f.attrs.get('laue_group', '')),
@@ -1694,10 +1778,24 @@ def load_volume_h5(path: str) -> VolumeData:
                     metadata[key] = str(v)
                 else:
                     metadata[key] = float(v)
+        if 'diagnostics' in f:
+            from .orbit_engine import diagnostics_from_arrays
+            grp = f['diagnostics']
+            metadata['symmetry_diagnostics'] = diagnostics_from_arrays(
+                {name: np.array(grp[name]) for name in grp},
+                str(grp.attrs['q_unit']), bool(grp.attrs['has_variance']))
+        # A raw unbinned unwarp volume of rspace3d <= 2.2 has no variance
+        # model. Its variance is max(I, 1), the same as in a newer file.
+        if ('variance_model' not in metadata and variance is None and counts is None
+                and metadata['grid_kind'] == 'unwarp_raster' and not metadata['laue_group']
+                and 'symmetry_ops_applied' not in metadata
+                and metadata['bin_xy'] == 1 and metadata['bin_z'] == 1):
+            metadata['variance_model'] = 'poisson_stored_units'
         plane_type = str(f.attrs.get('plane_type', 'HK'))
     return VolumeData(
         intensity=intensity, H=H, K=K, L=L,
         plane_type=plane_type, metadata=metadata, counts=counts,
+        variance=variance,
     )
 
 

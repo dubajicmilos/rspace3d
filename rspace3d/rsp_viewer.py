@@ -315,10 +315,12 @@ class UnifiedViewer(QMainWindow):
             self.vol = load_volume_h5(path)
         else:
             d = np.load(path, allow_pickle=False)
+            unc = d.get('uncertainty')
             self.vol = VolumeData(
                 intensity=d['intensity'], H=d['H'], K=d['K'], L=d['L'],
                 plane_type=str(d.get('plane_type', 'HK')),
-                metadata={'wavelength': float(d.get('wavelength', 0))})
+                metadata={'wavelength': float(d.get('wavelength', 0))},
+                variance=None if unc is None else np.square(unc.astype(np.float32)))
 
         self._mode = 'vol'
         self._last_cut_value = None
