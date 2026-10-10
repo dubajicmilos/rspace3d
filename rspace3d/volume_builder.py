@@ -446,9 +446,11 @@ def _bin_start(c: float, b: int) -> int | None:
     """
     half = b / 2.0
     r = (c - 0.5) % half
-    if abs(r - round(r)) > 1e-9:          # would need a fractional skip
-        return None
-    return int(round(r))
+    # For an odd b, the integer skip can be r or r + b/2. Try the two values.
+    for skip in (r, r + half):
+        if abs(skip - round(skip)) <= 1e-9:
+            return int(round(skip)) % b
+    return None                           # only a fractional skip is possible
 
 
 def _bin_kind(c: float, b: int, start: int) -> int:
@@ -492,8 +494,10 @@ def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
     NaN voxels (unmeasured) are excluded from the bin mean. A binned cell
     becomes NaN only if every sub-cell was NaN. `counts` (rawrecon pixel
     counts) are summed. Blocks are aligned to the grid centre (`bin_starts`)
-    so that symmetry operations remain exact index maps on the binned grid;
-    the (fewer than 2b per axis) edge layers this costs are recorded in
+    so that symmetry operations remain exact index maps on the binned grid.
+    An odd layer count binned by an even factor has no such alignment (see
+    `bin_starts`). The (fewer than 2b per axis) edge layers that the
+    alignment costs are recorded in
     metadata as `bin_dropped_layers_hkl` / `bin_starts_hkl`.
     """
     x_axis, y_axis = {'HK': (0, 1), 'HL': (0, 2), 'KL': (1, 2)}[vol.plane_type]
@@ -1032,7 +1036,10 @@ def index_space_ops(vol: VolumeData, laue_group: str) -> list[dict[str, Any]]:
       'integer'  M and t integer but not a permutation (hexagonal/trigonal
                  3- and 6-fold operations on a regular grid): exact gather
       'interp'   otherwise (a sheared monoclinic unwarp raster under a
-                 2-fold): trilinear, support-normalised interpolation
+                 2-fold): trilinear, support-normalised interpolation.
+                 A unit-scale map with a half-voxel offset (an odd layer
+                 count binned by 2) is also 'interp', because nearest-voxel
+                 rounding cannot choose between two equal neighbours
     """
     origin, A = volume_affine(vol)
     A_inv = np.linalg.inv(A)
@@ -1058,13 +1065,21 @@ def index_space_ops(vol: VolumeData, laue_group: str) -> list[dict[str, Any]]:
         is_perm_structure = len(set(dominant.tolist())) == 3
         neglected = np.abs(corners @ (M - P).T).max() if is_perm_structure else np.inf
         t_P = t + (M - P) @ centre
+        # A unit-scale map with a half-integer offset puts each target voxel
+        # at the midpoint of two source voxels. Example: an odd layer count
+        # binned by 2. rint (round half to even) then reads some source
+        # layers two times and does not read the other layers. Thus,
+        # interpolate this map.
+        unit = np.abs(np.abs(P[np.arange(3), dominant]) - 1) < _INDEX_MAP_TOL
+        half_tie = np.abs(t_P - np.floor(t_P) - 0.5) < _INDEX_MAP_TOL
+        tie = bool(np.any(unit & half_tie))
         if exact and is_perm_structure and np.all(np.abs(M_int).sum(axis=1) == 1):
             result.append({'op': op, 'M': M_int.astype(np.int64),
                            't': t_int.astype(np.int64), 'kind': 'perm'})
         elif exact:
             result.append({'op': op, 'M': M_int.astype(np.int64),
                            't': t_int.astype(np.int64), 'kind': 'integer'})
-        elif neglected < _PERM_NEGLECT_TOL:
+        elif neglected < _PERM_NEGLECT_TOL and not tie:
             result.append({'op': op, 'M': P, 't': t_P, 'kind': 'nearest'})
         else:
             result.append({'op': op, 'M': M, 't': t, 'kind': 'interp'})
@@ -1137,6 +1152,14 @@ def _gather_interp(filled: Any, finite: Any, xp: Any, M: npt.NDArray[np.float64]
     coords = _target_coords(xp, M, t, h_start, h_end, nk, nl, xp.float64)
     shape = coords[0].shape[0], nk, nl
     flat = xp.stack([xp.broadcast_to(c, shape).ravel() for c in coords])
+    # Round-off can move a coordinate on the grid edge a small distance to
+    # the outside of the grid. Example: t = 59.999999999999986 for the
+    # l-mirror of a 61-layer raster. mode='constant' then removes this orbit
+    # member on all of the edge layer. Move these coordinates onto the edge.
+    for d, size in enumerate((nh, nk, nl)):
+        row = flat[d]
+        row[(row < 0) & (row > -_EDGE_SNAP_TOL)] = 0.0
+        row[(row > size - 1) & (row < size - 1 + _EDGE_SNAP_TOL)] = size - 1
     if xp is np:
         interp = map_coordinates
     else:
@@ -1178,7 +1201,8 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
     (`metadata['symmetry_max_index_error']` records the largest rounding);
     an operation that mixes axes off the grid (a sheared monoclinic unwarp
     raster under a 2-fold) is sampled by trilinear interpolation of the
-    measured neighbours.
+    measured neighbours. A unit-scale map with an offset of exactly half a
+    voxel (an odd layer count binned by 2) is also interpolated.
 
     Parameters
     ----------
@@ -1400,7 +1424,11 @@ def extract_volume_slice(
     if int_range < 1e-6:
         indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])
     else:
-        lo, hi = target_val - int_range, target_val + int_range
+        # Keep a layer that is on an end of the window. Round-off can move
+        # the end a small distance inward (0.35 + 0.1 = 0.44999999999999996).
+        step = abs(fixed_ax[1] - fixed_ax[0]) if len(fixed_ax) > 1 else 1.0
+        tol = _EDGE_SNAP_TOL * step
+        lo, hi = target_val - int_range - tol, target_val + int_range + tol
         indices = np.where((fixed_ax >= lo) & (fixed_ax <= hi))[0]
         if len(indices) == 0:
             indices = np.array([int(np.argmin(np.abs(fixed_ax - target_val)))])

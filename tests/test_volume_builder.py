@@ -227,6 +227,19 @@ def test_sheared_raster_two_fold_is_interpolated_and_invariant_field_kept():
     assert np.max(np.abs(inner - ref)) < 0.05 * np.abs(ref).max()   # linear interpolation error
 
 
+@pytest.mark.parametrize('nl, dl', [(21, 0.1), (61, 0.05), (61, 0.02)])
+def test_interpolated_l_mirror_keeps_edge_layers(nl, dl):
+    # For these layer axes, round-off puts the offset t_l of the interpolated
+    # 2_y a small distance below nl - 1 (top layer) or above it (bottom layer).
+    # The edge layer must keep this orbit member.
+    vol = _sheared_unwarp_volume(shear=0.3, n=(11, 9, nl), dl=dl)
+    vol.intensity = np.broadcast_to(vol.L, vol.intensity.shape).astype(np.float32)
+    out = symmetrize_volume(vol, '2/m', sigma=None, use_gpu=False)
+    inner = out.intensity[3:-3, 1:-1, :]     # 2_y and m_y shift h by <= 2.4 voxels
+    assert np.isfinite(inner).all()
+    assert np.max(np.abs(inner)) < 1e-5      # an odd-in-l field averages to zero
+
+
 def test_regular_grid_two_fold_is_exact_for_monoclinic_cell():
     vol = _regular_volume((4, 5, 6, 90, 105, 90))
     assert {o['kind'] for o in index_space_ops(vol, '2/m')} == {'perm'}
@@ -297,10 +310,11 @@ def test_binning_keeps_cubic_operations_exact_on_i19_like_raster(b):
     assert binned.metadata['cx'] == pytest.approx(1 - binned.H[0] / (binned.H[1] - binned.H[0]))
     assert binned.metadata['cy'] == pytest.approx(1 - binned.K[0] / (binned.K[1] - binned.K[0]))
     # unaligned blocks (2.0.0 layout) are not exact for this raster: the
-    # rotations would fall back to nearest-voxel rounding (half a voxel off)
+    # rotations are a fraction of a voxel off. For b = 2 the offset is half a
+    # voxel and the map is interpolated. For b = 4 and 8 it is rounded.
     naive_H = vb.bin_1d(vol.H, b); naive_K = vb.bin_1d(vol.K, b)
     naive = VolumeData(binned.intensity, naive_H, naive_K, binned.L, 'HK', binned.metadata)
-    assert 'nearest' in {o['kind'] for o in index_space_ops(naive, '4/mmm')}
+    assert {o['kind'] for o in index_space_ops(naive, '4/mmm')} != {'perm'}
 
 
 def test_layer_step_differing_from_pixel_step_uses_nearest_voxel_maps():
@@ -317,6 +331,38 @@ def test_layer_step_differing_from_pixel_step_uses_nearest_voxel_maps():
     assert out.metadata['symmetry_mapping'] == 'nearest'
     assert 0 < out.metadata['symmetry_max_index_error'] <= 0.5
     assert np.allclose(out.intensity[np.isfinite(out.intensity)], 1.0)
+
+
+@pytest.mark.parametrize('nl', [61, 601])
+def test_odd_bin_factor_keeps_index_zero_on_the_binned_grid(nl):
+    """bin_z = 3 on an odd, centred layer stack. A skip of 2 layers puts
+    l = 0 on a bin centre. Thus the mirrors stay exact index maps."""
+    vol = _unwarp_like(84, 84, nl)
+    binned = bin_volume(vol, 1, 1, 3)
+    assert np.min(np.abs(binned.L)) < 1e-12
+    assert {o['kind'] for o in index_space_ops(binned, 'mmm')} == {'perm'}
+
+
+def test_odd_layer_count_binned_by_two_interpolates_the_half_voxel_mirror():
+    """61 layers binned by 2 put l = 0 between two binned layers. The
+    l-mirror is a unit-scale map with offset k + 1/2. Nearest-voxel rounding
+    (half to even) maps two target layers onto one source layer and does
+    not read the other layer. Thus the map must be interpolated (mean of
+    the two layers)."""
+    vol = _unwarp_like(24, 24, 61)
+    binned = bin_volume(vol, 1, 1, 2)
+    ops = index_space_ops(binned, 'mmm')
+    l_mirrors = [o for o in ops if o['op'][2, 2] == -1]
+    assert {o['kind'] for o in l_mirrors} == {'interp'}
+    nl = binned.intensity.shape[2]
+    binned.intensity[:] = 0.0
+    binned.intensity[:, :, 1::2] = 1.0           # odd binned layers only
+    out = symmetrize_volume(binned, 'mmm', sigma=None, use_gpu=False)
+    # 4 of the 8 ops keep l (own value v). The 4 l-mirrors read the mean of an
+    # odd and an even layer (0.5). Half-to-even rounding read even layers only.
+    inner = out.intensity[1:-1, 1:-1, 1:nl - 1]
+    own = binned.intensity[1:-1, 1:-1, 1:nl - 1]
+    assert np.allclose(inner, 0.25 + 0.5 * own, atol=1e-6)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -399,6 +445,20 @@ def test_integration_is_nan_aware():
     vol.intensity[:] = np.nan
     sl, *_ = extract_volume_slice(vol, 0, 0.0, int_range=1.5)
     assert np.isnan(sl).all()
+
+
+def test_integration_window_keeps_the_layers_on_its_ends():
+    """target +/- int_range on a 0.05 layer grid (viewer spin boxes: 3 and 2
+    decimals) must use 2 int_range / dl + 1 layers. Round-off (0.35 + 0.1 =
+    0.44999999999999996) must not remove the layer on an end of the window."""
+    vol = _regular_volume((4.0, 4.0, 4.0, 90, 90, 90), n=(3, 3, 321), step=0.05)
+    vol.intensity[:] = 1.0
+    for target in np.round(vol.L[10:-10], 3):
+        for int_range in (0.05, 0.1, 0.15, 0.2):
+            sl, *_, n = extract_volume_slice(vol, 0, float(target), int_range=int_range)
+            expected = 2 * round(int_range / 0.05) + 1
+            assert n == expected, (target, int_range, n)
+            assert np.allclose(sl, expected)
 
 
 # ──────────────────────────────────────────────────────────────────

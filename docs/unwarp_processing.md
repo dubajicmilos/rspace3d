@@ -112,7 +112,9 @@ three test datasets.
 
 `bin_volume` and the per-frame `bin_2d_covered` average only the covered (finite)
 sub-pixels of each block, and the blocks are aligned to the raster centre so that
-90° rotations and inversions remain exact index maps after binning. A block that
+90° rotations and inversions remain exact index maps after binning. An odd layer
+count binned by an even factor has no such alignment. For this case, the mirrors
+of l use the mean of the two nearest binned layers. A block that
 mixes NaN and finite values returns the mean of the finite values, and an all-NaN
 block stays NaN. Real low-count pixels (for example a 1 or 2 in a 4×4 block of
 zeros) are therefore kept rather than rounded down to zero.

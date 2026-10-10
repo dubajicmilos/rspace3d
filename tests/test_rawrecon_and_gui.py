@@ -65,6 +65,15 @@ def test_reconstruct_to_volumedata_declares_regular_grid_and_keeps_counts():
     assert np.allclose(A, np.eye(3) * 0.25) and np.allclose(origin, -0.875)
 
 
+def test_find_cbf_frames_picks_equal_length_scans_by_name(tmp_path):
+    from rspace3d.rawrecon.geometry import find_cbf_frames
+    for prefix in ('sample_02_', 'sample_01_'):
+        for i in range(1, 4):
+            (tmp_path / f'{prefix}{i:05d}.cbf').write_bytes(b'')
+    paths, nums = find_cbf_frames(str(tmp_path))
+    assert [os.path.basename(p) for p in paths] == [f'sample_01_{i:05d}.cbf' for i in (1, 2, 3)]
+
+
 # ──────────────────────────────────────────────────────────────────
 # I1: the tabbin next to the par in use wins over an unrelated larger table
 # ──────────────────────────────────────────────────────────────────

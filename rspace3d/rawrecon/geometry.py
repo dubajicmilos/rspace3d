@@ -213,7 +213,10 @@ def find_cbf_frames(folder):
             groups.setdefault(m.group(1), []).append((int(m.group(2)), f))
     if not groups:
         return [], []
-    prefix = max(groups, key=lambda k: len(groups[k]))       # main scan
+    # Use the scan with the most frames. If two scans have the same number of
+    # frames, use the first scan by name. The order of a set is different in
+    # each Python process.
+    prefix = max(sorted(groups), key=lambda k: len(groups[k]))
     items = sorted(groups[prefix])
     paths = [os.path.join(folder, f) for _, f in items]
     nums = [n for n, _ in items]
