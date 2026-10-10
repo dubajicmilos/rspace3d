@@ -39,13 +39,23 @@ class Volume:
 
 
 # ---------------------------------------------------------------- grid / cell
-def _axes(ranges, step):
-    """(nh,nk,nl), (H,K,L), (lo_h,lo_k,lo_l) for per-axis (lo,hi) ranges + dq."""
+def _axes(ranges, step, bins=(1, 1, 1)):
+    """(nh,nk,nl), (H,K,L), (lo_h,lo_k,lo_l) for per-axis (lo,hi) ranges + dq.
+
+    Each axis is a sequence of blocks of b voxels (b from `bins`). The block
+    centres are the integer multiples of b * step in [lo, hi]. Thus hkl = 0
+    is a voxel centre after `bin_volume` with the same factors, and the
+    operations of all 11 Laue groups stay exact index maps. lo_* are the
+    lower edges of the first voxels, as the forward scatter uses them.
+    """
     los, ns, axes = [], [], []
-    for lo, hi in ranges:
-        n = int(round((hi - lo) / step))
-        los.append(float(lo)); ns.append(n)
-        axes.append(lo + (np.arange(n) + 0.5) * step)
+    for (lo, hi), b in zip(ranges, bins):
+        j0 = int(np.ceil(lo / (b * step) - 1e-9))
+        j1 = int(np.floor(hi / (b * step) + 1e-9))
+        n = max(0, j1 - j0 + 1) * b
+        first = j0 * b - (b - 1) / 2.0          # first voxel centre, in units of step
+        los.append((first - 0.5) * step); ns.append(n)
+        axes.append((first + np.arange(n)) * step)
     return tuple(ns), tuple(axes), tuple(los)
 
 
@@ -128,6 +138,7 @@ def has_cupy(device=0):
 def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
                            osc_axis=(0, 1, 0), sense=1,
                            ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)), step=0.025,
+                           bins=(1, 1, 1),
                            read_fn=None, hot=None, progress_callback=None,
                            corrections=None, device=0, prefetch=3) -> Volume:
     """GPU reconstruction. Per-frame float64 scatter-add into a resident
@@ -144,7 +155,7 @@ def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
     px = np.column_stack([xs.ravel(), ys.ravel()]).astype(np.float32)
     r_lab = detector.scattering_vectors(px).astype(np.float32)
 
-    (nh, nk, nl), (H, K, L), (lo_h, lo_k, lo_l) = _axes(ranges, step)
+    (nh, nk, nl), (H, K, L), (lo_h, lo_k, lo_l) = _axes(ranges, step, bins)
     nkl = nk * nl
     nvox = nh * nkl
     corr = _resolve_corrections(corrections, detector, r_lab)
@@ -190,6 +201,7 @@ def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
 def reconstruct_volume(frames, phis, UB, R0, detector, *, phi0,
                        osc_axis=(0, 1, 0), sense=1,
                        ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)), step=0.025,
+                       bins=(1, 1, 1),
                        read_fn=None, hot=None, progress_callback=None,
                        corrections=None, **_ignored) -> Volume:
     """CPU reconstruction (numpy bincount). Same result as the GPU path."""
@@ -201,7 +213,7 @@ def reconstruct_volume(frames, phis, UB, R0, detector, *, phi0,
     px = np.column_stack([xs.ravel(), ys.ravel()]).astype(np.float32)
     r_lab = detector.scattering_vectors(px).astype(np.float32)
 
-    (nh, nk, nl), (H, K, L), (lo_h, lo_k, lo_l) = _axes(ranges, step)
+    (nh, nk, nl), (H, K, L), (lo_h, lo_k, lo_l) = _axes(ranges, step, bins)
     nkl = nk * nl
     nvox = nh * nkl
     corr = _resolve_corrections(corrections, detector, r_lab)
@@ -291,8 +303,8 @@ def reconstruct_to_volumedata(vol: Volume, source_folder=None, extra_meta=None):
 
 # ---------------------------------------------------------------- high level
 def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
-                        step=0.025, nframes=None, corrections=True, hot=None,
-                        use_gpu=True, device=0, prefetch=4, par_path=None,
+                        step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
+                        hot=None, use_gpu=True, device=0, prefetch=4, par_path=None,
                         use_tabbin=False, progress_callback=None, log=None):
     """One call: locate the cracker par + CBF frames, read the UB, get the
     orientation, and reconstruct. Returns (Volume, info_dict).
@@ -304,6 +316,10 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
         a lab-Y oscillation axis (works for clean, correctly-headered datasets).
     par_path : explicit .par to use (e.g. in a subfolder); else searched in `folder`.
         It is also the par the tabbin calibration uses.
+    bins : (bh, bk, bl) factors that you will give to `bin_volume` before
+        symmetrisation. The grid is built so that hkl = 0 is a voxel centre
+        after this binning (see `_axes`). Use the default (1, 1, 1) if you do
+        not bin.
     hot : raw-count cutoff above which pixels are ignored; None (default) keeps
         every pixel, so saturated Bragg pixels are never clipped silently.
     corrections : True applies solid-angle + polarisation corrections with the
@@ -388,7 +404,7 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
         f"grid {[list(r) for r in ranges]} dq={step} ...")
     t0 = time.time()
     vol = recon(frames, phis, UB, R0, det, phi0=phi0, osc_axis=osc_axis, sense=sense,
-                ranges=ranges, step=step, hot=hot, corrections=corr,
+                ranges=ranges, step=step, bins=bins, hot=hot, corrections=corr,
                 progress_callback=progress_callback, device=device, prefetch=prefetch)
     dt = time.time() - t0
 

@@ -215,10 +215,10 @@ agrees with the independent route.
 
 | Symbol | Module | Purpose |
 |--------|--------|---------|
-| `reconstruct_dataset(folder, *, ranges, step, use_tabbin, corrections, hot, use_gpu, nframes, ...)` | `engine` | one-call: geometry + reconstruction → `(Volume, info)` |
+| `reconstruct_dataset(folder, *, ranges, step, bins, use_tabbin, corrections, hot, use_gpu, nframes, ...)` | `engine` | one-call: geometry + reconstruction → `(Volume, info)`. Voxel centres are multiples of `step` × `bins`, so hkl = 0 is a voxel centre after `bin_volume(vd, *bins)` and all Laue groups stay exact |
 | `geometry_from_tabbin(folder) -> FittedGeometry` | `calibrate` | instrument-agnostic geometry fit from the tabbin |
 | `orient_from_frame(par, frame1) -> (det, UB, R0, phi0, idx)` | `geometry` | per-frame auto-index (with quality gate) |
-| `reconstruct_volume_gpu / reconstruct_volume(frames, phis, UB, R0, det, *, phi0, osc_axis, sense, ranges, step, hot, corrections, ...)` | `engine` | the core GPU / CPU histogram engine |
+| `reconstruct_volume_gpu / reconstruct_volume(frames, phis, UB, R0, det, *, phi0, osc_axis, sense, ranges, step, bins, hot, corrections, ...)` | `engine` | the core GPU / CPU histogram engine |
 | `reconstruct_to_volumedata(vol) -> VolumeData` | `engine` | wrap as an rspace3d `VolumeData` (NaN = unmeasured) |
 | `read_tabbin(path)`, `find_tabbin(folder)` | `tabbin` | read / locate the peak-hunt table |
 | `find_cbf_frames(folder)`, `find_crysalis_par(folder, recursive=)` | `geometry` | robust file discovery |

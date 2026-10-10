@@ -266,16 +266,17 @@ def test_bin_volume_scales_raster_geometry_and_sums_counts():
     vol = _sheared_unwarp_volume(shear=0.0, n=(8, 8, 6))
     vol.metadata.update({'s': 0.5, 'cx': 4.5, 'cy': 4.5, 'bin_xy': 1, 'bin_z': 1})
     vol.intensity[:] = 2.0
-    vol.intensity[0, 0, 0] = np.nan
+    vol.intensity[1, 1, 0] = np.nan
     vol.counts = np.ones(vol.intensity.shape, np.int64)
     b = bin_volume(vol, 2, 2, 2)
-    assert b.intensity.shape == (4, 4, 3)
+    # h = 0 and k = 0 are bin centres: the blocks skip the first pixel
+    assert b.intensity.shape == (3, 3, 3)
     assert b.metadata['s'] == 1.0 and b.metadata['bin_xy'] == 2 and b.metadata['bin_z'] == 2
-    assert b.metadata['cx'] == 2.5 and b.metadata['cy'] == 2.5
+    assert b.metadata['cx'] == 2.0 and b.metadata['cy'] == 2.0
     assert b.counts[0, 0, 0] == 8 and b.intensity[0, 0, 0] == 2.0   # NaN excluded
-    assert np.allclose(b.H, [-1.5, -0.5, 0.5, 1.5])
+    assert np.allclose(b.H, [-1.0, 0.0, 1.0])
     t = bin_volume(vol, 2, 2, 4)
-    assert t.metadata['bin_dropped_layers_hkl'] == [0, 0, 2]
+    assert t.metadata['bin_dropped_layers_hkl'] == [2, 2, 2]
     with pytest.raises(ValueError, match='in-plane'):
         bin_volume(vol, 3, 2, 1)
     sheared = _sheared_unwarp_volume(0.3, (8, 8, 6))

@@ -163,6 +163,19 @@ class ReconstructGUI(QMainWindow):
                             'saturated). 0 = no clip (default): the Eiger at\n'
                             'I19-2 reaches ~1.3e6 counts in Bragg cores.')
         gl.addWidget(self.hot, 3, 4)
+
+        gl.addWidget(QLabel('bin H,K / L:'), 4, 3)
+        brow = QHBoxLayout()
+        self.bin_xy = QSpinBox(); self.bin_xy.setRange(1, 16); self.bin_xy.setValue(1)
+        self.bin_z = QSpinBox(); self.bin_z.setRange(1, 16); self.bin_z.setValue(1)
+        brow.addWidget(self.bin_xy); brow.addWidget(self.bin_z)
+        for w in (self.bin_xy, self.bin_z):
+            w.setToolTip('Bin factors for the symmetrised volume. Set them before\n'
+                         'you reconstruct: the grid puts hkl = 0 on a voxel centre\n'
+                         'after this binning, so that the operations of all Laue\n'
+                         'groups are exact. The raw volume is not binned.')
+            w.valueChanged.connect(self._update_estimate)
+        gl.addLayout(brow, 4, 4)
         g2.setLayout(gl); layout.addWidget(g2)
 
         # Corrections + device
@@ -219,13 +232,6 @@ class ReconstructGUI(QMainWindow):
         self.sigma.setToolTip('Outlier rejection threshold (MAD sigma) across each\n'
                               'symmetry orbit. 3 = standard.')
         f4.addRow('Outlier sigma:', self.sigma)
-        brow = QHBoxLayout()
-        brow.addWidget(QLabel('H,K:'))
-        self.bin_xy = QSpinBox(); self.bin_xy.setRange(1, 16); self.bin_xy.setValue(1)
-        brow.addWidget(self.bin_xy); brow.addWidget(QLabel('L:'))
-        self.bin_z = QSpinBox(); self.bin_z.setRange(1, 16); self.bin_z.setValue(1)
-        brow.addWidget(self.bin_z); brow.addStretch(1)
-        f4.addRow('Bin before symmetrise:', brow)
 
         btns = QHBoxLayout()
         self.save_raw_btn = QPushButton('Save raw volume')
@@ -264,18 +270,26 @@ class ReconstructGUI(QMainWindow):
                 (self.kmin.value(), self.kmax.value()),
                 (self.lmin.value(), self.lmax.value()))
 
+    def _bins(self):
+        return (self.bin_xy.value(), self.bin_xy.value(), self.bin_z.value())
+
+    def _grid_counts(self):
+        """Voxel counts per axis of the grid that `_reconstruct` builds."""
+        from .rawrecon.engine import _axes
+        return _axes(self._ranges(), self.dq.value(), self._bins())[0]
+
     def _update_estimate(self):
-        dq = self.dq.value()
-        ns = []
-        for lo, hi in self._ranges():
-            ns.append(max(0, int(round((hi - lo) / dq))) if hi > lo else 0)
+        ns = self._grid_counts()
         nvox = ns[0] * ns[1] * ns[2]
         # GPU working set during accumulation: float64 sum + int32 count
         gb = nvox * 12 / 1e9
         txt = f'{ns[0]} x {ns[1]} x {ns[2]} = {nvox:,} voxels  (~{gb:.1f} GB GPU)'
         too_big = self._gpu_free_gb and gb > 0.7 * self._gpu_free_gb
-        if ns[0] == 0 or ns[1] == 0 or ns[2] == 0:
+        if any(hi <= lo for lo, hi in self._ranges()):
             txt = 'invalid range (max must exceed min)'
+            self.estimate_label.setStyleSheet('color:#a00;')
+        elif 0 in ns:
+            txt = 'range too narrow: it must contain a multiple of dq x bin'
             self.estimate_label.setStyleSheet('color:#a00;')
         else:
             self.estimate_label.setStyleSheet('color:#a00;' if too_big else 'color:#337;')
@@ -364,6 +378,10 @@ class ReconstructGUI(QMainWindow):
         if any(hi <= lo for lo, hi in r):
             QMessageBox.warning(self, 'Invalid grid', 'Each axis max must exceed its min.')
             return
+        if 0 in self._grid_counts():
+            QMessageBox.warning(self, 'Invalid grid',
+                                'Each axis range must contain a multiple of dq x bin.')
+            return
         corr = ({'solid_angle': True, 'polarization': True,
                  'polarization_fraction': self.pol_frac.value()}
                 if self.corr_chk.isChecked() else False)
@@ -373,20 +391,20 @@ class ReconstructGUI(QMainWindow):
         self._set_busy(True, 'Reconstructing...')
         self._log(f'\n{"="*54}\nReconstructing {self._folder}')
         self._worker = WorkerThread(self._do_reconstruct, self._folder, r,
-                                    self.dq.value(), nframes, corr, hot, use_gpu,
-                                    self._par, self.tabbin_chk.isChecked())
+                                    self.dq.value(), self._bins(), nframes, corr, hot,
+                                    use_gpu, self._par, self.tabbin_chk.isChecked())
         self._worker.progress.connect(self._update_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_recon_done)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _do_reconstruct(self, folder, ranges, step, nframes, corr, hot, use_gpu,
+    def _do_reconstruct(self, folder, ranges, step, bins, nframes, corr, hot, use_gpu,
                         par_path, use_tabbin):
         log = lambda m: QThread.currentThread()._emit_log(m)     # type: ignore[union-attr]
         cb = QThread.currentThread()._emit_progress             # type: ignore[union-attr]
         vol, info = rawrecon.reconstruct_dataset(
-            folder, ranges=ranges, step=step, nframes=nframes, corrections=corr,
+            folder, ranges=ranges, step=step, bins=bins, nframes=nframes, corrections=corr,
             hot=hot, use_gpu=use_gpu, par_path=par_path, use_tabbin=use_tabbin,
             progress_callback=cb, log=log)
         info['bragg_rms'] = rawrecon.bragg_registration_rms(vol)
@@ -470,6 +488,11 @@ class ReconstructGUI(QMainWindow):
         n_out = sym.metadata.get('n_outliers_removed', 0)
         log(f'  done in {time.time()-t:.1f}s ({n_out:,} outliers); '
             f'range [{np.nanmin(sym.intensity):.2f}, {np.nanmax(sym.intensity):.2f}]')
+        mapping = sym.metadata.get('symmetry_mapping')
+        log(f'  symmetry operations applied as: {mapping} maps')
+        if mapping != 'exact':
+            log('  Not all operations are exact index maps. If you changed the bin\n'
+                '  factors after the reconstruction, reconstruct again with them.')
         t = time.time()
         save_volume_h5(path, sym)
         log(f'  wrote {os.path.getsize(path)/1e6:.0f} MB in {time.time()-t:.0f}s')

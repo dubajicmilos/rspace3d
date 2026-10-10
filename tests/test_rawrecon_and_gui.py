@@ -65,6 +65,39 @@ def test_reconstruct_to_volumedata_declares_regular_grid_and_keeps_counts():
     assert np.allclose(A, np.eye(3) * 0.25) and np.allclose(origin, -0.875)
 
 
+def test_grid_puts_hkl_zero_on_a_voxel_centre_and_scatter_matches_it():
+    """Voxel centres are multiples of dq, also for ranges that are not."""
+    (n, _, _), (H, _, _), (lo, _, _) = engine._axes(((-1.01, 0.93),) * 3, 0.25)
+    assert n == 8 and np.allclose(H, np.arange(-4, 4) * 0.25) and 0.0 in H
+    assert lo == pytest.approx(-1.125)
+    # the forward scatter index floor((h - lo) / dq) puts each point in its own voxel
+    for shift in (-0.49, 0.0, 0.49):
+        idx = np.floor((H + shift * 0.25 - lo) / 0.25).astype(int)
+        assert np.array_equal(idx, np.arange(n))
+
+
+_HEXAGONAL_UB = np.array([[1 / 4.0, 0, 0], [1 / (4.0 * np.sqrt(3)), 2 / (4.0 * np.sqrt(3)), 0],
+                          [0, 0, 1 / 7.0]])           # a = b = 4, gamma = 120 deg (B, 1/d)
+
+
+@pytest.mark.parametrize('b', [1, 2, 3, 4])
+@pytest.mark.parametrize('laue, ub', [('6/mmm', _HEXAGONAL_UB), ('-3m', _HEXAGONAL_UB),
+                                      ('m-3m', np.eye(3) / 6.0)])
+def test_grid_built_for_the_bin_factor_keeps_all_operations_exact(b, laue, ub):
+    """A grid built with bins = b and then binned by b has hkl = 0 on a voxel
+    centre. Thus the trigonal and hexagonal operations are exact, also for
+    an even b (with voxel edges at 0 they were interpolated)."""
+    from rspace3d.volume_builder import bin_volume, index_space_ops
+    ns, (H, K, L), _ = engine._axes(((-1.0, 1.0),) * 3, 0.05, (b, b, b))
+    data = np.ones(ns, np.float32)
+    vol = engine.Volume(data, H, K, L, ub, np.ones(ns, np.int64), 0.5)
+    vd = bin_volume(engine.reconstruct_to_volumedata(vol, source_folder='x', extra_meta={}),
+                    b, b, b)
+    assert min(np.abs(ax).min() for ax in (vd.H, vd.K, vd.L)) < 1e-12
+    assert 'bin_dropped_layers_hkl' not in vd.metadata          # whole blocks only
+    assert {o['kind'] for o in index_space_ops(vd, laue)} <= {'perm', 'integer'}
+
+
 def test_find_cbf_frames_picks_equal_length_scans_by_name(tmp_path):
     from rspace3d.rawrecon.geometry import find_cbf_frames
     for prefix in ('sample_02_', 'sample_01_'):
@@ -221,6 +254,19 @@ def test_reconstruct_gui_clears_previous_volume_on_folder_change(qapp, tmp_path)
     assert gui.hot.value() == 0                           # no hot-pixel clip by default
 
 
+def test_reconstruct_gui_builds_the_grid_for_its_bin_factors(qapp):
+    from rspace3d.reconstruct_gui import ReconstructGUI
+    gui = ReconstructGUI()
+    for w, v in ((gui.hmin, -1.0), (gui.hmax, 1.0), (gui.kmin, -1.0), (gui.kmax, 1.0),
+                 (gui.lmin, -1.0), (gui.lmax, 1.0), (gui.dq, 0.05)):
+        w.setValue(v)
+    assert gui.bin_xy.isEnabled()                         # set before the reconstruction
+    assert tuple(gui._grid_counts()) == (41, 41, 41)
+    gui.bin_xy.setValue(2)
+    assert tuple(gui._grid_counts()) == (42, 42, 41)      # 21 blocks of 2, centred on 0
+    assert gui.estimate_label.text().startswith('42 x 42 x 41')
+
+
 # ──────────────────────────────────────────────────────────────────
 # Loader end-to-end (fabio decode stubbed): D4, D7, D10
 # ──────────────────────────────────────────────────────────────────
@@ -250,14 +296,15 @@ def test_loader_covered_binning_and_binned_geometry(monkeypatch, tmp_path):
         name = f'run_{i + 1}.img'
         (tmp_path / name).write_bytes(_img_header(nx, ny, 'HK', l))
         f = np.full((ny, nx), 100, np.int32)
-        f[:, :3] = -1                     # detector-flagged strip -> unmeasured
-        f[4, 4] = 0                        # an isolated real zero count
+        f[:, :4] = -1                     # detector-flagged strip -> unmeasured
+        f[5, 5] = 0                        # an isolated real zero count
         frames[name] = f
     _stub_decode(monkeypatch, frames)
     vol = load_unwarp_folder(str(tmp_path), bin_xy=2, morph_size=3, max_workers=1)
-    assert vol.plane_type == 'HK' and vol.intensity.shape == (6, 6, 3)
+    # the blocks skip pixel 0 so that h = 0 and k = 0 are bin centres
+    assert vol.plane_type == 'HK' and vol.intensity.shape == (5, 5, 3)
     # D4: the 2x2 cells straddling the -1 strip average the covered pixels only
-    assert vol.intensity[1, 2, 0] == 100.0            # x pixels 2,3 -> one covered column
+    assert vol.intensity[1, 2, 0] == 100.0            # x pixels 3,4 -> one covered column
     assert np.isnan(vol.intensity[0, 2, 0])            # fully unmeasured block
     assert vol.intensity[2, 2, 0] == pytest.approx(75.0)   # block with the real zero
     # D10: raster geometry describes the binned volume; bin_z applied once

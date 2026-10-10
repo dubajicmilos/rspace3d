@@ -438,18 +438,22 @@ def _axis_center(axis: npt.NDArray[np.floating]) -> float:
 
 
 def _bin_start(c: float, b: int) -> int | None:
-    """Leading pixels to skip so the centre `c` (1-based) sits on a bin edge
-    or bin centre after binning by `b`; None when no integer skip achieves it.
+    """Leading pixels to skip so the centre `c` (1-based) sits on a bin
+    centre after binning by `b`, or else on a bin edge; None when no integer
+    skip achieves either.
 
     Bin edges sit at pixel coordinate 0.5 + skip + b*j and bin centres half
-    a bin further, so `c - 0.5 - skip` must be a multiple of b/2.
+    a bin further. A bin centre keeps the operations of all Laue groups
+    exact and keeps index 0 as a layer of the binned grid. A bin edge keeps
+    only the signed-permutation operations exact.
     """
-    half = b / 2.0
-    r = (c - 0.5) % half
-    # For an odd b, the integer skip can be r or r + b/2. Try the two values.
-    for skip in (r, r + half):
-        if abs(skip - round(skip)) <= 1e-9:
-            return int(round(skip)) % b
+    # Bin centre first, then bin edge. Round to the nearest integer skip
+    # (no float modulo, because round-off near a multiple of b/2 changes
+    # the result of a float modulo by b/2).
+    for x in (c - 0.5 - b / 2.0, c - 0.5):
+        k = round(x)
+        if abs(x - k) <= 1e-9:
+            return int(k) % b
     return None                           # only a fractional skip is possible
 
 
@@ -462,8 +466,9 @@ def bin_starts(axes: list[npt.NDArray[np.floating]], factors: list[int],
                couple: tuple[int, int] | None = None) -> list[int]:
     """Block alignment for binning: leading samples to skip per axis.
 
-    Chosen so that each axis keeps Miller index 0 on a bin edge or a bin centre
-    (inversion stays an exact index map), and, for the two `couple`d axes, so
+    Chosen so that each axis keeps Miller index 0 on a bin centre where
+    possible, otherwise on a bin edge (inversion stays an exact index map),
+    and, for the two `couple`d axes, so
     that both are of the same kind (90 deg rotations and the hexagonal
     operations, which mix the two in-plane axes, stay exact). Costs at most
     `b` samples at the raster edge. Falls back to 0 where no alignment exists

@@ -178,8 +178,14 @@ rspace3d-reconstruct          # or: python -m rspace3d.reconstruct_gui
    reciprocal-lattice units (they need not be symmetric or equal) and the voxel
    size `dq` (default 0.025 r.l.u.). The *Grid* line shows the voxel count and
    the GPU memory needed during accumulation (12 bytes per voxel), and turns red
-   when this approaches the free VRAM. A 480 × 480 × 480 grid (-6 to 6 at 0.025)
+   when this approaches the free VRAM. A 481 × 481 × 481 grid (-6 to 6 at 0.025)
    needs about 1.3 GB.
+   - *bin H,K / L*: the bin factors for the symmetrised volume. Set them before
+     you reconstruct. The voxel centres are multiples of `dq` × bin, so hkl = 0
+     is a voxel centre after the binning. Then the operations of all 11 Laue
+     groups, trigonal and hexagonal included, are exact index maps. The grid
+     can extend past the minimum and maximum by up to half a binned voxel. The
+     raw volume is not binned.
    - *frames (0 = all)*: use fewer frames for a quick test.
    - *hot-pixel clip*: pixels with counts above this value are ignored. The
      default (0 = off) keeps every pixel. A value such as 1e6 removes zingers
@@ -205,10 +211,13 @@ rspace3d-reconstruct          # or: python -m rspace3d.reconstruct_gui
 5. **Process the reconstructed volume** (enabled after a reconstruction):
    - *Save raw volume* writes `<folder name>_recon_raw.h5`. Unmeasured voxels
      are stored as `NaN`; measured voxels with zero counts are `0.0`.
-   - *Symmetrise + Save* applies optional binning (H, K and L factors) and then
+   - *Symmetrise + Save* applies the binning from step 2 and then
      one pass of symmetry averaging with outlier rejection in the chosen Laue
      group and sigma, and writes `<folder name>_recon_sym_<laue>.h5` (for
-     example `_recon_sym_mbar3m.h5` for `m-3m`).
+     example `_recon_sym_mbar3m.h5` for `m-3m`). The log shows whether the
+     symmetry operations were exact maps. If you change the bin factors after
+     the reconstruction, some operations can need interpolation. Reconstruct
+     again with the new factors to keep them exact.
    - *Open in Viewer* saves the raw volume next to the frames and opens it in
      the viewer.
 
@@ -283,7 +292,7 @@ wrong (see the troubleshooting table).
 | `could not reliably index ...` (tabbin option unticked) | the header-geometry path failed (powder rings, wrong header beam centre or distance); use the tabbin path. |
 | GPU out of memory | shrink the grid (larger `dq` or narrower ranges); the *Grid* line shows the requirement. Or untick *Use GPU*. |
 | peaks smeared, Bragg RMS around 0.5 r.l.u. | wrong detector pixel convention or geometry; see section 4.1 of `rspace3d/rawrecon/README.md`. |
-| no GPU | the CPU path gives the same result at about 1 s per frame on a 480³ grid; use *frames* to test on a subset first, or a coarser `dq`. |
+| no GPU | the CPU path gives the same result at about 1 s per frame on a 481³ grid; use *frames* to test on a subset first, or a coarser `dq`. |
 
 ## Route B: volume from CrysAlisPro unwarp layers
 
