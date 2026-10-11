@@ -8,7 +8,7 @@ GPU acceleration.
 Works with any unit cell (cubic to triclinic).
 """
 
-__version__ = '2.3.0'
+__version__ = '2.4.0'
 
 # Rigaku Oxford detector type 8 ships with newer CrysAlisPro experiments but is
 # missing from fabio < 2026-04. Patch in place so .img reads don't KeyError.
@@ -38,5 +38,14 @@ from .volume_builder import (
     cell_from_ub,
     get_symmetry_operations,
     LAUE_GROUP_NAMES,
+)
+from .averaging import (
+    NoiseModel,
+    fit_noise_model,
+    automatic_candidates,
+    score_candidates,
+    bias_checks,
+    suggest,
+    preselect,
 )
 from .make_dcunwarp import generate_dcunwarp

@@ -650,7 +650,8 @@ def bin_volume(vol: VolumeData, bh: int, bk: int, bl: int) -> VolumeData:
     # follows the block layout (blocks start at pixel 1).
     meta = vol.metadata.copy()
     # These values describe the symmetrisation of the unbinned grid
-    for key in ('symmetry_diagnostics', 'n_outliers_removed', 'symmetry_max_index_error'):
+    for key in ('symmetry_diagnostics', 'n_outliers_removed', 'symmetry_max_index_error',
+                'noise_model'):
         meta.pop(key, None)
     if 's' in meta:
         meta['s'] = meta['s'] * bx
@@ -1260,12 +1261,28 @@ def reciprocal_metric(vol: VolumeData) -> tuple[npt.NDArray[np.float64], str]:
 # Combined outlier rejection + symmetrization (per-voxel orbit engine)
 # ──────────────────────────────────────────────────────────────────
 
+def orbit_plan(vol: VolumeData, laue_group: str) -> Any:
+    """Operation tables of `vol` and `laue_group` for `orbit_engine` (an `OrbitPlan`)."""
+    from . import orbit_engine
+    ops = index_space_ops(vol, laue_group)
+    identity_index = next(i for i, o in enumerate(ops)
+                          if np.array_equal(o['op'], np.eye(3, dtype=int)))
+    origin, A = volume_affine(vol)
+    G, q_unit = reciprocal_metric(vol)
+    return orbit_engine.build_plan(vol.intensity.shape, ops, identity_index, origin, A, G,
+                                   q_unit, _EDGE_SNAP_TOL)
+
+
 def symmetrize_volume(vol: VolumeData, laue_group: str,
                       sigma: float | None = 3.0, min_valid: int = 3,
                       progress_callback: Callable[[int, int], None] | None = None,
                       use_gpu: bool | None = None,
                       poisson_floor: bool = True,
-                      propagate_variance: bool = True) -> VolumeData:
+                      propagate_variance: bool = True,
+                      weighting: str = 'equal',
+                      rejection: str | None = None,
+                      noise_model: Any = None,
+                      grad: np.ndarray | None = None) -> VolumeData:
     """Outlier-reject and symmetry-average in a single orbit gather.
 
     For each voxel the function:
@@ -1349,6 +1366,44 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
         False gives the output of rspace3d 2.2.0: no variance and no chi^2.
         This uses less memory and time. The intensity and the outlier count
         do not change.
+    weighting : str
+        'equal' (default) gives the mean of rspace3d 2.3.0.
+        'counts' weights each member with its pixel count N_i (`vol.counts`
+        gathered with the same maps, interpolated for an 'interp' member).
+        The interpolated count is used on purpose: the corners of an
+        interpolated member also go into the neighbouring voxels, so their
+        errors are correlated, and the interpolated count gives them less
+        weight than independent members. Without `vol.counts`, N_i = 1.
+        'adaptive' weights each member with 1 / v_i (see `noise_model`).
+        A weighted mean is the float64 sum of w_i x_i over the survivors,
+        divided by the float64 sum of w_i, rounded to float32. With weights,
+        the output variance is sum_j (W_j / W)^2 var_j over the distinct
+        sources j. W_j is the sum of the weights of the survivors that read
+        source j, and W is the sum of all survivor weights.
+    rejection : str or None
+        None (default) keeps the rule of rspace3d 2.3.0: 'mad' if `sigma`
+        is a number, 'none' if `sigma` is None.
+        'none' rejects no member. 'mad' is the median and MAD rule above.
+        'model' rejects member i if |x_i - med| > sigma * sqrt(v_i), the
+        orbit has at least `min_valid` finite members, and member i is not
+        the nearest member to the median (the member or members with the
+        smallest |x_j - med| always stay). It does not use the MAD or
+        `poisson_floor`. 'mad' and 'model' need a `sigma`.
+    noise_model : averaging.NoiseModel or None
+        The variance of a member, at the orbit median med:
+        v_i = gain max(med, 1) / N_i + (rel med)^2 + (kappa G)^2 + floor^2.
+        G is the gradient magnitude of a first-pass symmetric average at
+        the target voxel (`averaging.first_pass_gradient`). 'adaptive' and
+        'model' use it. If it is None, the function fits it with
+        `averaging.fit_noise_model`. `metadata['noise_model']` then holds it.
+        If that fit fails, the function raises ValueError.
+    grad : ndarray or None
+        The gradient volume G (shape of `vol.intensity`), for example from
+        `averaging.fit_noise_model(..., return_gradient=True)`. 'adaptive'
+        and 'model' use it if kappa > 0. None calculates G when it is
+        necessary. Give G to calculate it only once for several calls.
+
+    The defaults give an output that is bit-identical to rspace3d 2.3.0.
     """
     from . import orbit_engine
 
@@ -1356,6 +1411,10 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
         use_gpu = HAS_GPU
     if sigma is not None and (not np.isfinite(sigma) or sigma <= 0):
         raise ValueError(f"sigma must be positive or None, got {sigma!r}")
+    rej = rejection if rejection is not None else ('mad' if sigma is not None else 'none')
+    if rej != 'none' and sigma is None:
+        raise ValueError(f"rejection {rej!r} needs a sigma")
+    av = orbit_engine.Averaging(weighting=weighting, rejection=rej)
 
     residual = laue_metric_residual(vol, laue_group)
     if residual is not None and residual > 0.02:
@@ -1367,8 +1426,6 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
 
     ops = index_space_ops(vol, laue_group)
     n_ops = len(ops)
-    identity_index = next(i for i, o in enumerate(ops)
-                          if np.array_equal(o['op'], np.eye(3, dtype=int)))
     kinds = {o['kind'] for o in ops}
     mapping = ('interpolated' if 'interp' in kinds
                else 'nearest' if 'nearest' in kinds else 'exact')
@@ -1378,32 +1435,63 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
                 if vol.variance is not None and propagate_variance else None)
     # A derived variance max(I, 1) is calculated by the engine from the data
     derive = bool(propagate_variance) and variance_is_derived(vol)
-    origin, A = volume_affine(vol)
-    G, q_unit = reciprocal_metric(vol)
-    plan = orbit_engine.build_plan(data.shape, ops, identity_index, origin, A, G,
-                                   q_unit, _EDGE_SNAP_TOL)
+    plan = orbit_plan(vol, laue_group)
+
+    # Noise model and gradient volume (only for 'adaptive' and 'model')
+    if av.uses_model:
+        from . import averaging
+        if grad is not None:
+            grad = averaging._check_gradient(grad, data.shape)
+        fitted = noise_model is None
+        if fitted:
+            try:
+                noise_model, grad = averaging._fit(vol, laue_group, plan, data,
+                                                   use_gpu=use_gpu, grad=grad)
+            except ValueError as exc:
+                raise ValueError(
+                    f"weighting {weighting!r} with rejection {rej!r} needs a noise model, "
+                    f"and the noise-model fit failed. {exc} Give a noise_model, or use "
+                    "weighting 'equal' or 'counts' with rejection 'mad'.") from exc
+        elif noise_model.kappa > 0 and grad is None:
+            grad = averaging.first_pass_gradient(plan, data, use_gpu)
+        av.noise = noise_model.params
+        av.grad = grad if noise_model.kappa > 0 else None
+    if av.uses_counts and vol.counts is not None:
+        av.counts = np.ascontiguousarray(vol.counts, dtype=np.float32)
+
     # The threshold is float32(sigma) * scale, as in rspace3d <= 2.2.
-    sigma_f = None if sigma is None else float(sigma)
+    sigma_f = None if sigma is None or rej == 'none' else float(sigma)
     # The engines test n_valid >= an integer. ceil keeps the rule
     # n_valid >= min_valid of rspace3d 2.2.0 for a non-integer value.
     min_valid_i = int(np.clip(np.ceil(float(min_valid)), 0, orbit_engine.MAX_OPS + 1))
     res = orbit_engine.run(plan, data, variance, sigma_f, min_valid_i,
                            bool(poisson_floor), bool(use_gpu), progress_callback,
-                           derive_variance=derive)
+                           derive_variance=derive, averaging=av)
+    del av
 
     meta: dict[str, Any] = {**vol.metadata, 'laue_group': laue_group,
                             'symmetry_ops_applied': n_ops,
                             'symmetry_mapping': mapping,
                             'symmetry_max_index_error': plan.max_index_error,
                             'symmetry_diagnostics': orbit_engine.result_diagnostics(plan, res)}
+    for key in ('weighting', 'rejection', 'noise_model'):     # from an earlier run
+        meta.pop(key, None)
     if res.variance is None:
         meta.pop('variance_model', None)
     if residual is not None:
         meta['laue_metric_residual'] = residual
-    if sigma is not None:
+    if weighting != 'equal' or rejection is not None:
+        meta['weighting'] = weighting
+        meta['rejection'] = rej
+    if rej == 'model' or weighting == 'adaptive':
+        meta['noise_model'] = {**noise_model.to_dict(), 'fitted': fitted}
+    if rej != 'none':
         meta['sigma'] = sigma
         meta['min_valid'] = min_valid
-        meta['poisson_floor'] = poisson_floor
+        if rej == 'mad':
+            meta['poisson_floor'] = poisson_floor
+        else:
+            meta.pop('poisson_floor', None)
         meta['n_outliers_removed'] = res.n_outliers_removed
     return VolumeData(
         intensity=res.intensity,
@@ -1598,7 +1686,7 @@ _PROVENANCE_KEYS: dict[str, Callable[[Any], Any]] = {
     'reconstructed_by': str, 'n_measured_voxels': int, 'measured_pct': float,
     'n_files': int, 'd_min': float, 'hot_pixel_cutoff': float,
     'polarization_axis': str, 'geometry_method': str, 'source_manifest': str,
-    'variance_model': str,
+    'variance_model': str, 'weighting': str, 'rejection': str,
 }
 
 
@@ -1619,6 +1707,8 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
     calculate it again.
     Optional group: /diagnostics (the per-shell sums of
     `metadata['symmetry_diagnostics']`, one 1D dataset per sum).
+    Optional attribute: noise_model (`metadata['noise_model']` as a JSON
+    text). `averaging.NoiseModel.from_dict` makes the model from the dict.
 
     Can be read in MATLAB with:
         data = h5read('file.h5', '/data');
@@ -1660,6 +1750,10 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
             value = vol.metadata.get(key)
             if value is not None:
                 f.attrs[key] = value
+        # Noise model of the averaging (a JSON text)
+        if vol.metadata.get('noise_model') is not None:
+            import json
+            f.attrs['noise_model'] = json.dumps(vol.metadata['noise_model'])
 
         # Symmetrisation diagnostics per |q| shell
         diag = vol.metadata.get('symmetry_diagnostics')
@@ -1737,6 +1831,9 @@ def load_volume_h5(path: str) -> VolumeData:
         for key, kind in _PROVENANCE_KEYS.items():
             if key in f.attrs:
                 metadata[key] = kind(f.attrs[key])
+        if 'noise_model' in f.attrs:
+            import json
+            metadata['noise_model'] = json.loads(str(f.attrs['noise_model']))
         # M_inv, UB, cell, Cartesian step
         if 'M_inv' in f:
             metadata['M_inv'] = np.array(f['M_inv'])

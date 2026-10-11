@@ -32,6 +32,34 @@ Kinds of orbit member (see `volume_builder.index_space_ops`):
 The diagnostics are not part of the bit-identity. The GPU adds the float
 sums in a different order.
 
+Averaging options (`Averaging`, see `volume_builder.symmetrize_volume`):
+
+* weighting 'equal' (default): the float32 mean of rspace3d 2.3.0.
+* weighting 'counts': w_i = N_i, the pixel count of member i. An 'interp'
+  member has the interpolated count sum_k w_k N_k / W of its measured
+  corners. This is on purpose. An interpolated value is a mean of up to 8
+  measured voxels, so its variance is smaller than the variance of one
+  voxel. But the same measured voxels also go into the interpolated members
+  of the neighbouring output voxels, so these errors are correlated. The
+  interpolated count (not the larger effective count of the interpolated
+  value) gives the correlated corners less weight than independent
+  members. Without counts, N_i = 1.
+* weighting 'adaptive': w_i = 1 / v_i (noise model, below).
+* The weighted mean is the float64 sum of w_i x_i over the survivors in
+  operation order, divided by the float64 sum of the w_i, and rounded to
+  float32. If the sum of the weights is not positive, the voxel is NaN.
+* rejection 'mad' (the rule of rspace3d 2.3.0), 'model' or 'none'. 'model'
+  rejects member i if n_valid >= min_valid and
+  dev_i > max(sigma sqrt(v_i), min_j dev_j), with dev_i = |x_i - med| and
+  j over the finite members. Thus the member or members nearest the median
+  always stay, and 'model' cannot remove all members of a voxel.
+* Noise model of member i, at the orbit median med of the finite members:
+  v_i = gain max(med, 1) / N_i + ((rel med)^2 + (kappa G)^2) + floor^2.
+  G is an input volume (the gradient magnitude at the target voxel).
+* The output variance with weights is sum_j (W_j / W)^2 var_j over the
+  distinct sources j of the survivors. W_j is the sum of the weights of the
+  survivors that read source j.
+
 Each voxel of an orbit sees the same members. Thus the float sums of the
 diagnostics (chi^2, nu and the R_sym sums) of a voxel are divided by the
 number of distinct sources among its finite members. An exact orbit then
@@ -84,6 +112,67 @@ class OrbitPlan:
     q_unit: str
     edge_tol: float
     max_index_error: float
+
+
+WEIGHTINGS = ('equal', 'counts', 'adaptive')
+REJECTIONS = ('none', 'mad', 'model')
+
+
+@dataclass
+class Averaging:
+    """Averaging options of the engines.
+
+    `noise` is (gain, rel, kappa, floor) of the noise model. 'adaptive' and
+    'model' use it. `counts` is the float32 pixel count of each voxel (None
+    gives N = 1). `grad` is the float32 gradient magnitude G of each voxel
+    (None gives G = 0).
+    """
+    weighting: str = 'equal'
+    rejection: str = 'mad'
+    noise: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    counts: npt.NDArray[np.float32] | None = None
+    grad: npt.NDArray[np.float32] | None = None
+
+    def __post_init__(self) -> None:
+        if self.weighting not in WEIGHTINGS:
+            raise ValueError(f"weighting must be one of {WEIGHTINGS}, got {self.weighting!r}")
+        if self.rejection not in REJECTIONS:
+            raise ValueError(f"rejection must be one of {REJECTIONS}, got {self.rejection!r}")
+
+    @property
+    def wmode(self) -> int:
+        return WEIGHTINGS.index(self.weighting)
+
+    @property
+    def rmode(self) -> int:
+        return REJECTIONS.index(self.rejection)
+
+    @property
+    def uses_model(self) -> bool:
+        """True if the noise model is necessary."""
+        return self.weighting == 'adaptive' or self.rejection == 'model'
+
+    @property
+    def uses_counts(self) -> bool:
+        """True if the member pixel counts are necessary."""
+        return self.weighting != 'equal' or self.rejection == 'model'
+
+    def count_array(self) -> npt.NDArray[np.float32] | None:
+        """The counts that the engines read, or None (N = 1)."""
+        return self.counts if self.uses_counts else None
+
+    def grad_array(self) -> npt.NDArray[np.float32] | None:
+        """The gradient volume that the engines read, or None (G = 0)."""
+        return self.grad if self.uses_model else None
+
+
+def _averaging(sigma: float | None, averaging: Averaging | None) -> Averaging:
+    """The options of rspace3d 2.3.0 if `averaging` is None. Checks sigma."""
+    if averaging is None:
+        return Averaging(rejection='mad' if sigma is not None else 'none')
+    if averaging.rejection != 'none' and sigma is None:
+        raise ValueError(f"rejection {averaging.rejection!r} needs a sigma")
+    return averaging
 
 
 @dataclass
@@ -241,17 +330,21 @@ class _Source:
     var_mode: int                            # 0 none, 1 stored, 2 derived max(x, 1)
     filled: npt.NDArray[np.float32] | None   # data with NaN = 0 (interp, var_mode 0)
     weight: npt.NDArray[np.float32] | None   # 1 where data is finite, else 0
+    cnt: npt.NDArray[np.float32] | None = None       # pixel counts (None: N = 1)
+    cnt_flat: npt.NDArray[np.float32] | None = None
 
 
-def _table_axes(plan: OrbitPlan, o: int, r: list[Any]) -> list[Any]:
+def _table_axes(plan: OrbitPlan, o: int, c: list[Any]) -> list[Any]:
     """Source index on each axis of a 'perm' or 'nearest' member (-1 outside the grid).
 
-    Each index is a 3D array that broadcasts to the box. It comes from a 1D table.
+    `c` holds the target index on each axis (int64 arrays that broadcast to
+    the box, or 1D arrays of the same length for a list of voxels). Each
+    source index comes from a 1D table.
     """
     sd = []
     for d in range(3):
         j = int(plan.opi[o, 1 + d])
-        sd.append(_along(j, plan.tab[int(plan.opi[o, 4 + d]) + r[j]]))
+        sd.append(plan.tab[int(plan.opi[o, 4 + d]) + c[j]])
     return sd
 
 
@@ -322,7 +415,7 @@ def _sources(plan: OrbitPlan, r: list[Any], c: list[Any], dc: list[Any]) -> list
     for o in range(plan.n_ops):
         kind = plan.kind[o]
         if kind == 0:
-            out.append(_table_axes(plan, o, r))
+            out.append(_table_axes(plan, o, c))
         elif kind == 1:
             out.append(_integer_axes(plan, o, c))
         else:
@@ -331,9 +424,13 @@ def _sources(plan: OrbitPlan, r: list[Any], c: list[Any], dc: list[Any]) -> list
     return out
 
 
-def _member_table(plan: OrbitPlan, o: int, src: _Source, r: list[Any]) -> tuple[Any, Any]:
-    """'perm' and 'nearest' member: values and variances (None without variance)."""
-    sd = _table_axes(plan, o, r)
+def _member_table(plan: OrbitPlan, o: int, src: _Source, c: list[Any]) -> tuple[Any, Any, Any]:
+    """'perm' and 'nearest' member: values, variances and counts.
+
+    The variances are None without variance. The counts (float64) are None
+    if `src` has no counts.
+    """
+    sd = _table_axes(plan, o, c)
     ok = (sd[0] >= 0) & (sd[1] >= 0) & (sd[2] >= 0)
     ix = [np.maximum(s, 0) for s in sd]
     x = src.data[ix[0], ix[1], ix[2]]
@@ -345,12 +442,13 @@ def _member_table(plan: OrbitPlan, o: int, src: _Source, r: list[Any]) -> tuple[
         xv = src.var[ix[0], ix[1], ix[2]]
     elif src.var_mode == 2:
         xv = np.maximum(x, np.float32(1.0))
-    return x, xv
+    xn = src.cnt[ix[0], ix[1], ix[2]].astype(np.float64) if src.cnt is not None else None
+    return x, xv, xn
 
 
 def _member_integer(plan: OrbitPlan, o: int, src: _Source, c: list[Any],
-                    shape: tuple[int, int, int]) -> tuple[Any, Any]:
-    """'integer' member (int64 index arithmetic): values and variances."""
+                    shape: tuple[int, ...]) -> tuple[Any, Any, Any]:
+    """'integer' member (int64 index arithmetic): values, variances and counts."""
     nh, nk, nl = plan.shape
     sd = _integer_axes(plan, o, c)
     ok = None
@@ -366,15 +464,17 @@ def _member_integer(plan: OrbitPlan, o: int, src: _Source, c: list[Any],
         xv = src.var_flat[key]
     elif src.var_mode == 2:
         xv = np.maximum(x, np.float32(1.0))
-    return x, xv
+    xn = src.cnt_flat[key].astype(np.float64) if src.cnt_flat is not None else None
+    return x, xv, xn
 
 
 def _member_interp(plan: OrbitPlan, o: int, src: _Source, dc: list[Any],
-                   shape: tuple[int, int, int]) -> tuple[Any, Any]:
+                   shape: tuple[int, ...]) -> tuple[Any, Any, Any]:
     """'interp' member: trilinear interpolation of the measured neighbours.
 
-    Returns the values and the variances (None without variance). The
-    variance is sum_k (w_k / W)^2 var_k over the measured corners k.
+    Returns the values, the variances (None without variance) and the counts
+    (None if `src` has no counts). The variance is sum_k (w_k / W)^2 var_k
+    over the measured corners k. The count is sum_k w_k N_k / W (float64).
     """
     nh, nk, nl = plan.shape
     sizes = plan.shape
@@ -390,10 +490,11 @@ def _member_interp(plan: OrbitPlan, o: int, src: _Source, dc: list[Any],
         with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
             x = np.where(den32 > _DEN_MIN, num32 / np.maximum(den32, _DEN_MIN), nan)
         x[~np.isfinite(x)] = nan
-        return x.reshape(shape), None
+        return x.reshape(shape), None, None
 
     num = np.zeros(shape, np.float64)
     den = np.zeros(shape, np.float64)
+    numn = np.zeros(shape, np.float64) if src.cnt_flat is not None else None
     taps = []
     with np.errstate(invalid='ignore', over='ignore'):
         for s in itertools.product((0, 1), repeat=3):
@@ -420,6 +521,18 @@ def _member_interp(plan: OrbitPlan, o: int, src: _Source, dc: list[Any],
                     p = p * a[d]
             np.add(num, p, out=num, where=use)
             del p
+            if numn is not None:
+                # ((N a0) a1) a2, the same order as the data
+                p = src.cnt_flat[fl].astype(np.float64)
+                for d in range(3):
+                    if np.all(a[d] == 1.0):
+                        continue
+                    if np.broadcast_shapes(p.shape, a[d].shape) == p.shape:
+                        np.multiply(p, a[d], out=p)
+                    else:
+                        p = p * a[d]
+                np.add(numn, p, out=numn, where=use)
+                del p
             w = (a[0] * a[1]) * a[2]
             np.add(den, w, out=den, where=use)
             if src.var_mode != 0:
@@ -443,7 +556,11 @@ def _member_interp(plan: OrbitPlan, o: int, src: _Source, dc: list[Any],
                 np.multiply(rr, vk, out=rr)               # (r r) var, var exact in float64
                 np.add(vs, rr, out=vs, where=use)
         xv = vs.astype(np.float32)
-    return x, xv
+    xn = None
+    if numn is not None:
+        with np.errstate(invalid='ignore', divide='ignore'):
+            xn = numn / den
+    return x, xv, xn
 
 
 def _median_sorted(s: npt.NDArray[np.float32], n: npt.NDArray[np.int64]) -> npt.NDArray[np.float32]:
@@ -456,8 +573,13 @@ def _median_sorted(s: npt.NDArray[np.float32], n: npt.NDArray[np.int64]) -> npt.
 
 
 def _row_median(a: npt.NDArray[np.float32], n: npt.NDArray[np.int64]) -> npt.NDArray[np.float32]:
-    """Median over axis 0 of `a` (n_ops, count) of the n finite entries of each column."""
-    s = np.ascontiguousarray(a.T)
+    """Median over axis 0 of `a` (n_ops, count) of the n finite entries of each column.
+
+    The function sorts a copy. It does not change `a`, also if `a` is
+    F-contiguous (a.T is then C-contiguous and np.ascontiguousarray does not
+    copy it).
+    """
+    s = np.array(a.T, order='C')
     s.sort(axis=1)                         # NaN last
     return _median_sorted(s, n)
 
@@ -558,47 +680,99 @@ def _ranges(h0: int, h1: int, k0: int, k1: int, nl: int) -> tuple[list[Any], ...
     return r, c, dc
 
 
-def _box_cpu(plan: OrbitPlan, src: _Source, h0: int, h1: int, k0: int, k1: int,
-             sigma: float | None, min_valid: int, poisson_floor: bool,
-             cand: npt.NDArray[np.int64], keys_c: npt.NDArray[np.int64] | None) -> tuple[Any, ...]:
-    """Output, output variance and diagnostic sums of the voxels of one box.
+def gather_members(plan: OrbitPlan, src: _Source, c: list[Any], dc: list[Any],
+                   shape: tuple[int, ...]) -> tuple[Any, Any, Any]:
+    """Orbit members of the voxels `c` (a box, or a 1D list of voxels).
 
-    `cand` holds the flat indices (in the box) of the voxels where two
-    members can read the same source (`_collision_voxels`), and `keys_c`
-    the source keys of all members at these voxels (`_keys_at`).
+    `c` holds the int64 target index on each axis and `dc` the same as
+    float64. Returns `vals` (n_ops, count) float32 (NaN where a member is
+    missing), `mvar` (n_ops, count) float32 or None, and `ncnt`
+    (n_ops, count) float64 or None (None if `src` has no counts).
     """
-    nh, nk, nl = plan.shape
     n_ops = plan.n_ops
-    shape = (h1 - h0, k1 - k0, nl)
-    count = shape[0] * shape[1] * shape[2]
-    r, c, dc = _ranges(h0, h1, k0, k1, nl)
-    var_mode = src.var_mode
-    has_var = var_mode != 0
-
+    count = int(np.prod(shape))
     vals = np.empty((n_ops, count), np.float32)
-    mvar = np.empty((n_ops, count), np.float32) if has_var else None
+    mvar = np.empty((n_ops, count), np.float32) if src.var_mode != 0 else None
+    ncnt = np.empty((n_ops, count), np.float64) if src.cnt is not None else None
     for o in range(n_ops):
         kind = plan.kind[o]
         if kind == 0:
-            x, xv = _member_table(plan, o, src, r)
+            x, xv, xn = _member_table(plan, o, src, c)
         elif kind == 1:
-            x, xv = _member_integer(plan, o, src, c, shape)
+            x, xv, xn = _member_integer(plan, o, src, c, shape)
         else:
-            x, xv = _member_interp(plan, o, src, dc, shape)
+            x, xv, xn = _member_interp(plan, o, src, dc, shape)
         vals[o] = np.broadcast_to(x, shape).reshape(-1)
-        if has_var:
+        if mvar is not None:
             mvar[o] = np.broadcast_to(xv, shape).reshape(-1)
-        del x, xv
+        if ncnt is not None:
+            ncnt[o] = np.broadcast_to(xn, shape).reshape(-1)
+        del x, xv, xn
+    return vals, mvar, ncnt
+
+
+def model_variance(med: npt.NDArray[np.float32], ncnt: npt.NDArray[np.float64] | None,
+                   grad: npt.NDArray[np.float32] | None,
+                   noise: tuple[float, float, float, float]) -> npt.NDArray[np.float64]:
+    """Noise-model variance v_i (float64) of each member, at the orbit median `med`.
+
+    v_i = gain max(med, 1) / N_i + ((rel med)^2 + (kappa G)^2) + floor^2.
+    `ncnt` is (n_ops, count), or None for N = 1. `grad` is G per voxel, or
+    None for G = 0. The order of the operations is the same in all engines.
+    The result is (n_ops, count) with `ncnt`, else (count,) (the same for
+    all members of a voxel).
+    """
+    gain, rel, kappa, flr = (float(p) for p in noise)
+    md = med.astype(np.float64)
+    rm = rel * md
+    g = grad.astype(np.float64) if grad is not None else np.zeros(md.shape)
+    kg = kappa * g
+    s = (rm * rm + kg * kg) + flr * flr
+    gm = gain * np.maximum(med, np.float32(1.0)).astype(np.float64)
+    n = ncnt if ncnt is not None else 1.0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return gm / n + s          # N = 0 gives v = inf (the weight 0)
+
+
+@dataclass
+class Estimate:
+    """Result of `estimate` for each voxel (column)."""
+    out: npt.NDArray[np.float32]          # (count,) average, NaN without survivors
+    fin: npt.NDArray[np.bool_]            # (n_ops, count) finite members
+    n: npt.NDArray[np.int64]              # (count,) number of finite members
+    surv: npt.NDArray[np.bool_]           # (n_ops, count) survivors
+    rej: npt.NDArray[np.bool_] | None     # (n_ops, count) rejected members
+    tested: npt.NDArray[np.bool_]         # (count,) voxels tested for outliers
+    floor_used: npt.NDArray[np.bool_]     # (count,) MAD scale set by the Poisson floor
+    m: npt.NDArray[np.int64]              # (count,) number of survivors
+    w: npt.NDArray[np.float64] | None     # (n_ops, count) weights (None for 'equal')
+    wsum: npt.NDArray[np.float64] | None  # (count,) sum of the survivor weights
+
+
+def estimate(vals: npt.NDArray[np.float32], ncnt: npt.NDArray[np.float64] | None,
+             grad: npt.NDArray[np.float32] | None, sigma: float | None, min_valid: int,
+             poisson_floor: bool, av: Averaging) -> Estimate:
+    """Median, outlier rejection and average of the orbit members of each voxel.
+
+    `vals` is (n_ops, count), NaN where a member is missing. This is the
+    estimator of the NumPy engine. `averaging.score_candidates` uses it too.
+    """
+    count = vals.shape[1]
+    wmode, rmode = av.wmode, av.rmode
     fin = np.isfinite(vals)
     n = fin.sum(axis=0)
-
     tested = np.zeros(count, bool)
     floor_used = np.zeros(count, bool)
     surv = fin
     rej = None
-    if sigma is not None:
-        with np.errstate(invalid='ignore'):
+    v = None
+    with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+        if rmode or wmode == 2:
             med = _row_median(vals, n)
+            if av.uses_model:
+                # (count,) without counts: one value per member is necessary
+                v = np.broadcast_to(model_variance(med, ncnt, grad, av.noise), vals.shape)
+        if rmode == 1:
             dev = np.abs(vals - med)
             scale = _row_median(dev, n) * np.float32(MAD_SCALE)
             if poisson_floor:
@@ -608,16 +782,74 @@ def _box_cpu(plan: OrbitPlan, src: _Source, h0: int, h1: int, k0: int, k1: int,
             thr = np.float32(sigma) * scale
             tested = (n >= min_valid) & (n > 0)
             rej = (dev > thr) & tested
-        del dev, med, scale, thr
+            del dev, scale, thr
+        elif rmode == 2:
+            dev = np.abs(vals.astype(np.float64) - med.astype(np.float64))
+            tested = (n >= min_valid) & (n > 0)
+            # the member(s) nearest the median always stay
+            dmin = np.min(np.where(fin, dev, np.inf), axis=0)
+            rej = (dev > np.float64(sigma) * np.sqrt(v)) & (dev > dmin) & tested
+            del dev, dmin
+    if rej is not None:
         floor_used &= tested
         surv = fin & ~rej
     m = surv.sum(axis=0)
 
-    acc = np.zeros(count, np.float32)
-    for i in range(n_ops):
-        np.add(acc, vals[i], out=acc, where=surv[i])
-    with np.errstate(invalid='ignore', divide='ignore'):
-        out = np.where(m > 0, acc / m.astype(np.float32), np.float32(np.nan))
+    w = wsum = None
+    if wmode == 0:
+        acc = np.zeros(count, np.float32)
+        for i in range(vals.shape[0]):
+            np.add(acc, vals[i], out=acc, where=surv[i])
+        with np.errstate(invalid='ignore', divide='ignore'):
+            out = np.where(m > 0, acc / m.astype(np.float32), np.float32(np.nan))
+    else:
+        with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+            if wmode == 1:
+                w = ncnt if ncnt is not None else np.ones(vals.shape)
+            else:
+                w = 1.0 / v
+            num = np.zeros(count, np.float64)
+            wsum = np.zeros(count, np.float64)
+            tmp = np.empty(count, np.float64)
+            for i in range(vals.shape[0]):
+                np.multiply(w[i], vals[i], out=tmp)
+                np.add(num, tmp, out=num, where=surv[i])
+                np.add(wsum, w[i], out=wsum, where=surv[i])
+            good = (m > 0) & (wsum > 0)
+            if not good.all():
+                # no positive weight: the voxel has no result
+                surv = surv & good
+                m = np.where(good, m, 0)
+            out = np.where(good, (num / wsum).astype(np.float32), np.float32(np.nan))
+    return Estimate(out, fin, n, surv, rej, tested, floor_used, m, w, wsum)
+
+
+def _box_cpu(plan: OrbitPlan, src: _Source, h0: int, h1: int, k0: int, k1: int,
+             sigma: float | None, min_valid: int, poisson_floor: bool,
+             cand: npt.NDArray[np.int64], keys_c: npt.NDArray[np.int64] | None,
+             av: Averaging, grad: npt.NDArray[np.float32] | None) -> tuple[Any, ...]:
+    """Output, output variance and diagnostic sums of the voxels of one box.
+
+    `cand` holds the flat indices (in the box) of the voxels where two
+    members can read the same source (`_collision_voxels`), and `keys_c`
+    the source keys of all members at these voxels (`_keys_at`). `grad` is
+    the gradient magnitude of the voxels of the box (flat), or None.
+    """
+    nh, nk, nl = plan.shape
+    n_ops = plan.n_ops
+    shape = (h1 - h0, k1 - k0, nl)
+    count = shape[0] * shape[1] * shape[2]
+    _, c, dc = _ranges(h0, h1, k0, k1, nl)
+    var_mode = src.var_mode
+    has_var = var_mode != 0
+
+    vals, mvar, ncnt = gather_members(plan, src, c, dc, shape)
+    est = estimate(vals, ncnt, grad, sigma, min_valid, poisson_floor, av)
+    del ncnt
+    fin, n = est.fin, est.n
+    out, surv, rej, m = est.out, est.surv, est.rej, est.m
+    tested, floor_used = est.tested, est.floor_used
+    weighted = est.w is not None
     mean = out.astype(np.float64)
     tmp = np.empty(count, np.float64)
 
@@ -638,10 +870,15 @@ def _box_cpu(plan: OrbitPlan, src: _Source, h0: int, h1: int, k0: int, k1: int,
         chi = np.zeros(count, np.float64)
         nd = np.zeros(count, np.int64)
         with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
-            inv_mm = 1.0 / (m64 * m64)                    # c / m^2 with c = 1
+            inv_mm = None if weighted else 1.0 / (m64 * m64)   # c / m^2 with c = 1
             for i in range(n_ops):
                 s_i = surv[i]
-                np.multiply(inv_mm, mvar[i], out=tmp)
+                if weighted:
+                    np.divide(est.w[i], est.wsum, out=tmp)     # r = w_i / W
+                    np.multiply(tmp, tmp, out=tmp)
+                    np.multiply(tmp, mvar[i], out=tmp)         # (r r) var
+                else:
+                    np.multiply(inv_mm, mvar[i], out=tmp)
                 np.add(accv, tmp, out=accv, where=s_i)
                 # chi^2 over the distinct survivors with a positive variance
                 pos = s_i & (mvar[i] > 0)
@@ -660,9 +897,22 @@ def _box_cpu(plan: OrbitPlan, src: _Source, h0: int, h1: int, k0: int, k1: int,
                 acc_c = np.zeros(cand.size, np.float64)
                 chi_c = np.zeros(cand.size, np.float64)
                 nd_c = np.zeros(cand.size, np.int64)
+                if weighted:
+                    wc = est.w[:, cand]
+                    wsum_c = est.wsum[cand]
                 for i in range(n_ops):
                     v64 = mvar[i, cand].astype(np.float64)
-                    np.add(acc_c, (mult[i] / mm) * v64, out=acc_c, where=sc[i])
+                    if weighted:
+                        # W_j: weights of the survivors that read the source of
+                        # member i, added in operation order. The first
+                        # survivor of each source adds (W_j / W)^2 var_j.
+                        wg = np.zeros(cand.size, np.float64)
+                        for j in range(n_ops):
+                            np.add(wg, wc[j], out=wg, where=sc[j] & (keys_c[j] == keys_c[i]))
+                        rr = wg / wsum_c
+                        np.add(acc_c, (rr * rr) * v64, out=acc_c, where=first[i])
+                    else:
+                        np.add(acc_c, (mult[i] / mm) * v64, out=acc_c, where=sc[i])
                     pos = first[i] & (v64 > 0)
                     dd = vals[i, cand] - mean_c
                     np.add(chi_c, (dd * dd) / v64, out=chi_c, where=pos)
@@ -708,24 +958,40 @@ def _box_cpu(plan: OrbitPlan, src: _Source, h0: int, h1: int, k0: int, k1: int,
     return out, out_var, ints, flts
 
 
-def _run_numpy(plan: OrbitPlan, data: npt.NDArray[np.float32],
-               variance: npt.NDArray[np.float32] | None, var_mode: int,
-               sigma: float | None, min_valid: int, poisson_floor: bool,
-               progress_callback: Callable[[int, int], None] | None,
-               chunk_voxels: int | None) -> OrbitResult:
-    t0 = time.perf_counter()
+def make_source(plan: OrbitPlan, data: npt.NDArray[np.float32],
+                variance: npt.NDArray[np.float32] | None = None, var_mode: int = 0,
+                counts: npt.NDArray[np.float32] | None = None) -> _Source:
+    """Input arrays of the NumPy engine (`gather_members`).
+
+    `var_mode` is 0 (no variance), 1 (`variance`) or 2 (max(x, 1)).
+    `counts` is the float32 pixel count of each voxel, or None.
+    """
     data3 = np.ascontiguousarray(data, dtype=np.float32)
     var3 = np.ascontiguousarray(variance, dtype=np.float32) if var_mode == 1 else None
+    cnt3 = np.ascontiguousarray(counts, dtype=np.float32) if counts is not None else None
     filled = weight = None
-    if var_mode == 0 and np.any(plan.kind == 2):
+    if var_mode == 0 and cnt3 is None and np.any(plan.kind == 2):
         # map_coordinates input for the interpolated members (as in rspace3d 2.2)
         finite = np.isfinite(data3)
         filled = np.where(finite, data3, np.float32(0.0))
         weight = finite.astype(np.float32)
         del finite
-    src = _Source(data3, data3.reshape(-1), var3,
-                  var3.reshape(-1) if var3 is not None else None, var_mode, filled, weight)
-    nvox = data3.size
+    return _Source(data3, data3.reshape(-1), var3,
+                   var3.reshape(-1) if var3 is not None else None, var_mode, filled, weight,
+                   cnt3, cnt3.reshape(-1) if cnt3 is not None else None)
+
+
+def _run_numpy(plan: OrbitPlan, data: npt.NDArray[np.float32],
+               variance: npt.NDArray[np.float32] | None, var_mode: int,
+               sigma: float | None, min_valid: int, poisson_floor: bool,
+               progress_callback: Callable[[int, int], None] | None,
+               chunk_voxels: int | None, av: Averaging) -> OrbitResult:
+    t0 = time.perf_counter()
+    src = make_source(plan, data, variance, var_mode, av.count_array())
+    grad = av.grad_array()
+    grad_flat = (np.ascontiguousarray(grad, dtype=np.float32).reshape(-1)
+                 if grad is not None else None)
+    nvox = src.data.size
     nh, nk, nl = plan.shape
     if chunk_voxels is None:
         # (n_ops, count) arrays of about 800,000 values stay in the CPU cache
@@ -757,8 +1023,10 @@ def _run_numpy(plan: OrbitPlan, data: npt.NDArray[np.float32],
             # the slab and its boxes are contiguous ranges of the flat volume
             lo, hi = np.searchsorted(cand, [base - slab_base, base - slab_base + count])
             box_keys = keys[:, lo:hi] if keys is not None else None
-            o, ov, ii, ff = _box_cpu(plan, src, h0, h1, k0, k1, sigma, min_valid,
-                                     poisson_floor, cand[lo:hi] - (base - slab_base), box_keys)
+            o, ov, ii, ff = _box_cpu(
+                plan, src, h0, h1, k0, k1, sigma, min_valid, poisson_floor,
+                cand[lo:hi] - (base - slab_base), box_keys, av,
+                grad_flat[base:base + count] if grad_flat is not None else None)
             out[base:base + count] = o
             if out_var is not None:
                 out_var[base:base + count] = ov
@@ -794,12 +1062,19 @@ def _run_numba(plan: OrbitPlan, data: npt.NDArray[np.float32],
                variance: npt.NDArray[np.float32] | None, var_mode: int,
                sigma: float | None, min_valid: int, poisson_floor: bool,
                progress_callback: Callable[[int, int], None] | None,
-               slab_voxels: int = NUMBA_SLAB) -> OrbitResult:
+               av: Averaging, slab_voxels: int = NUMBA_SLAB) -> OrbitResult:
     from . import _orbit_numba
     t0 = time.perf_counter()
     flat = np.ascontiguousarray(data, dtype=np.float32).reshape(-1)
     var = (np.ascontiguousarray(variance, dtype=np.float32).reshape(-1) if var_mode == 1
            else np.zeros(1, np.float32))
+    cnt_in, grd_in = av.count_array(), av.grad_array()
+    cnt = (np.ascontiguousarray(cnt_in, dtype=np.float32).reshape(-1) if cnt_in is not None
+           else np.zeros(1, np.float32))
+    grd = (np.ascontiguousarray(grd_in, dtype=np.float32).reshape(-1) if grd_in is not None
+           else np.zeros(1, np.float32))
+    gain, rel, kappa, flr = (float(p) for p in av.noise)
+    basic = av.weighting == 'equal' and av.rejection != 'model'
     nvox = flat.size
     nh, nk, nl = plan.shape
     out = np.empty(nvox, np.float32)
@@ -815,14 +1090,29 @@ def _run_numba(plan: OrbitPlan, data: npt.NDArray[np.float32],
         nblocks = -(-count // NUMBA_BLOCK)
         iacc = np.zeros((nblocks, N_SHELLS, _NI), np.int64)
         facc = np.zeros((nblocks, N_SHELLS, _NF), np.float64)
+        if basic:
+            # the options of rspace3d 2.3.0: its own code (faster, same bits)
+            _orbit_numba.orbit_blocks_basic(
+                flat, var, var_mode, out[base:base + count],
+                out_var[base:base + count] if var_mode else out_var,
+                plan.tab, plan.opi, plan.opl, plan.opd, plan.geo,
+                nh, nk, nl, plan.n_ops, plan.identity_index, av.rmode == 1,
+                np.float32(sigma if sigma is not None else 0.0), int(min_valid),
+                bool(poisson_floor), float(plan.edge_tol), np.float32(MAD_SCALE), _DEN_MIN,
+                base, count, NUMBA_BLOCK, iacc, facc)
+            ints += iacc.sum(axis=0)
+            flts += facc.sum(axis=0)
+            continue
         _orbit_numba.orbit_blocks(
             flat, var, var_mode, out[base:base + count],
             out_var[base:base + count] if var_mode else out_var,
             plan.tab, plan.opi, plan.opl, plan.opd, plan.geo,
-            nh, nk, nl, plan.n_ops, plan.identity_index, sigma is not None,
+            nh, nk, nl, plan.n_ops, plan.identity_index, av.rmode,
             np.float32(sigma if sigma is not None else 0.0), int(min_valid),
             bool(poisson_floor), float(plan.edge_tol), np.float32(MAD_SCALE), _DEN_MIN,
-            base, count, NUMBA_BLOCK, iacc, facc)
+            base, count, NUMBA_BLOCK, iacc, facc,
+            cnt, cnt_in is not None, grd, grd_in is not None, av.wmode,
+            gain, rel, kappa, flr, float(sigma if sigma is not None else 0.0))
         ints += iacc.sum(axis=0)
         flts += facc.sum(axis=0)
     if progress_callback:
@@ -839,21 +1129,23 @@ def run_cpu(plan: OrbitPlan, data: npt.NDArray[np.float32],
             min_valid: int, poisson_floor: bool,
             progress_callback: Callable[[int, int], None] | None = None,
             chunk_voxels: int | None = None, derive_variance: bool = False,
-            backend: str = 'auto') -> OrbitResult:
+            backend: str = 'auto', averaging: Averaging | None = None) -> OrbitResult:
     """CPU engine. `data` and `variance` are float32 arrays of `plan.shape`.
 
     `derive_variance=True` (with `variance=None`) uses the variance max(x, 1)
     of each data value x. `backend` is 'numba', 'numpy' or 'auto'. 'auto'
     uses numba if it is installed. If the numba engine fails, 'auto' gives a
     warning and uses the NumPy engine. All backends give the same bits.
+    `averaging` None gives the rules of rspace3d 2.3.0 (see `Averaging`).
     """
     if backend not in ('auto', 'numba', 'numpy'):
         raise ValueError(f"backend must be 'auto', 'numba' or 'numpy', got {backend!r}")
+    av = _averaging(sigma, averaging)
     var_mode = 1 if variance is not None else 2 if derive_variance else 0
     if backend == 'numba' or (backend == 'auto' and numba_available()):
         try:
             return _run_numba(plan, data, variance, var_mode, sigma, min_valid,
-                              poisson_floor, progress_callback)
+                              poisson_floor, progress_callback, av)
         except Exception as exc:          # numba is optional: any failure falls back
             if backend == 'numba':
                 raise
@@ -861,7 +1153,7 @@ def run_cpu(plan: OrbitPlan, data: npt.NDArray[np.float32],
                           "the NumPy CPU engine (slower, same result).", RuntimeWarning,
                           stacklevel=3)
     return _run_numpy(plan, data, variance, var_mode, sigma, min_valid, poisson_floor,
-                      progress_callback, chunk_voxels)
+                      progress_callback, chunk_voxels, av)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -869,6 +1161,9 @@ def run_cpu(plan: OrbitPlan, data: npt.NDArray[np.float32],
 # ──────────────────────────────────────────────────────────────────
 
 _CUDA_SOURCE = r'''
+#ifndef ORBIT_EXT
+#define ORBIT_EXT 1
+#endif
 #define MAXOPS 48
 #define NSH 10
 #define NI 6
@@ -919,9 +1214,17 @@ extern "C" __global__ void orbit_kernel(
     const double* __restrict__ geo,
     unsigned long long* __restrict__ iacc, double* __restrict__ facc,
     long long nh, long long nk, long long nl, int n_ops, int id_op,
-    int do_reject, float sigma, int min_valid, int floor_on, int has_var,
-    double edge_tol, long long base, long long count)
+    int rmode, float sigma, int min_valid, int floor_on, int has_var,
+    double edge_tol, long long base, long long count,
+    const float* __restrict__ cnt, int cnt_on, const float* __restrict__ grd, int g_on,
+    int wmode, double gain, double rel, double kappa, double flr, double sigma_d)
 {
+    // wmode: 0 equal, 1 counts, 2 adaptive. rmode: 0 none, 1 MAD, 2 noise model.
+    // ORBIT_EXT 0 compiles only the options of rspace3d 2.3.0 (equal weights,
+    // MAD or no rejection). The compiler then removes the other code.
+    const int WM = ORBIT_EXT ? wmode : 0;
+    const bool MODEL = ORBIT_EXT && rmode == 2;
+    const bool read_n = ORBIT_EXT && (WM != 0 || MODEL) && cnt_on;
     __shared__ unsigned long long s_i[NSH * NI];
     __shared__ double s_f[NSH * NF];
     for (int i = threadIdx.x; i < NSH * NI; i += blockDim.x) s_i[i] = 0ULL;
@@ -943,12 +1246,14 @@ extern "C" __global__ void orbit_kernel(
         float vals[MAXOPS];
         float mvar[MAXOPS];
         long long key[MAXOPS];
+        double ncnt[MAXOPS];   // member counts, later the member weights
         int n = 0;
         int self = -1;
         for (int o = 0; o < n_ops; o++) {
             int kind = opi[o * 8];
             float x;
             float xv = 0.0f;
+            double xn = 1.0;
             long long k;
             if (kind != 2) {
                 long long src[3];
@@ -970,6 +1275,7 @@ extern "C" __global__ void orbit_kernel(
                 if (!fin(x)) continue;
                 if (has_var == 1) xv = var[k];
                 else if (has_var == 2) xv = fmaxf(x, 1.0f);
+                if (read_n) xn = (double)cnt[k];
             } else {
                 const double* m = opd + o * 12;
                 long long ib[3];
@@ -991,7 +1297,7 @@ extern "C" __global__ void orbit_kernel(
                     ib[d] = (long long)f;
                 }
                 if (!inside) continue;
-                double num = 0.0, den = 0.0;
+                double num = 0.0, den = 0.0, numn = 0.0;
                 for (int s0 = 0; s0 < 2; s0++) {
                     double a0 = s0 ? w1[0] : w0[0];
                     if (a0 == 0.0) continue;
@@ -1006,12 +1312,16 @@ extern "C" __global__ void orbit_kernel(
                             if (!fin(xx)) continue;
                             num = __dadd_rn(num, __dmul_rn(__dmul_rn(__dmul_rn((double)xx, a0), a1), a2));
                             den = __dadd_rn(den, __dmul_rn(__dmul_rn(a0, a1), a2));
+                            if (read_n)
+                                numn = __dadd_rn(numn, __dmul_rn(__dmul_rn(__dmul_rn(
+                                    (double)cnt[idx], a0), a1), a2));
                         }
                     }
                 }
                 float num32 = __double2float_rn(num);
                 float den32 = __double2float_rn(den);
                 if (!(den32 > 1e-6f)) continue;
+                if (read_n) xn = __ddiv_rn(numn, den);
                 x = __fdiv_rn(num32, fmaxf(den32, 1e-6f));
                 if (!fin(x)) continue;
                 if (has_var) {
@@ -1045,45 +1355,89 @@ extern "C" __global__ void orbit_kernel(
             vals[n] = x;
             mvar[n] = xv;
             key[n] = k;
+            if (ORBIT_EXT) ncnt[n] = xn;
             n++;
         }
 
         // median, MAD and rejection
         float med = 0.0f;
         float thr = 0.0f;
-        bool tested = false, floor_used = false;
-        if (do_reject && n >= min_valid && n > 0) {
+        bool tested = rmode != 0 && n >= min_valid && n > 0;
+        bool floor_used = false;
+        if (n > 0 && (tested || WM == 2)) {
             float s[MAXOPS];
             for (int i = 0; i < n; i++) s[i] = vals[i];
             isort(s, n);
             med = med_sorted(s, n);
-            for (int i = 0; i < n; i++) s[i] = fabsf(__fsub_rn(vals[i], med));
-            isort(s, n);
-            float scale = __fmul_rn(med_sorted(s, n), 1.4826f);
-            if (floor_on) {
-                float root = __fsqrt_rn(fmaxf(med, 1.0f));
-                floor_used = root > scale;
-                scale = fmaxf(scale, root);
+            if (tested && !MODEL) {
+                for (int i = 0; i < n; i++) s[i] = fabsf(__fsub_rn(vals[i], med));
+                isort(s, n);
+                float scale = __fmul_rn(med_sorted(s, n), 1.4826f);
+                if (floor_on) {
+                    float root = __fsqrt_rn(fmaxf(med, 1.0f));
+                    floor_used = root > scale;
+                    scale = fmaxf(scale, root);
+                }
+                thr = __fmul_rn(sigma, scale);
             }
-            thr = __fmul_rn(sigma, scale);
-            tested = true;
+        }
+        // noise model v_i = gm / N_i + s_const at the median
+        bool use_v = n > 0 && (WM == 2 || (tested && MODEL));
+        double gm = 0.0, s_const = 0.0;
+        if (use_v) {
+            double md = (double)med;
+            double rm = __dmul_rn(rel, md);
+            double kg = __dmul_rn(kappa, g_on ? (double)grd[v] : 0.0);
+            s_const = __dadd_rn(__dadd_rn(__dmul_rn(rm, rm), __dmul_rn(kg, kg)),
+                                __dmul_rn(flr, flr));
+            gm = __dmul_rn(gain, (double)fmaxf(med, 1.0f));
+        }
+        // 'model': the member(s) nearest the median always stay
+        double dmin = 0.0;
+        if (tested && MODEL) {
+            dmin = __longlong_as_double(0x7ff0000000000000LL);   // +inf
+            for (int i = 0; i < n; i++) {
+                double d = fabs(__dsub_rn((double)vals[i], (double)med));
+                if (d < dmin) dmin = d;
+            }
         }
         unsigned long long surv = 0ULL;
         float acc = 0.0f;
+        double num = 0.0, wsum = 0.0;
         int m = 0;
         int n_rej = 0;
         bool self_rej = false;
         for (int i = 0; i < n; i++) {
-            if (tested && fabsf(__fsub_rn(vals[i], med)) > thr) {
+            double vi = use_v ? __dadd_rn(__ddiv_rn(gm, ncnt[i]), s_const) : 0.0;
+            bool rej = false;
+            if (tested) {
+                if (!MODEL) rej = fabsf(__fsub_rn(vals[i], med)) > thr;
+                else {
+                    double d = fabs(__dsub_rn((double)vals[i], (double)med));
+                    rej = d > __dmul_rn(sigma_d, __dsqrt_rn(vi)) && d > dmin;
+                }
+            }
+            if (rej) {
                 n_rej++;
                 if (i == self) self_rej = true;
             } else {
                 surv |= 1ULL << i;
-                acc = __fadd_rn(acc, vals[i]);
+                if (WM == 0) {
+                    acc = __fadd_rn(acc, vals[i]);
+                } else {
+                    double w = WM == 1 ? ncnt[i] : __ddiv_rn(1.0, vi);
+                    ncnt[i] = w;
+                    num = __dadd_rn(num, __dmul_rn(w, (double)vals[i]));
+                    wsum = __dadd_rn(wsum, w);
+                }
                 m++;
             }
         }
-        float res = m > 0 ? __fdiv_rn(acc, (float)m) : __int_as_float(0x7fc00000);
+        // no positive weight: the voxel has no result
+        if (WM != 0 && !(wsum > 0.0)) { surv = 0ULL; m = 0; }
+        float res = __int_as_float(0x7fc00000);
+        if (m > 0) res = WM == 0 ? __fdiv_rn(acc, (float)m)
+                                 : __double2float_rn(__ddiv_rn(num, wsum));
         out[li] = res;
 
         // rep[i]: the first finite member that reads the same source as member i
@@ -1101,11 +1455,18 @@ extern "C" __global__ void orbit_kernel(
         double chi = 0.0;
         int nd = 0;
         if (has_var) {
-            // cnt[g]: number of survivors that read the source of group g
-            unsigned char cnt[MAXOPS];
-            for (int i = 0; i < n; i++) cnt[i] = 0;
+            // cnt_g[g]: number of survivors that read the source of group g
+            unsigned char cnt_g[MAXOPS];
+            for (int i = 0; i < n; i++) cnt_g[i] = 0;
             for (int i = 0; i < n; i++)
-                if ((surv >> i) & 1ULL) cnt[rep[i]]++;
+                if ((surv >> i) & 1ULL) cnt_g[rep[i]]++;
+            // wg[g]: sum of the weights of the survivors that read source g
+            double wg[MAXOPS];
+            if (WM != 0) {
+                for (int i = 0; i < n; i++) wg[i] = 0.0;
+                for (int i = 0; i < n; i++)
+                    if ((surv >> i) & 1ULL) wg[rep[i]] = __dadd_rn(wg[rep[i]], ncnt[i]);
+            }
             unsigned long long seen = 0ULL;
             double accv = 0.0;
             double mm = __dmul_rn((double)m, (double)m);
@@ -1115,8 +1476,13 @@ extern "C" __global__ void orbit_kernel(
                 int g = rep[i];
                 bool first = !((seen >> g) & 1ULL);
                 seen |= 1ULL << g;
-                double f = __ddiv_rn((double)cnt[g], mm);
-                accv = __dadd_rn(accv, __dmul_rn(f, (double)mvar[i]));
+                if (WM == 0) {
+                    double f = __ddiv_rn((double)cnt_g[g], mm);
+                    accv = __dadd_rn(accv, __dmul_rn(f, (double)mvar[i]));
+                } else if (first) {
+                    double rr = __ddiv_rn(wg[g], wsum);
+                    accv = __dadd_rn(accv, __dmul_rn(__dmul_rn(rr, rr), (double)mvar[i]));
+                }
                 if (first && mvar[i] > 0.0f) {
                     double dd = __dsub_rn((double)vals[i], mean);
                     chi = __dadd_rn(chi, __ddiv_rn(__dmul_rn(dd, dd), (double)mvar[i]));
@@ -1176,21 +1542,26 @@ extern "C" __global__ void orbit_kernel(
 }
 '''
 
-_KERNEL = None
+_KERNELS: dict[bool, Any] = {}
 SLAB_VOXELS = 1 << 24          # output voxels per kernel launch
 _MIN_SLAB = 1 << 16
 _UPLOAD_BYTES = 256 * 2**20    # largest host-to-GPU copy
 
 
-def _kernel() -> Any:
-    """The compiled CUDA kernel. A compilation error is raised here, not at the launch."""
-    global _KERNEL
-    if _KERNEL is None:
+def _kernel(ext: bool = False) -> Any:
+    """The compiled CUDA kernel. A compilation error is raised here, not at the launch.
+
+    `ext` False compiles only the options of rspace3d 2.3.0 (ORBIT_EXT 0:
+    equal weights, MAD or no rejection). This kernel is about 5 % faster.
+    `ext` True compiles all options.
+    """
+    if ext not in _KERNELS:
         import cupy as cp
-        kern = cp.RawKernel(_CUDA_SOURCE, 'orbit_kernel', options=('--fmad=false',))
+        kern = cp.RawKernel(_CUDA_SOURCE, 'orbit_kernel',
+                            options=('--fmad=false', f'-DORBIT_EXT={int(bool(ext))}'))
         kern.compile()
-        _KERNEL = kern
-    return _KERNEL
+        _KERNELS[ext] = kern
+    return _KERNELS[ext]
 
 
 def _gpu_errors() -> tuple[type[BaseException], ...]:
@@ -1231,29 +1602,38 @@ def run_gpu(plan: OrbitPlan, data: npt.NDArray[np.float32],
             variance: npt.NDArray[np.float32] | None, sigma: float | None,
             min_valid: int, poisson_floor: bool,
             progress_callback: Callable[[int, int], None] | None = None,
-            slab_voxels: int = SLAB_VOXELS, derive_variance: bool = False) -> OrbitResult | None:
+            slab_voxels: int = SLAB_VOXELS, derive_variance: bool = False,
+            averaging: Averaging | None = None) -> OrbitResult | None:
     """CUDA engine. Returns None if the input volume does not fit in GPU memory.
 
     `derive_variance=True` (with `variance=None`) uses the variance max(x, 1)
     of each data value x. The kernel calculates it from the data value, so
-    that no variance array is copied to the GPU.
+    that no variance array is copied to the GPU. `averaging` is explained in
+    `run_cpu`.
     """
     import cupy as cp
     oom = (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError)
+    av = _averaging(sigma, averaging)
     t0 = time.perf_counter()
-    kern = _kernel()
+    ext = av.weighting != 'equal' or av.rejection == 'model'
+    kern = _kernel(True) if ext else _kernel()
     host = np.ascontiguousarray(data, dtype=np.float32)
     host_var = (np.ascontiguousarray(variance, dtype=np.float32)
                 if variance is not None else None)
+    cnt_in, grd_in = av.count_array(), av.grad_array()
+    host_cnt = np.ascontiguousarray(cnt_in, dtype=np.float32) if cnt_in is not None else None
+    host_grd = np.ascontiguousarray(grd_in, dtype=np.float32) if grd_in is not None else None
     var_mode = 1 if host_var is not None else 2 if derive_variance else 0
     nvox = host.size
     pool = cp.get_default_memory_pool()
-    d_vol = d_var = None
+    d_vol = d_var = d_cnt = d_grd = None
     try:
         d_vol = _upload(cp, host)
         d_var = _upload(cp, host_var) if host_var is not None else cp.zeros(1, cp.float32)
+        d_cnt = _upload(cp, host_cnt) if host_cnt is not None else cp.zeros(1, cp.float32)
+        d_grd = _upload(cp, host_grd) if host_grd is not None else cp.zeros(1, cp.float32)
     except oom:
-        del d_vol, d_var
+        del d_vol, d_var, d_cnt, d_grd
         pool.free_all_blocks()
         return None
     t_upload = time.perf_counter() - t0
@@ -1277,7 +1657,7 @@ def run_gpu(plan: OrbitPlan, data: npt.NDArray[np.float32],
             d_out = d_out_var = None
             pool.free_all_blocks()
             if slab <= _MIN_SLAB:
-                del d_vol, d_var
+                del d_vol, d_var, d_cnt, d_grd
                 pool.free_all_blocks()
                 return None
             slab = max(_MIN_SLAB, slab // 2)
@@ -1298,11 +1678,14 @@ def run_gpu(plan: OrbitPlan, data: npt.NDArray[np.float32],
              (d_vol, d_var, d_out, d_out_var, d_tab, d_opi, d_opl, d_opd, d_geo,
               d_iacc, d_facc, np.int64(nh), np.int64(nk), np.int64(nl),
               np.int32(plan.n_ops), np.int32(plan.identity_index),
-              np.int32(sigma is not None),
+              np.int32(av.rmode),
               np.float32(sigma if sigma is not None else 0.0),
               np.int32(min_valid), np.int32(bool(poisson_floor)),
               np.int32(var_mode), np.float64(plan.edge_tol),
-              np.int64(base), np.int64(count)))
+              np.int64(base), np.int64(count),
+              d_cnt, np.int32(host_cnt is not None), d_grd, np.int32(host_grd is not None),
+              np.int32(av.wmode), *(np.float64(p) for p in av.noise),
+              np.float64(sigma if sigma is not None else 0.0)))
         stop.record()
         stop.synchronize()
         t_kernel += cp.cuda.get_elapsed_time(start, stop) / 1000.0
@@ -1313,7 +1696,8 @@ def run_gpu(plan: OrbitPlan, data: npt.NDArray[np.float32],
         progress_callback(n_slabs, n_slabs)
     ints = cp.asnumpy(d_iacc).astype(np.int64).reshape(N_SHELLS, _NI)
     flts = cp.asnumpy(d_facc).reshape(N_SHELLS, _NF)
-    del d_vol, d_var, d_out, d_out_var, d_tab, d_opi, d_opl, d_opd, d_geo, d_iacc, d_facc
+    del d_vol, d_var, d_cnt, d_grd, d_out, d_out_var, d_tab, d_opi, d_opl, d_opd, d_geo
+    del d_iacc, d_facc
     pool.free_all_blocks()
     return OrbitResult(
         intensity=out.reshape(plan.shape),
@@ -1328,19 +1712,21 @@ def run(plan: OrbitPlan, data: npt.NDArray[np.float32],
         variance: npt.NDArray[np.float32] | None, sigma: float | None,
         min_valid: int, poisson_floor: bool, use_gpu: bool,
         progress_callback: Callable[[int, int], None] | None = None,
-        derive_variance: bool = False) -> OrbitResult:
+        derive_variance: bool = False, averaging: Averaging | None = None) -> OrbitResult:
     """Run the GPU engine if `use_gpu`, else the CPU engine.
 
     If the input does not fit in GPU memory, a warning is given and the CPU
     engine is used. If the CUDA kernel does not compile, or if a CUDA
     runtime or driver error occurs, a warning is given and the CPU engine is
-    used. `derive_variance` is explained in `run_cpu`.
+    used. `derive_variance` and `averaging` are explained in `run_cpu`.
     """
+    _averaging(sigma, averaging)
     if use_gpu:
         failure = None
         try:
             res = run_gpu(plan, data, variance, sigma, min_valid, poisson_floor,
-                          progress_callback, derive_variance=derive_variance)
+                          progress_callback, derive_variance=derive_variance,
+                          averaging=averaging)
         except Exception as exc:
             if not isinstance(exc, _gpu_errors()):
                 raise
@@ -1358,7 +1744,7 @@ def run(plan: OrbitPlan, data: npt.NDArray[np.float32],
                           "the CPU engine (slower, same result).", RuntimeWarning,
                           stacklevel=3)
     return run_cpu(plan, data, variance, sigma, min_valid, poisson_floor, progress_callback,
-                   derive_variance=derive_variance)
+                   derive_variance=derive_variance, averaging=averaging)
 
 
 # ──────────────────────────────────────────────────────────────────

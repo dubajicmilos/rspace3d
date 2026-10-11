@@ -470,6 +470,83 @@ Outlier rejection removes the far members and makes χ²/ν a little smaller
 than 1. `rspace3d-process`, `rspace3d-builder` and `rspace3d-reconstruct`
 print the table after the symmetrisation (`format_symmetry_diagnostics`).
 
+### Averaging options
+
+`symmetrize_volume` has three more keywords. Their defaults give the result
+above, bit for bit.
+
+- `weighting`: `'equal'` (default), `'counts'` or `'adaptive'`. `'counts'`
+  weights each member with its pixel count N_i (`vol.counts`, gathered with
+  the same maps). Without counts, N_i = 1. `'adaptive'` weights each member
+  with 1 / v_i from the noise model. A weighted mean is calculated in float64
+  and rounded to float32. With weights, the output variance is
+  Σ_j (W_j / W)² σ_j². W_j is the sum of the weights of the members that read
+  source voxel j, and W is the sum of all weights.
+- `rejection`: `None` (default: the MAD rule above if `sigma` is a number,
+  no rejection if `sigma` is None), `'none'`, `'mad'` or `'model'`.
+  `'model'` rejects a member if |x_i − median| > sigma · √v_i. The member or
+  members nearest the median always stay, so `'model'` cannot remove all
+  members of a voxel. It does not use the MAD or the Poisson floor.
+- `noise_model`: an `averaging.NoiseModel`. The variance of a member at the
+  orbit median is
+  v_i = gain · max(median, 1) / N_i + (rel · median)² + (kappa · G)² + floor².
+  G is the gradient magnitude (intensity change per voxel) of a first-pass
+  average with the MAD rejection. On each axis it uses the larger one of
+  the two one-sided differences, so G is not 0 at a peak maximum. The term
+  (kappa · G)² keeps the members on sharp peaks: these members sample the
+  peak at different sub-voxel positions, so they scatter more. If
+  `noise_model` is None, `averaging.fit_noise_model` fits it to the volume
+  (robust medians of leave-one-out residuals). If the fit fails,
+  `symmetrize_volume` raises `ValueError`. `metadata['noise_model']` holds
+  the model.
+- `grad`: the gradient volume G. `fit_noise_model(..., return_gradient=True)`
+  returns it. Give it to `symmetrize_volume` and `score_candidates`, so that
+  G is calculated only once.
+
+```python
+from rspace3d.averaging import (BIAS_REFERENCE, automatic_candidates, fit_noise_model,
+                                preselect, score_candidates, bias_checks, suggest)
+
+has_counts = vol.counts is not None
+try:
+    model, grad = fit_noise_model(vol, "mmm", return_gradient=True)
+except ValueError as exc:                 # no noise model: keep the safe preselection
+    name, reason = preselect(has_counts, f"The noise-model fit failed. {exc}")
+else:
+    cands = automatic_candidates(has_counts)
+    scores = score_candidates(vol, "mmm", cands, noise_model=model, grad=grad)
+    outs = {c["name"]: symmetrize_volume(vol, "mmm", noise_model=model, grad=grad,
+                                         **{k: v for k, v in c.items() if k != "name"})
+            for c in cands}
+    bias = bias_checks(outs, outs[BIAS_REFERENCE], extra_positions=[(0.5, 0.5, 0.5)])
+    name, reason = suggest(scores, bias)
+```
+
+`automatic_candidates` gives `'equal, mad 3'` (the default above),
+`'counts, mad 3'` (only for a volume with pixel counts) and
+`'adaptive, model 4'`. Each one rejects outliers. An option without
+rejection is never in this set, because spikes then go into the mean. You
+can still give any option to `symmetrize_volume`.
+
+`score_candidates` calculates each member from the other members of its orbit
+with each candidate estimator, on a sample of voxels. Its score is the mean of
+(x_i − estimate)² / v_i without the largest 1 % (lower is better). All
+candidates are scored on the same members: the members for which all
+candidates give an estimate. `n_no_estimate` counts, for each candidate, the
+members without an estimate. The sample has only general positions, so the
+voxels on mirror planes and rotation axes are not scored.
+
+`bias_checks` compares the sums near the integer nodes, near other positions
+and in the diffuse region with the `'equal, mad 3'` result. It also counts
+the voxels that are finite in that result and NaN in the candidate.
+
+`suggest` takes the candidate with the lowest score that passes all checks.
+A candidate fails if a node, extra-position or diffuse sum ratio differs
+from 1 by more than 2 %, if it makes voxels NaN, or if `n_no_estimate` > 0.
+If no candidate passes, `suggest` returns the preselection: `'counts, mad 3'`
+for a volume with pixel counts, else `'equal, mad 3'`. Volumes that you
+subtract (for example field on and field off) must use the same options.
+
 ## Viewing volumes
 
 ```bash
@@ -527,8 +604,9 @@ or voxels binned by `bin_volume` without input counts). The group
 `plane_type`, `grid_kind`, `wavelength`, `cell_a/b/c/alpha/beta/gamma`, `s`,
 `cx`, `cy`, `bin_xy`, `bin_z`, `source_folder`, `source_manifest`,
 `laue_group`, `sigma`, `min_valid`, `poisson_floor`, `n_outliers_removed`,
-`symmetry_ops_applied`, `symmetry_mapping` and `symmetry_max_index_error`
-(symmetrised volumes); the coverage-mask diagnostics of route B (`morph_size`,
+`symmetry_ops_applied`, `symmetry_mapping`, `symmetry_max_index_error`,
+`weighting`, `rejection` and `noise_model` (a JSON text) (symmetrised
+volumes); the coverage-mask diagnostics of route B (`morph_size`,
 `n_unmeasured_per_frame_*`, `frame_npix`); and the reconstruction provenance of
 route A (`reconstructed_by`, `polarization_axis`, `hot_pixel_cutoff`,
 `geometry_method`), and `variance_model`. The files can be read from MATLAB with
