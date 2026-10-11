@@ -354,6 +354,8 @@ rspace3d-builder                 # or: python -m rspace3d.volume_builder_gui
 3. Set the binning (2 × 2 recommended) and sigma (3.0; a higher value rejects
    less).
 4. Click *Process All*. Output: `<sample>_raw.h5` and `<sample>_sym_<laue>.h5`.
+   To compare averaging options before this step, use the Averaging tab (see
+   [The Averaging panel](#the-averaging-panel-and-the-command-line-flags)).
 
 Command line:
 
@@ -547,6 +549,71 @@ If no candidate passes, `suggest` returns the preselection: `'counts, mad 3'`
 for a volume with pixel counts, else `'equal, mad 3'`. Volumes that you
 subtract (for example field on and field off) must use the same options.
 
+### The Averaging panel and the command-line flags
+
+Both GUIs (`rspace3d-builder` and `rspace3d-reconstruct`) have an
+**Averaging** tab. Use it to compare the averaging options on your volume
+before you symmetrise it.
+
+1. Set the Laue group and the bin factors. In the volume builder, select the
+   unwarp folder. In the raw-frame GUI, reconstruct the volume first.
+2. Open the Averaging tab and click **Measure**. The panel loads and bins the
+   volume once (the volume builder uses the raw cache). The volume builder
+   keeps this volume, and *Process All* uses it. Measure fits the noise
+   model and symmetrises once with `'equal, mad 3'`. The text shows the model
+   parameters. The table shows these values per |q| shell: χ²/ν, R_sym, the
+   rejected fraction, the Poisson-floor share, the spread of the member pixel
+   counts (the fraction of orbits with max/min count above 10) and the node
+   sum with rejection divided by the node sum without rejection. If the fit
+   fails, the panel shows the reason and the preselection.
+3. Tick the candidates. Measure ticks the automatic set. It does not tick
+   the other options (no rejection, `'model'` rejection with equal or counts
+   weights, other sigma values with the *Add* row). Type extra positions, for
+   example `0.5 0.5 0.5; 0 0 0.5`, and select a slice. Click **Compare**. The
+   table shows the score, the node, extra and diffuse sum ratios against
+   `'equal, mad 3'`, the lost voxels, the members without an estimate and the
+   time of each candidate. The panel shows the suggestion and its reason. It
+   shows the slice of the selected candidate and its difference to
+   `'equal, mad 3'`, in Cartesian reciprocal space (1/Å, or hkl units without
+   a UB matrix) with lines at integer Miller indices. The table shows a candidate without rejection, but the
+   panel never suggests it.
+4. Select a candidate (the panel preselects the suggestion) and click
+   **Apply**. *Process All* (volume builder) or *Symmetrise + Save*
+   (raw-frame GUI) then uses this option. The sigma box of that tab is then
+   off, and a label next to it names the option. The output file records the
+   choice, the reason and a short score summary in the attribute
+   `averaging_choice`. If you do not click Apply, or if you click Clear, the
+   GUI uses its own settings.
+
+**Cancel** stops Measure or Compare after the current step or candidate. The
+panel then keeps the earlier results.
+
+With a GPU or numba, the panel uses the full volume. With NumPy only, it uses
+a centred crop, so that each candidate takes less than about one minute. The
+panel keeps the reference volume, G and one slice per candidate. It keeps no
+full candidate volume. The score cannot see contamination that is the same in
+many members of an orbit (for example a powder ring). Look at the slices
+before you apply a choice. The panel calls `averaging.measure_volume`,
+`averaging.compare_candidates` and `averaging.choice_record`. You can call
+them in a script too.
+
+Command line (without these flags `rspace3d-process` works as before):
+
+| flag | effect |
+|---|---|
+| `--weighting equal\|counts\|adaptive` | weights of the orbit members |
+| `--rejection none\|mad\|model` | outlier rule. `mad` and `model` use `--sigma` |
+| `--report` | fit, scores, bias table and suggestion, then stop |
+| `--report continue` | the report, then symmetrise with your options (the CLI uses the fitted noise model again) |
+| `--auto` | compare the automatic set and symmetrise with the suggestion (your `--weighting` or `--rejection` adds one candidate) |
+| `--extra-positions H K L` | an extra position for the bias table (repeat the flag for more). Needs `--report` or `--auto` |
+
+```bash
+rspace3d-process path/to/unwarp --laue m-3m --report --extra-positions 0.5 0.5 0.5
+rspace3d-process path/to/unwarp --laue m-3m --auto
+rspace3d-process path/to/unwarp --laue m-3m --weighting counts --rejection mad --sigma 3
+```
+
 ## Viewing volumes
 
 ```bash
@@ -605,8 +672,9 @@ or voxels binned by `bin_volume` without input counts). The group
 `cx`, `cy`, `bin_xy`, `bin_z`, `source_folder`, `source_manifest`,
 `laue_group`, `sigma`, `min_valid`, `poisson_floor`, `n_outliers_removed`,
 `symmetry_ops_applied`, `symmetry_mapping`, `symmetry_max_index_error`,
-`weighting`, `rejection` and `noise_model` (a JSON text) (symmetrised
-volumes); the coverage-mask diagnostics of route B (`morph_size`,
+`weighting`, `rejection`, `noise_model` (a JSON text) and `averaging_choice`
+(a JSON text: the option of the Averaging panel or of `--auto`, the reason and
+a score summary) (symmetrised volumes); the coverage-mask diagnostics of route B (`morph_size`,
 `n_unmeasured_per_frame_*`, `frame_npix`); and the reconstruction provenance of
 route A (`reconstructed_by`, `polarization_axis`, `hot_pixel_cutoff`,
 `geometry_method`), and `variance_model`. The files can be read from MATLAB with

@@ -447,6 +447,13 @@ def _grouped_median(z: npt.NDArray[np.float64], group: npt.NDArray[np.int64],
 
 # Quantile levels of the bin edges of each model term. The extra levels at
 # the top give sparse features (the flanks of Bragg peaks) their own bins.
+FIT_NO_SCATTER = ("The noise-model fit cannot continue. The orbit members show no scatter "
+                  "(all residuals are 0). The volume can be constant.")
+FIT_NOT_FINITE = ("The noise-model fit cannot continue. It got values that are not finite. "
+                  "Make sure that the measured voxels have finite intensities and pixel "
+                  "counts above 0.")
+FIT_NUMERIC = "The noise-model fit stopped because of a numerical problem."
+
 _BIN_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.999)
 
 
@@ -462,6 +469,10 @@ def _binned_fit(z: npt.NDArray[np.float64], p: npt.NDArray[np.float64],
     members are not used. Returns theta and the number of bins.
     """
     from scipy.optimize import nnls
+    if not (np.all(np.isfinite(z)) and np.all(np.isfinite(p))):
+        raise ValueError(FIT_NOT_FINITE)
+    if not np.any(z > 0):
+        raise ValueError(FIT_NO_SCATTER)
     code = np.zeros(z.size, np.int64)
     for j in range(3):
         edges = np.unique(np.quantile(p[:, j], _BIN_LEVELS))
@@ -477,11 +488,14 @@ def _binned_fit(z: npt.NDArray[np.float64], p: npt.NDArray[np.float64],
     scale[scale == 0] = 1.0
     Xs = X / scale
     pred = X @ theta0 if theta0 is not None else y.copy()
-    tiny = 1e-12 * max(float(np.max(np.abs(y))), 1e-300)
+    tiny = max(1e-12 * float(np.max(np.abs(y))), 1e-300)
     theta = np.zeros(4)
     for _ in range(4):
         wrow = np.sqrt(c) / np.maximum(pred, tiny)
-        sol, _ = nnls(Xs * wrow[:, None], y * wrow)
+        try:
+            sol, _ = nnls(Xs * wrow[:, None], y * wrow)
+        except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+            raise ValueError(f"{FIT_NUMERIC} ({type(exc).__name__}: {exc})") from exc
         theta = sol / scale
         pred = X @ theta
     return theta, int(sel.sum())
@@ -870,6 +884,83 @@ def _offset_label(o: Sequence[float]) -> str:
     return '(' + ', '.join(f"{float(v):g}" for v in o) + ')'
 
 
+def _numba_region_sums(x: npt.NDArray[Any], ref: npt.NDArray[Any],
+                       origin: npt.NDArray[np.float64], A: npt.NDArray[np.float64],
+                       offsets: npt.NDArray[np.float64], radius: float,
+                       plan: oe.OrbitPlan | None = None) -> tuple[Any, Any, Any]:
+    """Sums of x and ref per |q| shell and region with the numba kernel.
+
+    Returns (sums, reference sums, lost voxels), each (n_shells, regions).
+    Without `plan`, n_shells = 1. With `plan`, the shells of the orbit engine.
+    """
+    from . import _orbit_numba
+    x = np.ascontiguousarray(x)
+    ref = np.ascontiguousarray(ref)
+    if plan is None:
+        G, scale, n_sh = np.eye(3), 0.0, 1
+    else:
+        G, scale, n_sh = plan.geo[12:21].reshape(3, 3).copy(), float(plan.geo[21]), oe.N_SHELLS
+    nh = x.shape[0]
+    n_reg = len(offsets) + 1
+    s = np.zeros((nh, n_sh, n_reg))
+    r = np.zeros((nh, n_sh, n_reg))
+    n = np.zeros((nh, n_sh, n_reg), np.int64)
+    _orbit_numba.region_sums(x, ref, np.ascontiguousarray(origin, np.float64),
+                             np.ascontiguousarray(A, np.float64),
+                             np.ascontiguousarray(offsets, np.float64).reshape(-1, 3),
+                             float(radius) ** 2, G, scale, n_sh, s, r, n)
+    # add the h-layers in a fixed order: the result does not depend on the threads
+    out_s = np.zeros((n_sh, n_reg))
+    out_r = np.zeros((n_sh, n_reg))
+    for i in range(nh):
+        out_s += s[i]
+        out_r += r[i]
+    return out_s, out_r, n.sum(axis=0)
+
+
+def node_sums_by_shell(result: Any, reference: Any, laue_group: str,
+                       radius: float = 0.1) -> dict[str, Any]:
+    """Node sums of `result` and `reference` per |q| shell of the orbit engine.
+
+    The node region is the same as in `bias_checks`: the distance in hkl to
+    the nearest integer node is at most `radius`. Only voxels that are finite
+    in both volumes are added. Returns {'result', 'reference', 'ratio'}
+    (lists per shell, ratio None if the reference sum is 0).
+    """
+    from .volume_builder import orbit_plan, volume_affine
+    plan = orbit_plan(reference, laue_group)
+    origin, A = volume_affine(reference)
+    x = np.asarray(getattr(result, 'intensity', result))
+    ref = np.asarray(reference.intensity)
+    if oe.numba_available():
+        s, r, _ = _numba_region_sums(x, ref, origin, A, np.zeros((1, 3)), radius, plan)
+        s, r = s[:, 0], r[:, 0]
+    else:
+        s = np.zeros(oe.N_SHELLS)
+        r = np.zeros(oe.N_SHELLS)
+        nh, nk, nl = ref.shape
+        r2 = float(radius) ** 2
+        jk = np.arange(nk, dtype=np.float64)[:, None]
+        jl = np.arange(nl, dtype=np.float64)[None, :]
+        for h0 in range(0, nh, 16):
+            h1 = min(nh, h0 + 16)
+            ih = np.arange(h0, h1, dtype=np.float64)[:, None, None]
+            d2 = 0.0
+            for d in range(3):
+                f = origin[d] + A[d, 0] * ih + A[d, 1] * jk[None] + A[d, 2] * jl[None]
+                f = f - np.rint(f)
+                d2 = d2 + f * f
+            c = np.indices((h1 - h0, nk, nl))
+            sh = oe._shell_of(plan, c[0] + h0, c[1], c[2])
+            xs = x[h0:h1].astype(np.float64)
+            rs = ref[h0:h1].astype(np.float64)
+            m = np.broadcast_to(d2 <= r2, xs.shape) & np.isfinite(xs) & np.isfinite(rs)
+            s += np.bincount(sh[m], weights=xs[m], minlength=oe.N_SHELLS)
+            r += np.bincount(sh[m], weights=rs[m], minlength=oe.N_SHELLS)
+    return {'result': [float(v) for v in s], 'reference': [float(v) for v in r],
+            'ratio': [float(a / b) if b != 0 else None for a, b in zip(s, r)]}
+
+
 def bias_checks(results: Mapping[str, Any], reference: Any, radius: float = 0.1,
                 extra_positions: Iterable[Sequence[float]] = (),
                 slab: int = 16) -> dict[str, Any]:
@@ -892,6 +983,12 @@ def bias_checks(results: Mapping[str, Any], reference: Any, radius: float = 0.1,
     also counts, in each region, the voxels that are finite in the
     reference and NaN in the result (lost voxels).
 
+    If numba is installed, one parallel pass per result calculates the
+    sums. The regions and the lost-voxel counts are the same as those of
+    the NumPy code. The sums are float64 sums in a different order. Thus
+    the numba sums and the NumPy sums can differ in the last bits (relative
+    difference about 1e-15).
+
     Returns name -> {'node_sum_ratio', 'extra_sum_ratio' (label -> ratio),
     'diffuse_sum_ratio', 'sums', 'reference_sums', 'lost_voxels' (region
     -> count), 'n_lost' (sum of the counts)}. Each ratio is the sum of the
@@ -912,11 +1009,20 @@ def bias_checks(results: Mapping[str, Any], reference: Any, radius: float = 0.1,
     sums = {name: dict.fromkeys(regions, 0.0) for name in arrays}
     rsums = {name: dict.fromkeys(regions, 0.0) for name in arrays}
     lost = {name: dict.fromkeys(regions, 0) for name in arrays}
+    if oe.numba_available():
+        offsets = np.array([np.zeros(3)] + extra, np.float64).reshape(-1, 3)
+        for name, a in arrays.items():
+            s, r, n = _numba_region_sums(a, ref, origin, A, offsets, radius)
+            for j, reg in enumerate(regions):
+                sums[name][reg] = float(s[0, j])
+                rsums[name][reg] = float(r[0, j])
+                lost[name][reg] = int(n[0, j])
+        arrays = {}                      # the NumPy loop below has nothing to do
     nh, nk, nl = ref.shape
     jk = np.arange(nk, dtype=np.float64)[:, None]
     jl = np.arange(nl, dtype=np.float64)[None, :]
     r2 = float(radius) ** 2
-    for h0 in range(0, nh, slab):
+    for h0 in range(0, nh if arrays else 0, slab):
         h1 = min(nh, h0 + slab)
         ih = np.arange(h0, h1, dtype=np.float64)[:, None, None]
         hkl = [origin[d] + A[d, 0] * ih + A[d, 1] * jk[None] + A[d, 2] * jl[None]
@@ -954,7 +1060,7 @@ def bias_checks(results: Mapping[str, Any], reference: Any, radius: float = 0.1,
         return a / b if b != 0 else None
 
     out: dict[str, Any] = {}
-    for name in arrays:
+    for name in sums:
         s, r = sums[name], rsums[name]
         out[name] = {'node_sum_ratio': ratio(s['node'], r['node']),
                      'extra_sum_ratio': {lab: ratio(s[lab], r[lab]) for lab in labels},
@@ -1038,3 +1144,476 @@ def suggest(scores: Mapping[str, Any], bias: Mapping[str, Any], node_tol: float 
                            "No candidate passes the checks (node tolerance "
                            f"{node_tol:g}, diffuse tolerance {diffuse_tol:g}).")
     return name, ' '.join([text] + notes)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Workflow: measure, compare, apply (averaging panel and command line)
+# ──────────────────────────────────────────────────────────────────
+
+LIMITS_TEXT = ("The score cannot see contamination that is the same in many members of an "
+               "orbit (for example a powder ring). Look at the slices before you apply a choice.")
+
+
+def make_candidate(weighting: str, rejection: str, sigma: float | None = None) -> dict[str, Any]:
+    """A candidate dict with the standard name, for example 'counts, mad 3'."""
+    if rejection == 'none':
+        return {'name': f"{weighting}, none", 'weighting': weighting, 'rejection': 'none'}
+    sigma = 3.0 if sigma is None else float(sigma)
+    return {'name': f"{weighting}, {rejection} {sigma:g}", 'weighting': weighting,
+            'rejection': rejection, 'sigma': sigma}
+
+
+def more_candidates(has_counts: bool) -> list[dict[str, Any]]:
+    """Options that a user can add by hand to the automatic set.
+
+    The options without rejection are in this list for a comparison only.
+    The panel and the command line never suggest them.
+    """
+    out = [make_candidate('equal', 'none')]
+    if has_counts:
+        out.append(make_candidate('counts', 'none'))
+    out.append(make_candidate('adaptive', 'none'))
+    if has_counts:
+        out.append(make_candidate('counts', 'model', 4.0))
+    out.append(make_candidate('equal', 'model', 4.0))
+    return out
+
+
+def known_candidate(name: str) -> dict[str, Any] | None:
+    """The candidate dict of a standard name ('weighting, rejection [sigma]'), or None."""
+    try:
+        weighting, rest = (p.strip() for p in name.split(',', 1))
+        parts = rest.split()
+        rejection = parts[0]
+        sigma = float(parts[1]) if len(parts) > 1 else None
+        if (weighting not in oe.WEIGHTINGS or rejection not in oe.REJECTIONS
+                or (rejection == 'none') != (sigma is None) or len(parts) > 2):
+            return None
+    except (ValueError, IndexError):
+        return None
+    spec = make_candidate(weighting, rejection, sigma)
+    return spec if spec['name'] == name else None
+
+
+def candidate_kwargs(spec: Mapping[str, Any], noise_model: NoiseModel | None = None,
+                     grad: npt.NDArray[np.float32] | None = None) -> dict[str, Any]:
+    """The keywords of `symmetrize_volume` for a candidate dict.
+
+    `noise_model` and `grad` are given only if the candidate needs them
+    ('adaptive' weighting or 'model' rejection).
+    """
+    rejection = spec.get('rejection', 'none')
+    kw: dict[str, Any] = {'weighting': spec.get('weighting', 'equal'), 'rejection': rejection,
+                          'sigma': None if rejection == 'none' else float(spec.get('sigma', 3.0))}
+    for key in ('min_valid', 'poisson_floor'):
+        if key in spec:
+            kw[key] = spec[key]
+    if kw['weighting'] == 'adaptive' or rejection == 'model':
+        kw['noise_model'] = noise_model
+        if grad is not None:
+            kw['grad'] = grad
+    return kw
+
+
+def centred_crop(vol: Any, n: int) -> Any:
+    """A box of at most `n` voxels per axis, centred on the voxel nearest hkl = 0.
+
+    The box has the same number of voxels on the two sides of the centre on
+    each axis. Thus the symmetry operations map most of the box into the box.
+    If hkl = 0 is near the end of an axis, such a box is thin. The box then
+    has min(n, axis length) voxels on that axis and contains hkl = 0 as near
+    to its centre as possible. If an axis does not contain 0, the box uses
+    the middle of that axis.
+    """
+    from .volume_builder import VolumeData
+    sl = []
+    for ax in (vol.H, vol.K, vol.L):
+        ax = np.asarray(ax, np.float64)
+        size = max(1, min(int(n), len(ax)))
+        if ax.min() <= 0.0 <= ax.max():
+            i0 = int(np.argmin(np.abs(ax)))
+            half = max(0, min((int(n) - 1) // 2, i0, len(ax) - 1 - i0))
+            if 2 * half + 1 >= size - 1:         # symmetric about hkl = 0
+                sl.append(slice(i0 - half, i0 + half + 1))
+                continue
+            start = min(max(i0 - (size - 1) // 2, 0), len(ax) - size)
+        else:
+            start = (len(ax) - size) // 2
+        sl.append(slice(start, start + size))
+    box = tuple(sl)
+    return VolumeData(
+        intensity=np.ascontiguousarray(vol.intensity[box]),
+        H=np.asarray(vol.H)[sl[0]].copy(), K=np.asarray(vol.K)[sl[1]].copy(),
+        L=np.asarray(vol.L)[sl[2]].copy(), plane_type=vol.plane_type,
+        metadata=dict(vol.metadata),
+        counts=None if vol.counts is None else np.ascontiguousarray(vol.counts[box]),
+        variance=None if vol.variance is None else np.ascontiguousarray(vol.variance[box]))
+
+
+def slice_geometry(vol: Any, plane: int, value: float) -> dict[str, Any]:
+    """Display geometry of a slice from `extract_volume_slice`.
+
+    The pixel (ix, iy) of the slice has the in-plane Miller indices
+    m = m0 + ix * mx + iy * my. For the native plane of the volume, the
+    function uses the affine grid of the volume (`volume_affine`). This
+    grid includes the shear of an unwarp raster. The other planes are on
+    the regular Miller-index axes of the slice.
+
+    With a UB matrix, 'M' maps the in-plane Miller indices to Cartesian
+    coordinates in 1/A. 'M' is the inverse of `compute_plane_M_inv`, as in
+    the viewer. 'cartesian' is then True. Without a UB matrix, the native
+    plane of an unwarp raster uses the inverse of `metadata['M_inv']`.
+    Else 'M' is the identity and the axes are in hkl units ('cartesian'
+    False).
+
+    Returns {'m0', 'mx', 'my' (2 floats each), 'M' (2 x 2), 'cartesian'}.
+    """
+    from .rsp_reader import compute_plane_M_inv
+    from .volume_builder import volume_affine
+    names = ['HK', 'HL', 'KL']
+    x_dim, y_dim, f_dim = [(0, 1, 2), (0, 2, 1), (1, 2, 0)][plane]
+    axes = [np.asarray(a, np.float64) for a in (vol.H, vol.K, vol.L)]
+    if names[plane] == vol.plane_type:
+        origin, A = volume_affine(vol)
+        i_f = int(np.argmin(np.abs(axes[f_dim] - float(value))))
+        base = origin + A[:, f_dim] * i_f
+        rows = [x_dim, y_dim]
+        m0, mx, my = base[rows], A[rows, x_dim], A[rows, y_dim]
+    else:
+        xa, ya = axes[x_dim], axes[y_dim]
+        dx = (xa[-1] - xa[0]) / (len(xa) - 1) if len(xa) > 1 else 1.0
+        dy = (ya[-1] - ya[0]) / (len(ya) - 1) if len(ya) > 1 else 1.0
+        m0, mx, my = np.array([xa[0], ya[0]]), np.array([dx, 0.0]), np.array([0.0, dy])
+    M, cart = np.eye(2), False
+    ub = vol.metadata.get('ub')
+    m_inv = vol.metadata.get('M_inv')
+    native_raster = (names[plane] == vol.plane_type
+                     and vol.metadata.get('grid_kind', 'unwarp_raster') == 'unwarp_raster')
+    try:
+        if ub is not None:
+            M = np.linalg.inv(compute_plane_M_inv(np.asarray(ub, np.float64),
+                                                  float(vol.metadata.get('wavelength', 1.0)),
+                                                  names[plane]))
+            cart = True
+        elif m_inv is not None and native_raster:
+            M = np.linalg.inv(np.asarray(m_inv, np.float64))
+            cart = True
+    except (np.linalg.LinAlgError, ValueError):
+        cart = False
+    if not (cart and np.all(np.isfinite(M))):
+        M, cart = np.eye(2), False
+    return {'m0': [float(v) for v in m0], 'mx': [float(v) for v in mx],
+            'my': [float(v) for v in my], 'M': M.tolist(), 'cartesian': cart}
+
+
+def count_spread(vol: Any, laue_group: str, n_members: int = 200_000, ratio: float = 10.0,
+                 seed: int = 0) -> dict[str, Any]:
+    """Spread of the member pixel counts in a sample of orbits, per |q| shell.
+
+    For each sampled voxel (`sample_orbits`), the ratio max N_i / min N_i
+    over its finite members with N_i > 0. Returns {'ratio', 'fraction'
+    (per shell: the fraction of the sampled voxels with a ratio above
+    `ratio`, None for an empty shell), 'total', 'n_voxels'}.
+    """
+    from .volume_builder import orbit_plan
+    plan = orbit_plan(vol, laue_group)
+    data = np.ascontiguousarray(vol.intensity, dtype=np.float32)
+    counts = np.ascontiguousarray(vol.counts, dtype=np.float32)
+    smp = sample_orbits(plan, data, counts, n_members=n_members, seed=seed)
+    del counts
+    use = np.isfinite(smp.vals) & (smp.ncnt > 0)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        hi = np.where(use, smp.ncnt, -np.inf).max(axis=0)
+        lo = np.where(use, smp.ncnt, np.inf).min(axis=0)
+        big = hi / lo > float(ratio)
+    frac, nvox = [], []
+    for k in range(oe.N_SHELLS):
+        m = smp.shell == k
+        nvox.append(int(m.sum()))
+        frac.append(float(big[m].mean()) if m.any() else None)
+    return {'ratio': float(ratio), 'fraction': frac,
+            'total': float(big.mean()) if big.size else None, 'n_voxels': nvox}
+
+
+def _quiet(*_: Any) -> None:
+    return None
+
+
+class Cancelled(Exception):
+    """The user cancelled Measure or Compare."""
+
+
+def _check_cancel(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise Cancelled('Cancelled.')
+
+
+def measure_volume(vol: Any, laue_group: str, use_gpu: bool | None = None,
+                   radius: float = 0.1,
+                   log: Callable[[str], None] | None = None,
+                   progress: Callable[[int, int], None] | None = None,
+                   cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
+    """Step 'Measure' of the averaging panel.
+
+    1. Fits the noise model and keeps G (`fit_noise_model` with
+       `return_gradient=True`). If the fit fails, 'model' is None and
+       'fit_error' holds the reason.
+    2. Symmetrises once with the default options ('equal, mad 3'). This is
+       the reference of `bias_checks`. Its diagnostics give chi^2/nu,
+       R_sym, the rejected fraction and the Poisson-floor share per shell.
+    3. Symmetrises with equal weights and no rejection, and calculates the
+       node sum of step 2 divided by the node sum without rejection, per
+       shell (`node_sums_by_shell`).
+    4. With pixel counts: the spread of the member counts (`count_spread`).
+
+    `cancelled` is a function without arguments. The function calls it
+    between the steps and raises `Cancelled` if it returns True.
+
+    Returns a dict. 'reference' is the result of step 2 without variance.
+    It is the only full volume that the dict keeps (with G).
+    """
+    from .volume_builder import HAS_GPU, symmetrize_volume
+    log = log or _quiet
+    if use_gpu is None:
+        use_gpu = HAS_GPU
+    times: dict[str, float] = {}
+    out: dict[str, Any] = {'laue_group': laue_group, 'shape': list(vol.intensity.shape),
+                           'has_counts': vol.counts is not None, 'model': None, 'grad': None,
+                           'fit_error': None, 'radius': float(radius)}
+    t = time.perf_counter()
+    log('Fit the noise model.')
+    try:
+        out['model'], out['grad'] = fit_noise_model(vol, laue_group, use_gpu=use_gpu,
+                                                    return_gradient=True)
+    except ValueError as exc:
+        out['fit_error'] = str(exc)
+    except (np.linalg.LinAlgError, FloatingPointError, ZeroDivisionError,
+            RuntimeError) as exc:
+        out['fit_error'] = f"{FIT_NUMERIC} ({type(exc).__name__}: {exc})"
+    if out['fit_error'] is not None:
+        log(f"The noise-model fit failed: {out['fit_error']}")
+    times['fit_s'] = time.perf_counter() - t
+    _check_cancel(cancelled)
+    t = time.perf_counter()
+    log("Symmetrise with the default options ('equal, mad 3').")
+    ref = symmetrize_volume(vol, laue_group, sigma=3.0, use_gpu=use_gpu,
+                            progress_callback=progress)
+    times['reference_s'] = time.perf_counter() - t
+    out['diagnostics'] = ref.metadata['symmetry_diagnostics']
+    out['n_outliers_removed'] = int(ref.metadata.get('n_outliers_removed', 0))
+    ref.variance = None                          # keep only the intensity
+    out['reference'] = ref
+    _check_cancel(cancelled)
+    t = time.perf_counter()
+    log('Symmetrise with equal weights and no rejection (for the node sums).')
+    plain = symmetrize_volume(vol, laue_group, sigma=None, use_gpu=use_gpu,
+                              propagate_variance=False, progress_callback=progress)
+    out['node_ratio'] = node_sums_by_shell(ref, plain, laue_group, radius)['ratio']
+    del plain
+    times['no_rejection_s'] = time.perf_counter() - t
+    out['count_spread'] = None
+    _check_cancel(cancelled)
+    if vol.counts is not None:
+        t = time.perf_counter()
+        out['count_spread'] = count_spread(vol, laue_group)
+        times['count_spread_s'] = time.perf_counter() - t
+    out['times'] = times
+    return out
+
+
+def compare_candidates(vol: Any, laue_group: str, measured: Mapping[str, Any],
+                       candidates: Sequence[Mapping[str, Any]],
+                       extra_positions: Iterable[Sequence[float]] = (),
+                       slice_plane: int = 0, slice_value: float = 0.0,
+                       use_gpu: bool | None = None, n_members: int = 1_000_000,
+                       log: Callable[[str], None] | None = None,
+                       progress: Callable[[int, int], None] | None = None,
+                       cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
+    """Step 'Compare' of the averaging panel.
+
+    `measured` is the output of `measure_volume` for the same volume. The
+    function scores all candidates (`score_candidates`), symmetrises the
+    volume with each candidate, compares it with the reference
+    ('equal, mad 3', `bias_checks`) and keeps one slice of it
+    (`extract_volume_slice`, plane 0 HK, 1 HL, 2 KL). It keeps no full
+    candidate volume. The reference is always in the comparison. The
+    suggestion (`suggest`) uses only the candidates with rejection.
+    'slice_info' holds the display geometry of the slices (`slice_geometry`).
+
+    Raises ValueError if `measured` has no noise model. Raises `Cancelled`
+    if `cancelled()` returns True between two steps or two candidates.
+    """
+    from .volume_builder import HAS_GPU, extract_volume_slice, symmetrize_volume
+    log = log or _quiet
+    if use_gpu is None:
+        use_gpu = HAS_GPU
+    model, grad, ref = measured['model'], measured['grad'], measured['reference']
+    if model is None:
+        raise ValueError("Compare needs a noise model, and the fit failed. "
+                         + str(measured.get('fit_error') or ''))
+    cands = [dict(c) for c in candidates]
+    if BIAS_REFERENCE not in [c['name'] for c in cands]:
+        cands.insert(0, dict(EQUAL_MAD))
+    extra = [tuple(float(v) for v in o) for o in extra_positions]
+    t = time.perf_counter()
+    _check_cancel(cancelled)
+    log(f'Score {len(cands)} candidates.')
+    scores = score_candidates(vol, laue_group, cands, noise_model=model, grad=grad,
+                              n_members=n_members, use_gpu=use_gpu, progress_callback=progress)
+    t_score = time.perf_counter() - t
+    sl = extract_volume_slice(ref, slice_plane, slice_value)
+    slice_info = {'plane': ['HK', 'HL', 'KL'][slice_plane], 'value': sl[6],
+                  'x': [float(sl[1][0]), float(sl[1][-1])],
+                  'y': [float(sl[2][0]), float(sl[2][-1])],
+                  'labels': (sl[3], sl[4], sl[5]),
+                  'geometry': slice_geometry(ref, slice_plane, sl[6])}
+    slices = {BIAS_REFERENCE: sl[0]}
+    bias: dict[str, Any] = {}
+    rows = []
+    for i, c in enumerate(cands):
+        _check_cancel(cancelled)
+        name = c['name']
+        if name == BIAS_REFERENCE:
+            out, dt = ref, float(measured['times']['reference_s'])
+        else:
+            log(f"Symmetrise with '{name}'.")
+            t = time.perf_counter()
+            out = symmetrize_volume(vol, laue_group, use_gpu=use_gpu, propagate_variance=False,
+                                    progress_callback=progress,
+                                    **candidate_kwargs(c, model, grad))
+            dt = time.perf_counter() - t
+            slices[name] = extract_volume_slice(out, slice_plane, slice_value)[0]
+        bias[name] = bias_checks({name: out}, ref, measured.get('radius', 0.1), extra)[name]
+        del out
+        sc = scores['candidates'][name]
+        b = bias[name]
+        rows.append({'name': name, 'rejection': c.get('rejection', 'none'),
+                     'score': sc['total']['trimmed_mean'], 'node': b['node_sum_ratio'],
+                     'extra': dict(b['extra_sum_ratio']), 'diffuse': b['diffuse_sum_ratio'],
+                     'lost': b['n_lost'], 'n_no_estimate': sc['n_no_estimate'],
+                     'time_s': dt})
+    _check_cancel(cancelled)
+    eligible ={r['name'] for r in rows if r['rejection'] != 'none'}
+    name, reason = suggest({**scores, 'candidates': {k: v for k, v in scores['candidates'].items()
+                                                     if k in eligible}},
+                           {k: v for k, v in bias.items() if k in eligible})
+    skipped = sorted(set(scores['candidates']) - eligible)
+    if skipped:
+        reason += (" The suggestion never uses the candidates without rejection ("
+                   + ', '.join(f"'{s}'" for s in skipped) + ").")
+    return {'scores': scores, 'bias': bias, 'rows': rows, 'slices': slices,
+            'slice_info': slice_info, 'suggestion': name, 'reason': reason,
+            'extra_positions': [list(o) for o in extra],
+            'specs': {c['name']: c for c in cands}, 'score_s': t_score}
+
+
+def _num(x: Any, spec: str = '.4f') -> str:
+    return '-' if x is None else format(x, spec)
+
+
+def format_measure(measured: Mapping[str, Any]) -> str:
+    """Text of the Measure results: the noise model and a table per |q| shell."""
+    lines = []
+    m = measured.get('model')
+    if m is None:
+        lines.append(f"Noise model: the fit failed. {measured.get('fit_error') or ''}")
+    else:
+        lines.append(f"Noise model: gain {m.gain:.4g}, rel {m.rel:.4g}, kappa {m.kappa:.4g}, "
+                     f"floor {m.floor:.4g} ({m.info.get('n_members', 0):,} members, "
+                     f"{m.info.get('iterations', 0)} iterations, "
+                     f"{100 * m.info.get('flagged_fraction', 0.0):.2f} % flagged).")
+    lines.append(shell_table(measured))
+    return '\n'.join(lines)
+
+
+def shell_rows(measured: Mapping[str, Any]) -> list[list[str]]:
+    """Rows of the Measure table: |q| range, chi^2/nu, R_sym, rejected %,
+    Poisson floor %, count spread %, node ratio."""
+    d = measured['diagnostics']
+    sh = d['shells']
+    edges = d['shell_edges']
+    spread = measured.get('count_spread')
+    rows = []
+    for i in range(len(edges) - 1):
+        rej, flo = sh['rejected_fraction'][i], sh['poisson_floor_fraction'][i]
+        sp = spread['fraction'][i] if spread else None
+        rows.append([f"{edges[i]:.3f}-{edges[i + 1]:.3f}", _num(sh['chi2_per_nu'][i], '.3f'),
+                     _num(sh['r_sym'][i]), _num(None if rej is None else 100 * rej, '.3f'),
+                     _num(None if flo is None else 100 * flo, '.1f'),
+                     _num(None if sp is None else 100 * sp, '.1f'),
+                     _num(measured['node_ratio'][i])])
+    return rows
+
+
+SHELL_HEADERS = ['|q| shell', 'chi2/nu', 'R_sym', 'rejected %', 'floor %', 'spread %',
+                 'node ratio']
+
+
+def shell_table(measured: Mapping[str, Any]) -> str:
+    unit = measured['diagnostics'].get('q_unit', '')
+    rows = shell_rows(measured)
+    head = [f"{SHELL_HEADERS[0]} ({unit})"] + SHELL_HEADERS[1:]
+    w = [max(len(head[j]), *(len(r[j]) for r in rows)) for j in range(len(head))]
+    out = ['  '.join(h.rjust(w[j]) for j, h in enumerate(head))]
+    out += ['  '.join(c.rjust(w[j]) for j, c in enumerate(r)) for r in rows]
+    spread = measured.get('count_spread')
+    out.append("floor % = voxels where the Poisson floor sets the scale. node ratio = node "
+               "sum with MAD 3 / node sum without rejection.")
+    if spread:
+        out.append(f"spread % = sampled orbits with max/min member pixel count above "
+                   f"{spread['ratio']:g}.")
+    return '\n'.join(out)
+
+
+COMPARE_HEADERS = ['candidate', 'score', 'node', 'extra', 'diffuse', 'lost', 'no estimate',
+                   'time (s)']
+
+
+def compare_rows(compared: Mapping[str, Any]) -> list[list[str]]:
+    """Rows of the Compare table (strings)."""
+    rows = []
+    for r in compared['rows']:
+        extra = ' '.join(_num(v) for v in r['extra'].values()) or '-'
+        rows.append([r['name'], _num(r['score']), _num(r['node']), extra, _num(r['diffuse']),
+                     str(r['lost']), str(r['n_no_estimate']), f"{r['time_s']:.1f}"])
+    return rows
+
+
+def format_compare(compared: Mapping[str, Any]) -> str:
+    """Text of the Compare results: the table, the suggestion and the limits."""
+    rows = compare_rows(compared)
+    head = list(COMPARE_HEADERS)
+    w = [max(len(head[j]), *(len(r[j]) for r in rows)) for j in range(len(head))]
+    out = ['  '.join(h.ljust(w[j]) if j == 0 else h.rjust(w[j]) for j, h in enumerate(head))]
+    out += ['  '.join(c.ljust(w[j]) if j == 0 else c.rjust(w[j]) for j, c in enumerate(r))
+            for r in rows]
+    if compared['extra_positions']:
+        out.append('extra = sum ratio at ' + ', '.join(_offset_label(o) for o in
+                                                         compared['extra_positions']) + '.')
+    out.append("Ratios are sums divided by the sums of 'equal, mad 3'. Lower scores are better.")
+    out.append(f"Suggestion: {compared['suggestion']}. {compared['reason']}")
+    out.append(LIMITS_TEXT)
+    return '\n'.join(out)
+
+
+def choice_record(name: str, reason: str, measured: Mapping[str, Any] | None,
+                  compared: Mapping[str, Any] | None, region: str) -> dict[str, Any]:
+    """The JSON-able record of an averaging choice for `metadata['averaging_choice']`."""
+    spec = ((compared or {}).get('specs', {}).get(name) or known_candidate(name) or {})
+    rec: dict[str, Any] = {
+        'name': name, 'weighting': spec.get('weighting'), 'rejection': spec.get('rejection'),
+        'sigma': spec.get('sigma'), 'reason': reason,
+        'suggested': (compared or {}).get('suggestion'), 'compared_on': region,
+        'fit_error': (measured or {}).get('fit_error'),
+        'noise_model': None, 'extra_positions': (compared or {}).get('extra_positions', []),
+        'candidates': {}}
+    model = (measured or {}).get('model')
+    if model is not None:
+        rec['noise_model'] = {'gain': model.gain, 'rel': model.rel, 'kappa': model.kappa,
+                              'floor': model.floor}
+    for r in (compared or {}).get('rows', []):
+        rec['candidates'][r['name']] = {
+            'score': r['score'], 'node_sum_ratio': r['node'], 'extra_sum_ratio': r['extra'],
+            'diffuse_sum_ratio': r['diffuse'], 'lost_voxels': r['lost'],
+            'n_no_estimate': r['n_no_estimate'], 'time_s': r['time_s']}
+    return rec

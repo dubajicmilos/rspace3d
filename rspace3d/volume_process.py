@@ -15,6 +15,16 @@ Options:
     --bin     HK bin factor (default: 2)
     --binl    L bin factor (default: 1)
     --no-gpu  Force CPU even if GPU available
+
+Averaging options (without them the CLI works as before):
+    --weighting        equal, counts or adaptive
+    --rejection        none, mad or model (mad and model use --sigma)
+    --report           fit the noise model, score the candidates, print the
+                       bias table and the suggestion, then stop
+                       ('--report continue' goes on with your options)
+    --auto             use the suggestion and go on
+    --extra-positions  h k l offsets for the bias table (repeat for more,
+                       needs --report or --auto)
 """
 
 from __future__ import annotations
@@ -32,6 +42,63 @@ from rspace3d.volume_builder import (
     _read_header_fast, _filter_numbered_imgs, _img_number,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
+
+
+SIGMA_DEFAULT = 3.0
+
+
+def _averaging_choice(vol, args, sigma_val, use_gpu, sym_kw):
+    """--report and --auto: measure, compare and suggest.
+
+    Returns None (stop after the report) or (keywords of symmetrize_volume,
+    record for metadata['averaging_choice'] or None).
+    """
+    from rspace3d import averaging as av
+
+    def log(msg):
+        print('      ' + msg, flush=True)
+
+    print(f'[A] Averaging options: measure and compare ({"GPU" if use_gpu else "CPU"})...')
+    t0 = time.time()
+    measured = av.measure_volume(vol, args.laue, use_gpu=use_gpu, log=log)
+    has_counts = vol.counts is not None
+    compared = None
+    if measured['model'] is None:
+        name, reason = av.preselect(has_counts, 'The noise-model fit failed. '
+                                    + str(measured['fit_error']))
+    else:
+        cands = av.automatic_candidates(has_counts)
+        if args.weighting is not None or args.rejection is not None:
+            rej = args.rejection or ('mad' if sigma_val is not None else 'none')
+            mine = av.make_candidate(args.weighting or 'equal', rej, sigma_val)
+            if mine['name'] not in [c['name'] for c in cands]:
+                cands.append(mine)
+        compared = av.compare_candidates(vol, args.laue, measured, cands,
+                                         args.extra_positions, use_gpu=use_gpu, log=log)
+        name, reason = compared['suggestion'], compared['reason']
+    if args.report:
+        for line in av.format_measure(measured).splitlines():
+            print('      ' + line)
+        if compared is not None:
+            for line in av.format_compare(compared).splitlines():
+                print('      ' + line)
+    if compared is None or not args.report:
+        print(f'      Suggestion: {name}. {reason}')
+    print(f'      Measure and compare took {time.time() - t0:.1f}s')
+    if not args.auto:
+        if args.report == 'stop':
+            return None
+        # --report continue: reuse the fitted noise model and G (no second fit)
+        kw = dict(sym_kw)
+        if measured['model'] is not None and (kw.get('weighting') == 'adaptive'
+                                              or kw.get('rejection') == 'model'):
+            kw.update(noise_model=measured['model'], grad=measured['grad'])
+        return kw, None
+    spec = (compared or {}).get('specs', {}).get(name) or av.known_candidate(name)
+    region = 'full volume ' + ' x '.join(str(s) for s in vol.intensity.shape)
+    print(f"      --auto: symmetrise with '{name}'.")
+    return (av.candidate_kwargs(spec, measured['model'], measured['grad']),
+            av.choice_record(name, reason, measured, compared, region))
 
 
 def main() -> None:
@@ -57,7 +124,7 @@ def _main() -> None:
     parser.add_argument('--laue', default='m-3m',
                         choices=list(LAUE_GROUP_NAMES.keys()),
                         help='Laue group (default: m-3m)')
-    parser.add_argument('--sigma', type=float, default=3.0,
+    parser.add_argument('--sigma', type=float, default=SIGMA_DEFAULT,
                         help='Outlier rejection sigma (default: 3.0); '
                              'pass 0 to skip rejection (pure symmetrization)')
     parser.add_argument('--morph', default='auto',
@@ -78,10 +145,34 @@ def _main() -> None:
     parser.add_argument('--workers', type=int, default=0,
                         help='Parallel file-load threads (0 = auto: min(8, cpu_count); '
                              '1 = sequential)')
+    avg = parser.add_argument_group(
+        'averaging options', 'Without these flags the symmetrisation is the same as before.')
+    avg.add_argument('--weighting', choices=['equal', 'counts', 'adaptive'], default=None,
+                     help="Weights of the orbit members (default: equal). 'counts' uses the "
+                          "pixel counts. 'adaptive' uses the fitted noise model.")
+    avg.add_argument('--rejection', choices=['none', 'mad', 'model'], default=None,
+                     help="Outlier rule. 'mad' and 'model' use --sigma. Default: 'mad' if "
+                          "--sigma > 0, else 'none'.")
+    avg.add_argument('--report', nargs='?', const='stop', choices=['stop', 'continue'],
+                     default=None,
+                     help='Fit the noise model, score the candidates, print the bias table '
+                          "and the suggestion. Then stop ('--report' or '--report stop') or "
+                          "go on with your options ('--report continue'). Put the folder "
+                          "before --report.")
+    avg.add_argument('--auto', action='store_true',
+                     help='Compare the candidates and symmetrise with the suggestion.')
+    avg.add_argument('--extra-positions', nargs=3, type=float, action='append', default=[],
+                     metavar=('H', 'K', 'L'),
+                     help='An offset such as 0.5 0.5 0.5 for the bias table. Repeat the '
+                          'flag for more positions. Needs --report or --auto.')
 
     args = parser.parse_args()
     folder = args.folder
     use_gpu = HAS_GPU and not args.no_gpu
+    if args.rejection in ('mad', 'model') and args.sigma <= 0:
+        parser.error(f'--rejection {args.rejection} needs --sigma > 0')
+    if args.extra_positions and not (args.report or args.auto):
+        parser.error('--extra-positions needs --report or --auto')
 
     if not os.path.isdir(folder):
         print(f'Error: {folder} is not a directory')
@@ -132,6 +223,14 @@ def _main() -> None:
           f'{sigma_val if sigma_val is not None else "off (pure average)"}')
     print(f'  Morph:   {morph_arg}')
     print(f'  Binning: {args.bin}x{args.bin} (HK), {args.binl}x (L)')
+    if args.weighting or args.rejection or args.report or args.auto:
+        print(f'  Average: weighting={args.weighting or "equal"}, '
+              f'rejection={args.rejection or "default"}'
+              + (f', report={args.report}' if args.report else '')
+              + (', auto' if args.auto else ''))
+    if args.auto and (args.weighting or args.rejection or args.sigma != SIGMA_DEFAULT):
+        print('  Note:    --auto symmetrises with the suggestion. It does not use --weighting, '
+              '--rejection or --sigma directly.')
     print('=' * 60)
 
     raw_path = os.path.join(folder, f'{base}_raw.h5')
@@ -230,11 +329,26 @@ def _main() -> None:
     else:
         print(f'[3/4] No binning')
 
+    # ── Averaging options (only with the new flags) ──
+    sym_kw: dict = {'sigma': sigma_val}
+    if args.weighting is not None or args.rejection is not None:
+        sym_kw.update(weighting=args.weighting or 'equal', rejection=args.rejection)
+    choice = None
+    if args.report or args.auto:
+        out = _averaging_choice(vol, args, sigma_val, use_gpu, sym_kw)
+        if out is None:
+            print('\n  Report done. The CLI saves no volume. Use --auto or --report continue '
+                  'to symmetrise.')
+            return
+        sym_kw, choice = out
+
     # ── Step 4: Single-pass symmetrize + outlier rejection ──
     print(f'[4/4] Symmetrize + outlier rejection ({device})...',
           end=' ', flush=True)
     t0 = time.time()
-    vol = symmetrize_volume(vol, args.laue, sigma=sigma_val, use_gpu=use_gpu)
+    vol = symmetrize_volume(vol, args.laue, use_gpu=use_gpu, **sym_kw)
+    if choice is not None:
+        vol.metadata['averaging_choice'] = choice
     dt_sym = time.time() - t0
     n_removed = vol.metadata.get('n_outliers_removed', 0)
     print(f'{dt_sym:.1f}s  ({n_removed:,} voxels flagged as outliers, '

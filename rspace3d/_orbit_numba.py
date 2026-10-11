@@ -715,6 +715,76 @@ def _sq0(d):
 
 
 @njit(parallel=True, nogil=True, cache=_CACHE)
+def region_sums(x, ref, origin, A, offsets, r2, G, shell_scale, n_shells, s_out, r_out, n_out):
+    """Sums of `x` and `ref` per h-layer, |q| shell and region (see `averaging.bias_checks`).
+
+    Region r < len(offsets): the distance in hkl to the nearest point
+    n + offsets[r] (n integer) is at most sqrt(r2). The last region (diffuse)
+    holds the voxels that are in no other region. The hkl values and the
+    distances use the same operations as the NumPy code, thus the regions
+    are the same. A voxel that is finite in `x` and `ref` adds x and ref
+    (float64) to s_out[i, shell, region] and r_out[i, shell, region]. A voxel
+    that is finite in `ref` and NaN in `x` adds 1 to n_out. The shell is
+    min(int(|q| shell_scale), n_shells - 1) with |q| from the metric G (the
+    operation order of `orbit_engine._q_of`). With n_shells = 1 all voxels
+    are in shell 0. Each h-layer has its own row of the outputs, thus the
+    result does not depend on the number of threads.
+    """
+    nh, nk, nl = x.shape
+    n_off = offsets.shape[0]
+    for i in prange(nh):
+        fi = np.float64(i)
+        for j in range(nk):
+            fj = np.float64(j)
+            for k in range(nl):
+                rv = ref[i, j, k]
+                if not np.isfinite(rv):
+                    continue
+                fk = np.float64(k)
+                xv = x[i, j, k]
+                sh = 0
+                if n_shells > 1:
+                    q0 = origin[0] + ((A[0, 0] * fi + A[0, 1] * fj) + A[0, 2] * fk)
+                    q1 = origin[1] + ((A[1, 0] * fi + A[1, 1] * fj) + A[1, 2] * fk)
+                    q2 = origin[2] + ((A[2, 0] * fi + A[2, 1] * fj) + A[2, 2] * fk)
+                    g0 = (G[0, 0] * q0 + G[0, 1] * q1) + G[0, 2] * q2
+                    g1 = (G[1, 0] * q0 + G[1, 1] * q1) + G[1, 2] * q2
+                    g2 = (G[2, 0] * q0 + G[2, 1] * q1) + G[2, 2] * q2
+                    qq = (q0 * g0 + q1 * g1) + q2 * g2
+                    sh = int(np.sqrt(max(qq, 0.0)) * shell_scale)
+                    if sh > n_shells - 1:
+                        sh = n_shells - 1
+                h0 = ((origin[0] + A[0, 0] * fi) + A[0, 1] * fj) + A[0, 2] * fk
+                h1 = ((origin[1] + A[1, 0] * fi) + A[1, 1] * fj) + A[1, 2] * fk
+                h2 = ((origin[2] + A[2, 0] * fi) + A[2, 1] * fj) + A[2, 2] * fk
+                fin = np.isfinite(xv)
+                inside = False
+                for r in range(n_off):
+                    f = h0 - offsets[r, 0]
+                    f = f - np.rint(f)
+                    d2 = f * f
+                    f = h1 - offsets[r, 1]
+                    f = f - np.rint(f)
+                    d2 = d2 + f * f
+                    f = h2 - offsets[r, 2]
+                    f = f - np.rint(f)
+                    d2 = d2 + f * f
+                    if d2 <= r2:
+                        inside = True
+                        if fin:
+                            s_out[i, sh, r] += np.float64(xv)
+                            r_out[i, sh, r] += np.float64(rv)
+                        else:
+                            n_out[i, sh, r] += 1
+                if not inside:
+                    if fin:
+                        s_out[i, sh, n_off] += np.float64(xv)
+                        r_out[i, sh, n_off] += np.float64(rv)
+                    else:
+                        n_out[i, sh, n_off] += 1
+
+
+@njit(parallel=True, nogil=True, cache=_CACHE)
 def gradient_blocks(f, out):
     """Gradient magnitude G of the float32 volume `f` (see `averaging.gradient_magnitude`).
 

@@ -25,10 +25,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QFormLayout, QPushButton, QLabel, QComboBox, QCheckBox,
     QSpinBox, QDoubleSpinBox, QProgressBar, QFileDialog, QTextEdit, QMessageBox,
+    QTabWidget, QScrollArea, QSplitter,
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
 from . import rawrecon
+from .averaging_panel import LOG_HEIGHT, AveragingPanel
 from .volume_builder import (
     bin_volume, symmetrize_volume, save_volume_h5, format_symmetry_diagnostics,
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
@@ -71,7 +73,7 @@ class ReconstructGUI(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle('Raw-frame 3D Reconstruction')
-        self.resize(760, 820)
+        self.resize(1280, 920)
         self._worker: WorkerThread | None = None
         self._folder: str | None = None
         self._par: str | None = None
@@ -80,6 +82,7 @@ class ReconstructGUI(QMainWindow):
         self._vd = None         # VolumeData (raw, NaN = unmeasured)
         self._info: dict | None = None
         self._viewer = None
+        self._binned: dict | None = None   # binned volume of the Averaging panel: key, vol
         self._gpu_free_gb = 0.0
         self._build_ui()
 
@@ -102,7 +105,18 @@ class ReconstructGUI(QMainWindow):
     # ── UI ──
     def _build_ui(self):
         central = QWidget(); self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        outer = QVBoxLayout(central)
+        # Tabs above, progress and log below. The user can move the border.
+        self.split = QSplitter(Qt.Orientation.Vertical)
+        outer.addWidget(self.split)
+        self.tabs = QTabWidget()
+        self.split.addWidget(self.tabs)
+        self.recon_tab = QWidget()
+        layout = QVBoxLayout(self.recon_tab)
+        # A scroll area: the tab does not push the log below its height
+        recon_scroll = QScrollArea(); recon_scroll.setWidgetResizable(True)
+        recon_scroll.setWidget(self.recon_tab)
+        self.tabs.addTab(recon_scroll, 'Reconstruct')
 
         # Dataset folder
         g1 = QGroupBox('1. Dataset folder  (raw .cbf frames + *_cracker.par)')
@@ -231,7 +245,12 @@ class ReconstructGUI(QMainWindow):
         self.sigma.setSingleStep(0.5); self.sigma.setDecimals(1)
         self.sigma.setToolTip('Outlier rejection threshold (MAD sigma) across each\n'
                               'symmetry orbit. 3 = standard.')
-        f4.addRow('Outlier sigma:', self.sigma)
+        sigma_row = QHBoxLayout()
+        sigma_row.addWidget(self.sigma)
+        self.sigma_note = QLabel('')
+        self.sigma_note.setStyleSheet('color: #070; font-weight: bold;')
+        sigma_row.addWidget(self.sigma_note, stretch=1)
+        f4.addRow('Outlier sigma:', sigma_row)
 
         btns = QHBoxLayout()
         self.save_raw_btn = QPushButton('Save raw volume')
@@ -252,12 +271,36 @@ class ReconstructGUI(QMainWindow):
         g4.setLayout(f4); layout.addWidget(g4)
         self._post_group = g4
         self._set_post_enabled(False)
+        # Room for the frame tools of a later release (hidden)
+        self.frame_tools_group = QGroupBox('Frame tools')
+        self.frame_tools_group.setLayout(QVBoxLayout())
+        self.frame_tools_group.setVisible(False)
+        layout.addWidget(self.frame_tools_group)
+        layout.addStretch(1)
 
+        # Averaging panel (works on the volume binned with the factors of section 2)
+        self.avg_panel = AveragingPanel(self._averaging_request, log=self._log,
+                                        progress=self._update_progress)
+        self.avg_panel.busy_changed.connect(self._on_panel_busy)
+        self.avg_panel.applied_changed.connect(self._on_applied_changed)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setWidget(self.avg_panel)
+        self.tabs.addTab(scroll, 'Averaging')
+        self.laue_combo.currentIndexChanged.connect(
+            lambda _: self.avg_panel.reset('The Laue group changed. Click Measure again.'))
+        for w in (self.bin_xy, self.bin_z):
+            w.valueChanged.connect(self._invalidate_binned)
+
+        bottom = QWidget(); bl = QVBoxLayout(bottom); bl.setContentsMargins(0, 0, 0, 0)
         self.progress = QProgressBar(); self.progress.setTextVisible(True)
-        layout.addWidget(self.progress)
+        bl.addWidget(self.progress)
         self.log = QTextEdit(); self.log.setReadOnly(True)
         self.log.setStyleSheet('font-family:Consolas,monospace; font-size:11px;')
-        layout.addWidget(self.log)
+        bl.addWidget(self.log)
+        self.split.addWidget(bottom)
+        self.split.setStretchFactor(0, 1); self.split.setStretchFactor(1, 0)
+        # About 230 px for the progress bar and the log at the default window size
+        self.split.setSizes([LOG_HEIGHT * 3, LOG_HEIGHT])
         self._update_estimate()
 
     def _mk_range_spin(self, val):
@@ -312,6 +355,7 @@ class ReconstructGUI(QMainWindow):
         # post-processing buttons would save/symmetrise the old volume under
         # the new folder's name.
         self._vol = self._vd = self._info = None
+        self._invalidate_binned()
         self._set_post_enabled(False)
         self.folder_label.setText(folder)
         self._log(f'\nFolder: {folder}')
@@ -417,6 +461,7 @@ class ReconstructGUI(QMainWindow):
 
     def _on_recon_done(self, result):
         self._vol, self._vd, self._info = result
+        self._invalidate_binned()
         i = self._info
         self._log(f'\nReconstruction complete:')
         self._log(f'  {i["time_s"]:.1f} s  ({i["ms_per_frame"]:.1f} ms/frame, '
@@ -465,9 +510,16 @@ class ReconstructGUI(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, 'Save symmetrised volume', default, 'HDF5 (*.h5)')
         if not path:
             return
+        # The Averaging panel: its binned volume and its applied option, if any
+        binned = self._current_binned()
+        sym_kw, choice = {}, None
+        if binned is not None:
+            sym_kw = self.avg_panel.symmetrize_kwargs(binned, laue)
+            choice = self.avg_panel.choice_metadata() if sym_kw else None
         self._set_busy(True, 'Symmetrising...')
         self._worker = WorkerThread(self._do_sym, self._vd, laue, self.sigma.value(),
-                                    self.bin_xy.value(), self.bin_z.value(), path)
+                                    self.bin_xy.value(), self.bin_z.value(), path,
+                                    binned if sym_kw else None, sym_kw, choice)
         self._worker.progress.connect(self._update_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(lambda p: (self._log(f'  saved {p}\nDone.'),
@@ -475,17 +527,28 @@ class ReconstructGUI(QMainWindow):
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _do_sym(self, vd, laue, sigma, bin_xy, bin_z, path):
+    def _do_sym(self, vd, laue, sigma, bin_xy, bin_z, path, binned=None, sym_kw=None,
+                choice=None):
         log = lambda m: QThread.currentThread()._emit_log(m)     # type: ignore[union-attr]
         cb = QThread.currentThread()._emit_progress             # type: ignore[union-attr]
-        if bin_xy > 1 or bin_z > 1:
+        if binned is not None:
+            log(f'  use the binned volume of the Averaging panel {binned.intensity.shape}')
+            vd = binned
+        elif bin_xy > 1 or bin_z > 1:
             log(f'  binning {bin_xy}x{bin_xy}x{bin_z} ...')
             vd = bin_volume(vd, bin_xy, bin_xy, bin_z)
             log(f'  -> {vd.intensity.shape}')
         n_ops = _EXPECTED_ORDERS[laue]
-        log(f'  symmetrising {laue} ({n_ops} ops), sigma={sigma} ...')
         t = time.time()
-        sym = symmetrize_volume(vd, laue, sigma=sigma, progress_callback=cb)
+        if sym_kw:
+            log(f'  symmetrising {laue} ({n_ops} ops), averaging option '
+                f'\'{choice["name"] if choice else "?"}\' from the Averaging panel ...')
+            sym = symmetrize_volume(vd, laue, progress_callback=cb, **sym_kw)
+            if choice is not None:
+                sym.metadata['averaging_choice'] = choice
+        else:
+            log(f'  symmetrising {laue} ({n_ops} ops), sigma={sigma} ...')
+            sym = symmetrize_volume(vd, laue, sigma=sigma, progress_callback=cb)
         n_out = sym.metadata.get('n_outliers_removed', 0)
         log(f'  done in {time.time()-t:.1f}s ({n_out:,} outliers); '
             f'range [{np.nanmin(sym.intensity):.2f}, {np.nanmax(sym.intensity):.2f}]')
@@ -500,6 +563,52 @@ class ReconstructGUI(QMainWindow):
         save_volume_h5(path, sym)
         log(f'  wrote {os.path.getsize(path)/1e6:.0f} MB in {time.time()-t:.0f}s')
         return path
+
+    # ── Averaging panel ──
+    def _binned_key(self):
+        return (id(self._vd), self.bin_xy.value(), self.bin_z.value())
+
+    def _current_binned(self):
+        """The binned volume of the Averaging panel if it matches the volume and the bins."""
+        if (self._vd is not None and self._binned is not None
+                and self._binned['key'] == self._binned_key()):
+            return self._binned['vol']
+        return None
+
+    def _invalidate_binned(self, *_):
+        self._binned = None
+        self.avg_panel.reset('The volume or the bin factors changed. Click Measure again.')
+
+    def _averaging_request(self):
+        """Laue group and volume function for the Averaging panel (GUI thread)."""
+        if self._vd is None:
+            raise ValueError('Reconstruct a volume first.')
+        laue = self.laue_combo.currentData()
+        vd, key = self._vd, self._binned_key()
+        bin_xy, bin_z = key[1], key[2]
+        ready = self._current_binned()
+
+        def volume_fn(log, progress):
+            if ready is not None:
+                return ready
+            vol = vd
+            if bin_xy > 1 or bin_z > 1:
+                log(f'Bin the volume {bin_xy}x{bin_xy}x{bin_z}.')
+                vol = bin_volume(vd, bin_xy, bin_xy, bin_z)
+            self._binned = {'key': key, 'vol': vol}
+            return vol
+        return laue, volume_fn
+
+    def _on_applied_changed(self):
+        """An applied averaging option replaces the outlier sigma of Symmetrise + Save."""
+        name = self.avg_panel.applied_name()
+        self.sigma.setEnabled(name is None)
+        self.sigma_note.setText('' if name is None else
+                                f"Not used. Symmetrise + Save uses '{name}' (Averaging tab).")
+
+    def _on_panel_busy(self, busy):
+        self.recon_tab.setEnabled(not busy)
+        self.statusBar().showMessage('Averaging panel is running...' if busy else 'Ready')
 
     # ── open in viewer ──
     def _open_in_viewer(self):
@@ -530,6 +639,7 @@ class ReconstructGUI(QMainWindow):
         self.browse_btn.setEnabled(not busy)
         self.recon_btn.setEnabled(not busy and self._par is not None)
         self._post_group.setEnabled(not busy and self._vd is not None)
+        self.avg_panel.set_host_busy(busy)
         if message or not busy:
             self.statusBar().showMessage(message or 'Ready')
 

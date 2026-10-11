@@ -23,9 +23,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QFormLayout, QPushButton, QLabel, QComboBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QProgressBar, QFileDialog,
-    QTextEdit, QMessageBox,
+    QTextEdit, QMessageBox, QTabWidget, QScrollArea, QSplitter,
 )
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, Qt, pyqtSignal
 
 from .volume_builder import (
     load_unwarp_folder, bin_volume, symmetrize_volume,
@@ -35,6 +35,7 @@ from .volume_builder import (
     LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
 )
 from .make_dcunwarp import generate_dcunwarp
+from .averaging_panel import LOG_HEIGHT, AveragingPanel
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -76,10 +77,12 @@ class SimpleVolumeGUI(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle('3D Volume Processor')
-        self.resize(700, 700)
+        self.resize(1280, 920)
         self._worker: WorkerThread | None = None
         self._folder_path: str | None = None
         self._dataset_valid = False
+        # The binned volume of the Averaging panel: {'key', 'vol', 'raw_path', 'base'}
+        self._prepared: dict[str, Any] | None = None
         self._build_ui()
 
         if HAS_GPU:
@@ -97,7 +100,19 @@ class SimpleVolumeGUI(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        outer = QVBoxLayout(central)
+        # Tabs above, progress and log below. The user can move the border.
+        self.split = QSplitter(Qt.Orientation.Vertical)
+        outer.addWidget(self.split)
+        self.tabs = QTabWidget()
+        self.split.addWidget(self.tabs)
+        self.process_tab = QWidget()
+        layout = QVBoxLayout(self.process_tab)
+        # A scroll area: the tab does not push the log below its height
+        process_scroll = QScrollArea()
+        process_scroll.setWidgetResizable(True)
+        process_scroll.setWidget(self.process_tab)
+        self.tabs.addTab(process_scroll, 'Process')
 
         # ── Folder selection ──
         g1 = QGroupBox('Select Unwarp Folder')
@@ -214,7 +229,12 @@ class SimpleVolumeGUI(QMainWindow):
             '3.0 = standard\n'
             '5.0 = conservative (removes only extreme outliers)\n'
             '1.5 = aggressive (tighter clipping, use with caution)')
-        f2.addRow('Outlier sigma:', self.sigma_spin)
+        sigma_row = QHBoxLayout()
+        sigma_row.addWidget(self.sigma_spin)
+        self.sigma_note = QLabel('')
+        self.sigma_note.setStyleSheet('color: #070; font-weight: bold;')
+        sigma_row.addWidget(self.sigma_note, stretch=1)
+        f2.addRow('Outlier sigma:', sigma_row)
 
         # Coverage-mask kernel (auto by default; allow odd integer override)
         self.morph_combo = QComboBox()
@@ -261,16 +281,41 @@ class SimpleVolumeGUI(QMainWindow):
 
         g2.setLayout(f2)
         layout.addWidget(g2)
+        layout.addStretch(1)
+
+        # ── Averaging panel ──
+        self.avg_panel = AveragingPanel(self._averaging_request, log=self._log,
+                                        progress=self._update_progress)
+        self.avg_panel.busy_changed.connect(self._on_panel_busy)
+        self.avg_panel.applied_changed.connect(self._on_applied_changed)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.avg_panel)
+        self.tabs.addTab(scroll, 'Averaging')
+        self.laue_combo.currentIndexChanged.connect(
+            lambda _: self.avg_panel.reset('The Laue group changed. Click Measure again.'))
+        for w in (self.bin_xy_spin, self.bin_z_spin):
+            w.valueChanged.connect(self._invalidate_prepared)
+        self.morph_combo.currentIndexChanged.connect(self._invalidate_prepared)
+        self.force_reload_chk.toggled.connect(self._invalidate_prepared)
 
         # ── Progress + log ──
+        bottom = QWidget()
+        bl = QVBoxLayout(bottom)
+        bl.setContentsMargins(0, 0, 0, 0)
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
-        layout.addWidget(self.progress)
+        bl.addWidget(self.progress)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
-        layout.addWidget(self.log)
+        bl.addWidget(self.log)
+        self.split.addWidget(bottom)
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 0)
+        # About 230 px for the progress bar and the log at the default window size
+        self.split.setSizes([LOG_HEIGHT * 3, LOG_HEIGHT])
 
     # ── Folder ──
 
@@ -284,6 +329,7 @@ class SimpleVolumeGUI(QMainWindow):
     def _set_folder(self, folder):
         self._folder_path = folder
         self._dataset_valid = False
+        self._invalidate_prepared()
         self.folder_label.setText(folder)
         self._log(f'Folder: {folder}')
 
@@ -393,9 +439,21 @@ class SimpleVolumeGUI(QMainWindow):
         bin_z = self.bin_z_spin.value()
         device = 'GPU' if HAS_GPU else 'CPU'
 
+        # The Averaging panel: its volume and its applied option, if any
+        prepared = self._current_prepared()
+        sym_kw: dict[str, Any] = {}
+        choice = None
+        if prepared is not None:
+            sym_kw = self.avg_panel.symmetrize_kwargs(prepared['vol'], laue)
+            choice = self.avg_panel.choice_metadata() if sym_kw else None
+        if sym_kw:
+            rule = f"averaging option '{choice['name'] if choice else '?'}'"
+        else:
+            rule = f'sigma={sigma}'
+
         self._set_busy(True, 'Processing...')
         self._log(f'\n{"="*50}')
-        self._log(f'Processing: {laue}, sigma={sigma}, morph={morph}, '
+        self._log(f'Processing: {laue}, {rule}, morph={morph}, '
                   f'bin={bin_xy}x{bin_xy}x{bin_z}, '
                   f'force_reload={force_reload}, {device}')
         self._log(f'{"="*50}')
@@ -403,12 +461,63 @@ class SimpleVolumeGUI(QMainWindow):
         self._worker = WorkerThread(
             self._do_process_all,
             self._folder_path, laue, sigma, morph, bin_xy, bin_z,
-            force_reload)
+            force_reload, prepared, sym_kw, choice)
         self._worker.progress.connect(self._update_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_process_done)
         self._worker.error.connect(self._on_error)
         self._worker.start()
+
+    # ── Averaging panel ──
+
+    def _volume_key(self) -> tuple[Any, ...]:
+        return (self._folder_path, self.morph_combo.currentData(),
+                self.force_reload_chk.isChecked(), self.bin_xy_spin.value(),
+                self.bin_z_spin.value())
+
+    def _current_prepared(self) -> dict[str, Any] | None:
+        """The binned volume of the Averaging panel if it matches the settings."""
+        if self._prepared is not None and self._prepared['key'] == self._volume_key():
+            return self._prepared
+        return None
+
+    def _invalidate_prepared(self, *_: Any) -> None:
+        self._prepared = None
+        self.avg_panel.reset('The volume settings changed. Click Measure again.')
+
+    def _averaging_request(self) -> tuple[str, Callable[..., Any]]:
+        """Laue group and volume function for the Averaging panel (GUI thread)."""
+        if not self._dataset_valid or not self._folder_path:
+            raise ValueError('Select an unwarp folder with .img files first.')
+        laue = self.laue_combo.currentData()
+        key = self._volume_key()
+        prepared = self._current_prepared()
+
+        def volume_fn(log: Callable[[str], None], progress: Callable[[int, int], None]) -> Any:
+            if prepared is not None:
+                log('Use the volume that the panel loaded and binned before.')
+                return prepared['vol']
+            folder, morph, force_reload, bin_xy, bin_z = key
+            vol, raw_path, base = self._load_binned(folder, morph, bin_xy, bin_z,
+                                                    force_reload, log, progress)
+            self._prepared = {'key': key, 'vol': vol, 'raw_path': raw_path, 'base': base}
+            log('The panel loaded and binned the volume. Process All uses this volume.')
+            return vol
+        return laue, volume_fn
+
+    def _on_applied_changed(self) -> None:
+        """An applied averaging option replaces the outlier sigma of Process All."""
+        name = self.avg_panel.applied_name()
+        self.sigma_spin.setEnabled(name is None)
+        self.sigma_note.setText('' if name is None
+                                else f"Not used. Process All uses '{name}' (Averaging tab).")
+
+    def _on_panel_busy(self, busy: bool) -> None:
+        self.process_tab.setEnabled(not busy)
+        if busy:
+            self.statusBar().showMessage('Averaging panel is running...')  # type: ignore[union-attr]
+        else:
+            self.statusBar().showMessage('Ready')  # type: ignore[union-attr]
 
     def _do_process_all(
         self,
@@ -419,11 +528,71 @@ class SimpleVolumeGUI(QMainWindow):
         bin_xy: int,
         bin_z: int,
         force_reload: bool,
+        prepared: dict[str, Any] | None = None,
+        sym_kw: dict[str, Any] | None = None,
+        choice: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         log = lambda msg: QThread.currentThread()._emit_log(msg)  # type: ignore[union-attr]
         cb = QThread.currentThread()._emit_progress  # type: ignore[union-attr]
         device = 'GPU' if HAS_GPU else 'CPU'
 
+        if prepared is not None:
+            log('Step 1-3/4: Use the volume that the Averaging panel loaded and binned.')
+            vol, raw_path, base = prepared['vol'], prepared['raw_path'], prepared['base']
+            nh, nk, nl = vol.intensity.shape
+            log(f'  Binned: {nh} x {nk} x {nl}')
+        else:
+            vol, raw_path, base = self._load_binned(folder, morph, bin_xy, bin_z,
+                                                    force_reload, log, cb)
+
+        # ── Step 4: Single-pass symmetrize + outlier rejection ──
+        n_ops = _EXPECTED_ORDERS[laue]
+        log(f'Step 4/4: Symmetrize + outlier rejection ({device})...')
+        t0 = time.time()
+        if sym_kw:
+            log(f'  Laue group: {laue} ({n_ops} ops), averaging option '
+                f'\'{choice["name"] if choice else "?"}\' from the Averaging panel')
+            vol = symmetrize_volume(vol, laue, progress_callback=cb, **sym_kw)
+            if choice is not None:
+                vol.metadata['averaging_choice'] = choice
+        else:
+            log(f'  Laue group: {laue} ({n_ops} ops), sigma={sigma}')
+            vol = symmetrize_volume(vol, laue, sigma=sigma, progress_callback=cb)
+        dt_sym = time.time() - t0
+        n_removed = vol.metadata.get('n_outliers_removed', 0)
+        log(f'  Done in {dt_sym:.1f}s '
+            f'({n_removed:,} orbit members flagged as outliers)')
+        log(f'  Range: [{np.nanmin(vol.intensity):.3f}, '
+            f'{np.nanmax(vol.intensity):.3f}]')
+        log('  Symmetry diagnostics per |q| shell:')
+        log(format_symmetry_diagnostics(vol.metadata.get('symmetry_diagnostics')))
+
+        # Save with Laue group suffix
+        laue_suffix = laue.replace('/', '').replace('-', 'bar')
+        sym_path = os.path.join(folder, f'{base}_sym_{laue_suffix}.h5')
+        log(f'  Saving: {sym_path}')
+        t0 = time.time()
+        save_volume_h5(sym_path, vol)
+        dt_save = time.time() - t0
+        size_mb = os.path.getsize(sym_path) / 1e6
+        log(f'  {size_mb:.1f} MB on disk in {dt_save:.1f}s')
+
+        return {'raw_path': raw_path, 'sym_path': sym_path}
+
+    def _load_binned(
+        self,
+        folder: str,
+        morph: int | str,
+        bin_xy: int,
+        bin_z: int,
+        force_reload: bool,
+        log: Callable[[str], None],
+        cb: Callable[[int, int], None],
+    ) -> tuple[Any, str, str]:
+        """Steps 1 to 3 of Process All: load (or the raw cache), save raw, bin.
+
+        Returns (binned volume, raw cache path, file prefix).
+        """
         # Derive base name from .img filename prefix
         # e.g. "MAPbI2Br_293K_1_1_0_1.img" -> prefix "MAPbI2Br_293K_1_1_0"
         img_files = sorted([f for f in os.listdir(folder) if f.lower().endswith('.img')])
@@ -535,34 +704,7 @@ class SimpleVolumeGUI(QMainWindow):
             log(f'  Binned: {nh} x {nk} x {nl}')
         else:
             log(f'Step 3/4: No binning (1x1x1)')
-
-        # ── Step 4: Single-pass symmetrize + outlier rejection ──
-        n_ops = _EXPECTED_ORDERS[laue]
-        log(f'Step 4/4: Symmetrize + outlier rejection ({device})...')
-        log(f'  Laue group: {laue} ({n_ops} ops), sigma={sigma}')
-
-        t0 = time.time()
-        vol = symmetrize_volume(vol, laue, sigma=sigma, progress_callback=cb)
-        dt_sym = time.time() - t0
-        n_removed = vol.metadata.get('n_outliers_removed', 0)
-        log(f'  Done in {dt_sym:.1f}s '
-            f'({n_removed:,} orbit members flagged as outliers)')
-        log(f'  Range: [{np.nanmin(vol.intensity):.3f}, '
-            f'{np.nanmax(vol.intensity):.3f}]')
-        log('  Symmetry diagnostics per |q| shell:')
-        log(format_symmetry_diagnostics(vol.metadata.get('symmetry_diagnostics')))
-
-        # Save with Laue group suffix
-        laue_suffix = laue.replace('/', '').replace('-', 'bar')
-        sym_path = os.path.join(folder, f'{base}_sym_{laue_suffix}.h5')
-        log(f'  Saving: {sym_path}')
-        t0 = time.time()
-        save_volume_h5(sym_path, vol)
-        dt_save = time.time() - t0
-        size_mb = os.path.getsize(sym_path) / 1e6
-        log(f'  {size_mb:.1f} MB on disk in {dt_save:.1f}s')
-
-        return {'raw_path': raw_path, 'sym_path': sym_path}
+        return vol, raw_path, base
 
     def _on_process_done(self, result):
         self._log(f'\nDone!')
@@ -583,6 +725,7 @@ class SimpleVolumeGUI(QMainWindow):
         self.browse_btn.setEnabled(not busy)
         self.process_btn.setEnabled(not busy and self._dataset_valid)
         self.dc_btn.setEnabled(not busy)
+        self.avg_panel.set_host_busy(busy)
         self.statusBar().showMessage(message if message else ('Ready' if not busy else ''))
 
     def _on_error(self, msg):

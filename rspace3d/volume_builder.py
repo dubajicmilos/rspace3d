@@ -1474,7 +1474,7 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
                             'symmetry_mapping': mapping,
                             'symmetry_max_index_error': plan.max_index_error,
                             'symmetry_diagnostics': orbit_engine.result_diagnostics(plan, res)}
-    for key in ('weighting', 'rejection', 'noise_model'):     # from an earlier run
+    for key in ('weighting', 'rejection', 'noise_model', 'averaging_choice'):  # earlier run
         meta.pop(key, None)
     if res.variance is None:
         meta.pop('variance_model', None)
@@ -1709,6 +1709,9 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
     `metadata['symmetry_diagnostics']`, one 1D dataset per sum).
     Optional attribute: noise_model (`metadata['noise_model']` as a JSON
     text). `averaging.NoiseModel.from_dict` makes the model from the dict.
+    Optional attribute: averaging_choice (`metadata['averaging_choice']` as
+    a JSON text): the option that the averaging panel or the command line
+    applied, the reason and a short score summary (`averaging.choice_record`).
 
     Can be read in MATLAB with:
         data = h5read('file.h5', '/data');
@@ -1754,6 +1757,10 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
         if vol.metadata.get('noise_model') is not None:
             import json
             f.attrs['noise_model'] = json.dumps(vol.metadata['noise_model'])
+        # Choice of the averaging panel or of the command line (a JSON text)
+        if vol.metadata.get('averaging_choice') is not None:
+            import json
+            f.attrs['averaging_choice'] = json.dumps(vol.metadata['averaging_choice'])
 
         # Symmetrisation diagnostics per |q| shell
         diag = vol.metadata.get('symmetry_diagnostics')
@@ -1834,6 +1841,9 @@ def load_volume_h5(path: str) -> VolumeData:
         if 'noise_model' in f.attrs:
             import json
             metadata['noise_model'] = json.loads(str(f.attrs['noise_model']))
+        if 'averaging_choice' in f.attrs:
+            import json
+            metadata['averaging_choice'] = json.loads(str(f.attrs['averaging_choice']))
         # M_inv, UB, cell, Cartesian step
         if 'M_inv' in f:
             metadata['M_inv'] = np.array(f['M_inv'])
