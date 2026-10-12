@@ -84,6 +84,7 @@ class ReconstructGUI(QMainWindow):
         self._viewer = None
         self._binned: dict | None = None   # binned volume of the Averaging panel: key, vol
         self._gpu_free_gb = 0.0
+        self._frame_stale = False   # True: the grid or the frames changed after the reconstruction
         self._build_ui()
 
         if HAS_GPU:
@@ -268,14 +269,15 @@ class ReconstructGUI(QMainWindow):
         self.view_btn.setToolTip('Save the raw volume and open it in the RSP viewer.')
         btns.addWidget(self.view_btn)
         f4.addRow(btns)
+        # The volume of the frame tools (Averaging tab), if it is not the uncorrected one
+        self.source_note = QLabel('')
+        self.source_note.setStyleSheet('color: #070; font-weight: bold;')
+        self.source_note.setWordWrap(True)
+        self.source_note.setVisible(False)
+        f4.addRow(self.source_note)
         g4.setLayout(f4); layout.addWidget(g4)
         self._post_group = g4
         self._set_post_enabled(False)
-        # Room for the frame tools of a later release (hidden)
-        self.frame_tools_group = QGroupBox('Frame tools')
-        self.frame_tools_group.setLayout(QVBoxLayout())
-        self.frame_tools_group.setVisible(False)
-        layout.addWidget(self.frame_tools_group)
         layout.addStretch(1)
 
         # Averaging panel (works on the volume binned with the factors of section 2)
@@ -283,13 +285,23 @@ class ReconstructGUI(QMainWindow):
                                         progress=self._update_progress)
         self.avg_panel.busy_changed.connect(self._on_panel_busy)
         self.avg_panel.applied_changed.connect(self._on_applied_changed)
+        # Frame tools: raw frames only (the volume builder keeps the group hidden)
+        self.avg_panel.enable_frame_tools(self._frame_request)
+        self.avg_panel.volume_changed.connect(self._on_volume_changed)
+        self.frame_tools_group = self.avg_panel.frame_group
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setWidget(self.avg_panel)
         self.tabs.addTab(scroll, 'Averaging')
-        self.laue_combo.currentIndexChanged.connect(
-            lambda _: self.avg_panel.reset('The Laue group changed. Click Measure again.'))
+        self.laue_combo.currentIndexChanged.connect(self._on_laue_changed)
         for w in (self.bin_xy, self.bin_z):
             w.valueChanged.connect(self._invalidate_binned)
+        # A change of the grid, the frames or the pixel options makes the frame
+        # tools results of the last reconstruction stale
+        for w in (self.hmin, self.hmax, self.kmin, self.kmax, self.lmin, self.lmax, self.dq,
+                  self.nframes, self.hot, self.pol_frac):
+            w.valueChanged.connect(self._on_setup_changed)
+        for w in (self.corr_chk, self.tabbin_chk):
+            w.toggled.connect(self._on_setup_changed)
 
         bottom = QWidget(); bl = QVBoxLayout(bottom); bl.setContentsMargins(0, 0, 0, 0)
         self.progress = QProgressBar(); self.progress.setTextVisible(True)
@@ -326,7 +338,7 @@ class ReconstructGUI(QMainWindow):
         nvox = ns[0] * ns[1] * ns[2]
         # GPU working set during accumulation: float64 sum + int32 count
         # + float64 sum of squares (variance)
-        gb = nvox * 20 / 1e9
+        gb = rawrecon.gpu_memory_bytes(nvox) / 1e9
         txt = f'{ns[0]} x {ns[1]} x {ns[2]} = {nvox:,} voxels  (~{gb:.1f} GB GPU)'
         too_big = self._gpu_free_gb and gb > 0.7 * self._gpu_free_gb
         if any(hi <= lo for lo, hi in self._ranges()):
@@ -355,6 +367,8 @@ class ReconstructGUI(QMainWindow):
         # post-processing buttons would save/symmetrise the old volume under
         # the new folder's name.
         self._vol = self._vd = self._info = None
+        self._frame_stale = False
+        self.avg_panel.clear_frame_results('A new folder removed the frame tools results.')
         self._invalidate_binned()
         self._set_post_enabled(False)
         self.folder_label.setText(folder)
@@ -451,7 +465,7 @@ class ReconstructGUI(QMainWindow):
         vol, info = rawrecon.reconstruct_dataset(
             folder, ranges=ranges, step=step, bins=bins, nframes=nframes, corrections=corr,
             hot=hot, use_gpu=use_gpu, par_path=par_path, use_tabbin=use_tabbin,
-            progress_callback=cb, log=log)
+            progress_callback=cb, log=log, keep_setup=True)
         info['bragg_rms'] = rawrecon.bragg_registration_rms(vol)
         provenance = {k: info[k] for k in ('polarization_axis', 'hot_pixel_cutoff',
                                            'geometry_method') if info.get(k) is not None}
@@ -461,6 +475,8 @@ class ReconstructGUI(QMainWindow):
 
     def _on_recon_done(self, result):
         self._vol, self._vd, self._info = result
+        self._frame_stale = False
+        self.avg_panel.clear_frame_results('A new reconstruction removed the frame tools results.')
         self._invalidate_binned()
         i = self._info
         self._log(f'\nReconstruction complete:')
@@ -482,12 +498,13 @@ class ReconstructGUI(QMainWindow):
     def _save_raw(self):
         if self._vd is None:
             return
-        default = os.path.join(self._folder, f'{self._info["name"]}_recon_raw.h5')
+        vd, tag = self._source()
+        default = os.path.join(self._folder, f'{self._info["name"]}_recon_raw{tag}.h5')
         path, _ = QFileDialog.getSaveFileName(self, 'Save raw volume', default, 'HDF5 (*.h5)')
         if not path:
             return
         self._set_busy(True, 'Saving...')
-        self._worker = WorkerThread(self._do_save, self._vd, path)
+        self._worker = WorkerThread(self._do_save, vd, path)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(lambda p: (self._log(f'  saved {p}'), self._set_busy(False)))
         self._worker.error.connect(self._on_error)
@@ -506,7 +523,8 @@ class ReconstructGUI(QMainWindow):
             return
         laue = self.laue_combo.currentData()
         suffix = laue.replace('/', '').replace('-', 'bar')
-        default = os.path.join(self._folder, f'{self._info["name"]}_recon_sym_{suffix}.h5')
+        vd, tag = self._source()
+        default = os.path.join(self._folder, f'{self._info["name"]}_recon_sym_{suffix}{tag}.h5')
         path, _ = QFileDialog.getSaveFileName(self, 'Save symmetrised volume', default, 'HDF5 (*.h5)')
         if not path:
             return
@@ -517,7 +535,7 @@ class ReconstructGUI(QMainWindow):
             sym_kw = self.avg_panel.symmetrize_kwargs(binned, laue)
             choice = self.avg_panel.choice_metadata() if sym_kw else None
         self._set_busy(True, 'Symmetrising...')
-        self._worker = WorkerThread(self._do_sym, self._vd, laue, self.sigma.value(),
+        self._worker = WorkerThread(self._do_sym, vd, laue, self.sigma.value(),
                                     self.bin_xy.value(), self.bin_z.value(), path,
                                     binned if sym_kw else None, sym_kw, choice)
         self._worker.progress.connect(self._update_progress)
@@ -565,8 +583,21 @@ class ReconstructGUI(QMainWindow):
         return path
 
     # ── Averaging panel ──
+    def _source(self):
+        """The volume for the Averaging panel and the save steps, and its file-name tag.
+
+        It is the uncorrected volume unless the user selected a corrected volume
+        of the frame tools (Averaging tab). The tag follows the metadata value
+        'frame_correction' of the volume (for example no ring found: 'frame_model')."""
+        vd = self.avg_panel.selected_volume()
+        if vd is None or self._vd is None:
+            return self._vd, ''
+        return vd, {'ring_mask': '_ringmask', 'frame_model': '_framemodel',
+                    'ring_mask+frame_model': '_ringmask_framemodel'}.get(
+            vd.metadata.get('frame_correction'), '')
+
     def _binned_key(self):
-        return (id(self._vd), self.bin_xy.value(), self.bin_z.value())
+        return (id(self._source()[0]), self.bin_xy.value(), self.bin_z.value())
 
     def _current_binned(self):
         """The binned volume of the Averaging panel if it matches the volume and the bins."""
@@ -578,13 +609,14 @@ class ReconstructGUI(QMainWindow):
     def _invalidate_binned(self, *_):
         self._binned = None
         self.avg_panel.reset('The volume or the bin factors changed. Click Measure again.')
+        self.avg_panel.clear_scores()
 
     def _averaging_request(self):
         """Laue group and volume function for the Averaging panel (GUI thread)."""
         if self._vd is None:
             raise ValueError('Reconstruct a volume first.')
         laue = self.laue_combo.currentData()
-        vd, key = self._vd, self._binned_key()
+        vd, key = self._source()[0], self._binned_key()
         bin_xy, bin_z = key[1], key[2]
         ready = self._current_binned()
 
@@ -598,6 +630,50 @@ class ReconstructGUI(QMainWindow):
             self._binned = {'key': key, 'vol': vol}
             return vol
         return laue, volume_fn
+
+    # ── frame tools (Averaging tab) ──
+    def _frame_request(self):
+        """Setup, uncorrected volume and options for the frame tools (GUI thread)."""
+        setup = (self._info or {}).get('setup')
+        if self._vd is None or setup is None:
+            raise ValueError('Reconstruct a volume first. The frame tools use its frames.')
+        if self._frame_stale:
+            raise ValueError('The grid, the frames or the pixel options changed after the '
+                             'reconstruction. Reconstruct again to use the frame tools.')
+        bin_xy, bin_z = self.bin_xy.value(), self.bin_z.value()
+
+        def bin_fn(vd):
+            if bin_xy > 1 or bin_z > 1:
+                return bin_volume(vd, bin_xy, bin_xy, bin_z)
+            return vd
+        return {'setup': setup, 'raw': self._vd, 'laue': self.laue_combo.currentData(),
+                'use_gpu': bool(self.gpu_chk.isChecked() and HAS_GPU), 'bin': bin_fn}
+
+    def _on_volume_changed(self):
+        """The frame tools selected another volume: release the binned copy."""
+        self._binned = None
+        slot = self.avg_panel.selected_slot()
+        names = {'mask': 'ring mask', 'model': 'ring mask + frame model'}
+        self.source_note.setText('' if slot == 'none' else
+                                 f"Volume: '{names[slot]}' (frame tools, Averaging tab). The save "
+                                 'steps use this volume.')
+        self.source_note.setVisible(slot != 'none')
+
+    def _on_laue_changed(self, *_):
+        """The Laue group changed: reset the panel and remove the frame-model results."""
+        self.avg_panel.reset('The Laue group changed. Click Measure again.')
+        self.avg_panel.drop_laue_results(
+            "The Laue group changed. The panel removed the 'ring mask + frame model' volume "
+            'and the frame map. They use the Laue group. Run Frame model again.')
+
+    def _on_setup_changed(self, *_):
+        """The settings of the reconstruction changed: the frame tools results are stale."""
+        if self._vd is None:
+            return
+        self._frame_stale = True
+        self.avg_panel.clear_frame_results('The grid, the frames or the pixel options changed. '
+                                           'The frame tools results were removed. Reconstruct '
+                                           'again to use the frame tools.')
 
     def _on_applied_changed(self):
         """An applied averaging option replaces the outlier sigma of Symmetrise + Save."""
@@ -615,8 +691,9 @@ class ReconstructGUI(QMainWindow):
         if self._vd is None:
             return
         try:
-            path = os.path.join(self._folder, f'{self._info["name"]}_recon_raw.h5')
-            save_volume_h5(path, self._vd)
+            vd, tag = self._source()
+            path = os.path.join(self._folder, f'{self._info["name"]}_recon_raw{tag}.h5')
+            save_volume_h5(path, vd)
             from .rsp_viewer import UnifiedViewer
             self._viewer = UnifiedViewer()
             self._viewer._load_file(path)

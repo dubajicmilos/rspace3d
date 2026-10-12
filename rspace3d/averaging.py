@@ -1597,8 +1597,13 @@ def format_compare(compared: Mapping[str, Any]) -> str:
 
 
 def choice_record(name: str, reason: str, measured: Mapping[str, Any] | None,
-                  compared: Mapping[str, Any] | None, region: str) -> dict[str, Any]:
-    """The JSON-able record of an averaging choice for `metadata['averaging_choice']`."""
+                  compared: Mapping[str, Any] | None, region: str,
+                  split: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """The JSON-able record of an averaging choice for `metadata['averaging_choice']`.
+
+    `split` is the output of `compare_split_halves`, or None. With it, each
+    candidate of the record also gets its split-half difference.
+    """
     spec = ((compared or {}).get('specs', {}).get(name) or known_candidate(name) or {})
     rec: dict[str, Any] = {
         'name': name, 'weighting': spec.get('weighting'), 'rejection': spec.get('rejection'),
@@ -1616,4 +1621,142 @@ def choice_record(name: str, reason: str, measured: Mapping[str, Any] | None,
             'score': r['score'], 'node_sum_ratio': r['node'], 'extra_sum_ratio': r['extra'],
             'diffuse_sum_ratio': r['diffuse'], 'lost_voxels': r['lost'],
             'n_no_estimate': r['n_no_estimate'], 'time_s': r['time_s']}
+    if split:
+        for cname, res in split['rows'].items():
+            rec['candidates'].setdefault(cname, {})['split_half'] = res
+        rec['split_half'] = {'definition': SPLIT_HALF_DEFINITION,
+                             'halves_rule': split.get('halves_rule'),
+                             'shell_edges': split['shell_edges'], 'q_unit': split['q_unit']}
     return rec
+
+
+# ──────────────────────────────────────────────────────────────────
+# Split halves
+# ──────────────────────────────────────────────────────────────────
+
+SPLIT_HALF_DEFINITION = ('D = sum|A - B| / sum(|A| + |B|) over the voxels that are finite in A '
+                         'and B. A and B are the odd-frame and the even-frame volumes. Each half '
+                         'gets its own noise model and is symmetrised with the candidate. '
+                         "'node' = voxels within 0.1 (hkl distance) of an integer node, "
+                         "'diffuse' = the other voxels.")
+
+# Frame map of the frame tools (rawrecon.frames). The text is here so that the
+# Averaging panel can use it without an import of rawrecon.
+FRAME_MAP_FLOOR = 1e-3      # value of a cell without observed counts (below 1 / 1.5)
+FRAME_MAP_DEFINITION = (
+    "Each cell of the frame map is the observed / predicted ratio of one frame and 5-degree "
+    "sector, divided by the median of this ratio over all frames of the same sector. "
+    "Thus 1 means that the frame agrees with the other frames in this sector. The sector "
+    "median removes a pattern that is the same in all frames (for example a shadow). "
+    f"A cell without observed counts gets the value {FRAME_MAP_FLOOR:g} (an empty frame). "
+    "A frame is off if the median over its sectors differs from 1 by more than 10 %.")
+
+
+def split_half_masks(vol: Any, laue_group: str,
+                     radius: float = 0.1) -> tuple[npt.NDArray[np.int8], npt.NDArray[np.bool_],
+                                                   list[float], str]:
+    """|q| shell index (int8, 0 to N_SHELLS - 1) and node mask of each voxel of `vol`.
+
+    Also returns the shell edges and the |q| unit. A node voxel is at most
+    `radius` (hkl distance) from the nearest integer node.
+    """
+    from .volume_builder import orbit_plan, volume_affine
+    plan = orbit_plan(vol, laue_group)
+    origin, A = volume_affine(vol)
+    shape = vol.intensity.shape
+    shell = np.empty(shape, np.int8)
+    node = np.empty(shape, bool)
+    c1 = np.broadcast_to(np.arange(shape[1])[:, None], shape[1:])
+    c2 = np.broadcast_to(np.arange(shape[2])[None, :], shape[1:])
+    for h0 in range(shape[0]):
+        c0 = np.full(shape[1:], h0)
+        shell[h0] = oe._shell_of(plan, c0, c1, c2)
+        d2 = np.zeros(shape[1:])
+        for d in range(3):
+            f = origin[d] + A[d, 0] * h0 + A[d, 1] * c1 + A[d, 2] * c2
+            d2 += (f - np.rint(f)) ** 2
+        node[h0] = d2 <= radius * radius
+    edges = [plan.q_max * i / oe.N_SHELLS for i in range(oe.N_SHELLS + 1)]
+    return shell, node, edges, plan.q_unit
+
+
+def split_half_difference(a: npt.NDArray[np.floating], b: npt.NDArray[np.floating],
+                          shell: npt.NDArray[np.int8],
+                          node: npt.NDArray[np.bool_]) -> dict[str, Any]:
+    """Split-half difference of two volumes (see `SPLIT_HALF_DEFINITION`).
+
+    Returns 'total', 'node', 'diffuse', 'shells' (one value per |q| shell,
+    None for a shell without common voxels) and 'n_both'.
+    """
+    both = np.isfinite(a) & np.isfinite(b)
+    num = np.abs(a.astype(np.float64) - b)
+    den = np.abs(a.astype(np.float64)) + np.abs(b)
+
+    def ratio(m: npt.NDArray[np.bool_]) -> float | None:
+        d = float(den[m].sum())
+        return float(num[m].sum()) / d if d > 0 else None
+    return {'total': ratio(both), 'node': ratio(both & node), 'diffuse': ratio(both & ~node),
+            'shells': [ratio(both & (shell == k)) for k in range(oe.N_SHELLS)],
+            'n_both': int(both.sum())}
+
+
+def compare_split_halves(odd: Any, even: Any, laue_group: str,
+                         candidates: Sequence[Mapping[str, Any]],
+                         use_gpu: bool | None = None,
+                         log: Callable[[str], None] | None = None,
+                         progress: Callable[[int, int], None] | None = None,
+                         cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
+    """Split-half difference of each candidate (see `SPLIT_HALF_DEFINITION`).
+
+    `odd` and `even` are two volumes on the same grid (the two halves of one
+    dataset). Each half gets its own noise model (`_fit`), because the gain
+    of a half is not the gain of the full volume. A candidate that needs a
+    noise model gets None if the fit of a half fails.
+    Returns 'rows' ({name: `split_half_difference` or None}), 'shell_edges',
+    'q_unit', 'fit_errors' and 'time_s'. Raises `Cancelled` between two
+    candidates if `cancelled()` returns True.
+    """
+    from .volume_builder import HAS_GPU, symmetrize_volume
+    log = log or _quiet
+    if use_gpu is None:
+        use_gpu = HAS_GPU
+    if odd.intensity.shape != even.intensity.shape:
+        raise ValueError('The two halves must have the same grid.')
+    t0 = time.perf_counter()
+    shell, node, edges, unit = split_half_masks(odd, laue_group)
+    fits: dict[str, Any] = {}
+    errors: dict[str, str | None] = {}
+    needs_model = any(c.get('weighting') == 'adaptive' or c.get('rejection') == 'model'
+                      for c in candidates)
+    for name, half in (('odd', odd), ('even', even)):
+        _check_cancel(cancelled)
+        fits[name], errors[name] = (None, None), None
+        if not needs_model:
+            continue
+        log(f'Fit the noise model of the {name} half.')
+        try:
+            fits[name] = _fit(half, laue_group, None, None, use_gpu=use_gpu)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError, ZeroDivisionError,
+                RuntimeError) as exc:
+            errors[name] = str(exc)
+            log(f'The noise-model fit of the {name} half failed: {exc}')
+    rows: dict[str, Any] = {}
+    for i, c in enumerate(candidates):
+        _check_cancel(cancelled)
+        name = c['name']
+        need = c.get('weighting') == 'adaptive' or c.get('rejection') == 'model'
+        if need and (fits['odd'][0] is None or fits['even'][0] is None):
+            rows[name] = None
+            continue
+        log(f"Split halves: symmetrise the two halves with '{name}'.")
+        out = []
+        for half, (model, grad) in ((odd, fits['odd']), (even, fits['even'])):
+            out.append(symmetrize_volume(half, laue_group, use_gpu=use_gpu,
+                                         propagate_variance=False,
+                                         **candidate_kwargs(c, model, grad)).intensity)
+        rows[name] = split_half_difference(out[0], out[1], shell, node)
+        del out
+        if progress:
+            progress(i + 1, len(candidates))
+    return {'rows': rows, 'shell_edges': edges, 'q_unit': unit, 'fit_errors': errors,
+            'time_s': time.perf_counter() - t0}

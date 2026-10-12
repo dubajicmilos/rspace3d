@@ -1687,6 +1687,7 @@ _PROVENANCE_KEYS: dict[str, Callable[[Any], Any]] = {
     'n_files': int, 'd_min': float, 'hot_pixel_cutoff': float,
     'polarization_axis': str, 'geometry_method': str, 'source_manifest': str,
     'variance_model': str, 'weighting': str, 'rejection': str,
+    'frame_correction': str,
 }
 
 
@@ -1712,6 +1713,11 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
     Optional attribute: averaging_choice (`metadata['averaging_choice']` as
     a JSON text): the option that the averaging panel or the command line
     applied, the reason and a short score summary (`averaging.choice_record`).
+    Optional attribute: frame_tools (`metadata['frame_tools']` as a JSON
+    text): the options and the fit summary of the frame tools
+    (`rawrecon.frames.run_frame_chain`). The text attribute frame_correction
+    gives the correction ('none', 'ring_mask', 'frame_model' or
+    'ring_mask+frame_model').
 
     Can be read in MATLAB with:
         data = h5read('file.h5', '/data');
@@ -1761,6 +1767,10 @@ def save_volume_h5(path: str, vol: VolumeData, compression: str = 'gzip',
         if vol.metadata.get('averaging_choice') is not None:
             import json
             f.attrs['averaging_choice'] = json.dumps(vol.metadata['averaging_choice'])
+        # Options and fit summary of the frame tools (a JSON text)
+        if vol.metadata.get('frame_tools') is not None:
+            import json
+            f.attrs['frame_tools'] = json.dumps(vol.metadata['frame_tools'])
 
         # Symmetrisation diagnostics per |q| shell
         diag = vol.metadata.get('symmetry_diagnostics')
@@ -1844,6 +1854,9 @@ def load_volume_h5(path: str) -> VolumeData:
         if 'averaging_choice' in f.attrs:
             import json
             metadata['averaging_choice'] = json.loads(str(f.attrs['averaging_choice']))
+        if 'frame_tools' in f.attrs:
+            import json
+            metadata['frame_tools'] = json.loads(str(f.attrs['frame_tools']))
         # M_inv, UB, cell, Cartesian step
         if 'M_inv' in f:
             metadata['M_inv'] = np.array(f['M_inv'])

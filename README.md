@@ -293,6 +293,80 @@ through a few `l` planes: Bragg peaks must sit on the grid intersections in all
 three plane orientations. Smeared or doubled peaks mean that the geometry is
 wrong (see the troubleshooting table).
 
+### Frame tools (contamination that changes between frames)
+
+Some contamination is in the beam for part of the scan only: powder rings of
+a wire or a sample holder, an additive background, or a shadow. A symmetry
+average does not remove it fully, because each voxel gets it from different
+frames. The frame tools of `rawrecon` (new in 2.6.0) use the frames again:
+
+- `reconstruct_dataset(..., halves=True)` makes the odd-frame and even-frame
+  volumes in the same pass (`vol.parts`). Their difference is a noise estimate.
+  The frames must have odd and even numbers. The host needs about 120 bytes
+  per voxel at the peak of this pass, against about 55 bytes per voxel
+  without halves.
+- `ring_statistics` and `detect_rings` find powder rings from the frames.
+  `RingMask` removes the ring bands from the frames of the ring event. You can
+  also give the bands yourself (`RingMask.from_bands`). The detector needs
+  frames without the rings before or after the ring event in the frames that
+  you give. If all frames have the rings, it finds no ring. The ring mask
+  depends on the frames that you give. Check the number of ring frames when
+  you change the frame range.
+- `frame_map` shows the agreement of each frame and detector sector with a
+  first average, and the radial residual profile. The map value is the
+  observed / predicted ratio of a frame and sector, divided by the median of
+  this ratio over all frames of the same sector. Thus 1 means agreement with
+  the other frames. `FrameMap.summary()` counts the frames whose median over
+  the sectors differs from 1 by more than 10 %. A frame without counts gets
+  the lowest value and counts as off. On the real data the ratio before this
+  normalisation is not 1. For the full frame map of one I19-2 scan
+  (MAPbBr3) its median was 0.94. Real changes between frames and sectors
+  lower the ratio. They were the main cause in this scan. The cause of these
+  changes is not known. The orbit median is lower than the orbit mean. This
+  raises the ratio.
+- `run_frame_chain(info['setup'], laue)` runs the frame chain: ring mask, a
+  model of additive and scale contamination for each frame (3 iterations),
+  then the plain orbit mean. Get `info['setup']` with
+  `reconstruct_dataset(..., keep_setup=True)`, or call `prepare_setup`. The
+  output file records the options and the fit summary (attribute
+  `frame_tools`).
+
+Limits of the frame tools:
+
+- The frame chain was validated with Laue group mmm and 0.2-degree frames
+  (I19-2 and I15 data). Other Laue groups and frame widths work, but they
+  are not validated.
+- A test on synthetic data gave a smaller error for 2/m, 4/mmm and m-3m. For
+  Laue group -1 the same test showed no gain from the chain.
+- For another frame width the method scales its frame windows with
+  0.2 / width.
+- `info['setup']` (only with `keep_setup=True`) is not a JSON value. Remove
+  it before you serialise `info`.
+- Host memory of `run_frame_chain`: 6.0 GB above the memory before the call
+  at the peak (measured: GPU, 1735 frames, 1785 radial bins, grid
+  297 x 297 x 241, no halves). The peak is in the table fit. The table part
+  grows with the number of frames and of radial bins.
+
+In `rspace3d-reconstruct`, the *Frame tools* group of the Averaging tab has
+these steps as buttons. The group is below Measure, Compare and Results.
+Scroll down to see it. Reconstruct a volume first. *Ring mask* and *Frame
+model* make corrected volumes. Select a volume in the *Volume* list, then
+click Measure and Compare. *Split-half check* adds the split-half difference
+of each candidate to the Results table. *Frame map* shows the frame map of the
+selected volume. The frames of this pass are not corrected with the frame
+model. The colour scale of the map is logarithmic: white is 1, red is more
+counts and blue is fewer counts than in the other frames. The scale stops at
+1/1.5 and 1.5. If *Ring mask* finds no ring, the volume is the same as the
+uncorrected volume, and *Frame model* applies the frame model only. The file
+name tag then follows the metadata (`_framemodel`, not
+`_ringmask_framemodel`). A change of the Laue group removes the 'ring mask + frame model'
+volume and the frame map. *Save raw volume*, *Symmetrise + Save* and *Open in Viewer* use the
+selected volume, and the file records the frame-tool metadata. The volume
+builder (route B) has no frames, so it does not show this group.
+
+Without these options the reconstruction is the same as before. Section 12 of
+`rspace3d/rawrecon/README.md` describes the method.
+
 ### Troubleshooting
 
 | Message or symptom | Cause and fix |
@@ -677,7 +751,8 @@ or voxels binned by `bin_volume` without input counts). The group
 a score summary) (symmetrised volumes); the coverage-mask diagnostics of route B (`morph_size`,
 `n_unmeasured_per_frame_*`, `frame_npix`); and the reconstruction provenance of
 route A (`reconstructed_by`, `polarization_axis`, `hot_pixel_cutoff`,
-`geometry_method`), and `variance_model`. The files can be read from MATLAB with
+`geometry_method`), `frame_correction` and `frame_tools` (a JSON text, the
+options and the fit summary of the frame tools), and `variance_model`. The files can be read from MATLAB with
 `h5read(file, '/data')` and similar calls.
 
 The attribute `sigma` is the outlier threshold of the symmetrisation. The

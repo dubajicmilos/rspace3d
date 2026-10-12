@@ -630,7 +630,8 @@ def test_reconstruct_gui_defaults_and_symmetrise_without_panel(qapp, monkeypatch
     vol = _small(seed=9)
     gui, stub = _recon(qapp, monkeypatch, tmp_path, vol)
     assert (gui.sigma.value(), gui.bin_xy.value(), gui.bin_z.value()) == (3.0, 1, 1)
-    assert gui.tabs.tabText(1) == 'Averaging' and not gui.frame_tools_group.isVisibleTo(gui)
+    assert gui.tabs.tabText(1) == 'Averaging' and gui.frame_tools_group is gui.avg_panel.frame_group
+    assert gui.avg_panel.selected_volume() is None and gui.source_note.isHidden()
     gui._symmetrize_save()
     _wait(qapp, gui)
     (v, laue, kw), = stub.sym

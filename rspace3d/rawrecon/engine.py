@@ -21,13 +21,27 @@ The floor of 1 count per pixel is the same floor that the outlier rejection
 uses (`poisson_floor`). A voxel with N = 0 has a NaN variance.
 
 The grid may be anisotropic: independent (min,max) per axis, common voxel size dq.
+
+Options of the two engine functions (all off by default):
+
+* `groups` gives each frame a group number. The engine then makes one
+  partial volume per group in the same pass (for example odd and even
+  frames). The full volume is the sum of the partial volumes.
+* `frame_fn(i, img)` changes the pixels of frame i before the scatter. It
+  returns None (no change) or `(offset, gain)`. The pixel value is then
+  g (r - offset) gain and its variance is g^2 gain^2 max(r, 1). A pixel with
+  a gain that is not finite is not used (a mask). The raw count r controls
+  the validity test, the hot cutoff and the floor of the variance.
+* `cancelled()` is called once per frame. If it returns True, the engine
+  stops with `averaging.Cancelled`.
 """
 from __future__ import annotations
 
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import numpy as np
 
@@ -46,6 +60,7 @@ class Volume:
     counts: np.ndarray      # (nh,nk,nl) contributing pixels per voxel
     wavelength: float
     variance: np.ndarray | None = None   # (nh,nk,nl) sigma^2 of data, NaN where unmeasured
+    parts: list | None = None            # one Volume per frame group (`groups`), else None
 
 
 # ---------------------------------------------------------------- grid / cell
@@ -153,21 +168,83 @@ def _mean_and_variance(ssum, scount, ssq):
     return vol, var
 
 
+def frame_matrix(UBinv, R0, osc_axis, sense, phi, phi0):
+    """float32 (3, 3) matrix Mn of a frame: hkl = r_lab @ Mn.T."""
+    Rn = _axis_rot(osc_axis, sense * (phi - phi0)) @ R0
+    return (UBinv @ Rn.T).astype(np.float32)
+
+
+def _check_groups(groups, n):
+    """Validated int64 group number per frame and the number of groups (None: one group)."""
+    if groups is None:
+        return None, 1
+    g = np.asarray(groups)
+    if g.shape != (n,) or not np.issubdtype(g.dtype, np.integer) or (n and g.min() < 0):
+        raise ValueError(f"groups must be {n} integers >= 0, one for each frame")
+    return g.astype(np.int64), int(g.max()) + 1
+
+
+def _cancel_check(cancelled):
+    if cancelled is not None and cancelled():
+        from ..averaging import Cancelled
+        raise Cancelled("Cancelled.")
+
+
+def _frame_stream(frames, read_fn, frame_fn, ahead):
+    """(image, fix) per frame. fix is the result of frame_fn, or None without frame_fn."""
+    if frame_fn is None:
+        for img in _prefetch(frames, read_fn, ahead):
+            yield img, None
+        return
+
+    def read_fix(i):
+        img = read_fn(frames[i])
+        return img, frame_fn(i, img)
+    yield from _prefetch(list(range(len(frames))), read_fix, ahead)
+
+
+def _assemble(H, K, L, UB, wavelength, shape, sums):
+    """Volume from host accumulators. `sums` is one (ssum, scount, ssq) per group.
+
+    One group gives the plain Volume. More groups give a Volume whose
+    accumulators are the sums of the groups, with one Volume per group in
+    `parts`."""
+    def make(ssum, scount, ssq, parts=None):
+        vol, var = _mean_and_variance(ssum, scount, ssq)
+        return Volume(vol.reshape(shape), H, K, L, np.asarray(UB),
+                      scount.reshape(shape), wavelength, var.reshape(shape), parts)
+
+    if len(sums) == 1:
+        return make(*sums[0])
+    parts = [make(*s) for s in sums]
+    ssum, scount, ssq = (a.copy() for a in sums[0])
+    for s in sums[1:]:
+        ssum += s[0]
+        scount += s[1]
+        ssq += s[2]
+    return make(ssum, scount, ssq, parts)
+
+
 # ---------------------------------------------------------------- GPU engine
 def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
                            osc_axis=(0, 1, 0), sense=1,
                            ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)), step=0.025,
                            bins=(1, 1, 1),
                            read_fn=None, hot=None, progress_callback=None,
-                           corrections=None, device=0, prefetch=3) -> Volume:
+                           corrections=None, device=0, prefetch=3,
+                           groups=None, frame_fn=None, cancelled=None) -> Volume:
     """GPU reconstruction. Per-frame float64 scatter-add into a resident
-    accumulator; disk reads prefetched on a thread pool. Returns a host Volume."""
+    accumulator; disk reads prefetched on a thread pool. Returns a host Volume.
+
+    `groups`, `frame_fn` and `cancelled` are optional (see the module text).
+    Without them the result is the same as in rspace3d 2.5.0."""
     import cupy as cp
     import cupyx
 
     read_fn = read_fn or _default_read_fn()
     cp.cuda.Device(device).use()
     frames, phis = _validate_series(frames, phis)
+    gidx, n_groups = _check_groups(groups, len(frames))
 
     ny, nx = detector.shape
     ys, xs = np.mgrid[0:ny, 0:nx]
@@ -182,14 +259,15 @@ def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
     corr_g = None if corr is None else cp.asarray(corr)
     lo_g = cp.asarray([lo_h, lo_k, lo_l], cp.float32)
 
-    ssum = cp.zeros(nvox, cp.float64)
-    scount = cp.zeros(nvox, cp.int32)
-    ssq = cp.zeros(nvox, cp.float64)          # sum of g^2 * max(r, 1)
+    ssum = [cp.zeros(nvox, cp.float64) for _ in range(n_groups)]
+    scount = [cp.zeros(nvox, cp.int32) for _ in range(n_groups)]
+    ssq = [cp.zeros(nvox, cp.float64) for _ in range(n_groups)]   # sum of g^2 * max(r, 1)
     UBinv = np.linalg.inv(UB)
 
-    for i, (phi, img_host) in enumerate(zip(phis, _prefetch(frames, read_fn, prefetch))):
-        Rn = _axis_rot(osc_axis, sense * (phi - phi0)) @ R0
-        Mn = cp.asarray((UBinv @ Rn.T).astype(np.float32))       # hkl = r_lab @ Mn.T
+    stream = _frame_stream(frames, read_fn, frame_fn, prefetch)
+    for i, (phi, (img_host, fix)) in enumerate(zip(phis, stream)):
+        _cancel_check(cancelled)
+        Mn = cp.asarray(frame_matrix(UBinv, R0, osc_axis, sense, phi, phi0))  # hkl = r_lab @ Mn.T
         img = cp.asarray(img_host.ravel())
         vi = cp.floor((r_lab_g @ Mn.T - lo_g) / step).astype(cp.int32)
         h0, k0, l0 = vi[:, 0], vi[:, 1], vi[:, 2]
@@ -197,30 +275,41 @@ def reconstruct_volume_gpu(frames, phis, UB, R0, detector, *, phi0,
                & (h0 >= 0) & (h0 < nh) & (k0 >= 0) & (k0 < nk) & (l0 >= 0) & (l0 < nl))
         if hot is not None:
             inb &= img < hot
+        if fix is not None:
+            off, gain = fix
+            if gain is not None:
+                gain = cp.asarray(np.asarray(gain).ravel()).astype(cp.float64)
+                inb &= cp.isfinite(gain)
         flat = (h0.astype(cp.int64) * nkl + k0 * nl + l0)[inb]     # int64: any grid size
         r = img[inb].astype(cp.float64)
-        w = r
-        w2 = cp.maximum(r, 1.0)
-        if corr_g is not None:
-            g = corr_g[inb]
-            w = r * g
-            w2 = w2 * g * g
-        cupyx.scatter_add(ssum, flat, w)
-        cupyx.scatter_add(scount, flat, 1)
-        cupyx.scatter_add(ssq, flat, w2)
+        if fix is None:
+            w = r
+            w2 = cp.maximum(r, 1.0)
+            if corr_g is not None:
+                g = corr_g[inb]
+                w = r * g
+                w2 = w2 * g * g
+        else:
+            ga = gain[inb] if gain is not None else cp.ones_like(r)
+            if corr_g is not None:
+                ga = corr_g[inb] * ga
+            c = r
+            if off is not None:
+                c = r - cp.asarray(np.asarray(off).ravel()).astype(cp.float64)[inb]
+            w = c * ga
+            w2 = cp.maximum(r, 1.0) * ga * ga
+        gi = 0 if gidx is None else int(gidx[i])
+        cupyx.scatter_add(ssum[gi], flat, w)
+        cupyx.scatter_add(scount[gi], flat, 1)
+        cupyx.scatter_add(ssq[gi], flat, w2)
         if progress_callback:
             progress_callback(i + 1, len(frames))
 
-    ssum_h = cp.asnumpy(ssum)
-    scount_h = cp.asnumpy(scount).astype(np.int64)
-    ssq_h = cp.asnumpy(ssq)
+    sums = [(cp.asnumpy(ssum[j]), cp.asnumpy(scount[j]).astype(np.int64), cp.asnumpy(ssq[j]))
+            for j in range(n_groups)]
     del ssum, scount, ssq, r_lab_g, corr_g
     cp.get_default_memory_pool().free_all_blocks()
-
-    vol, var = _mean_and_variance(ssum_h, scount_h, ssq_h)
-    return Volume(vol.reshape(nh, nk, nl), H, K, L,
-                  np.asarray(UB), scount_h.reshape(nh, nk, nl), detector.wavelength,
-                  var.reshape(nh, nk, nl))
+    return _assemble(H, K, L, UB, detector.wavelength, (nh, nk, nl), sums)
 
 
 # ---------------------------------------------------------------- CPU fallback
@@ -229,10 +318,15 @@ def reconstruct_volume(frames, phis, UB, R0, detector, *, phi0,
                        ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)), step=0.025,
                        bins=(1, 1, 1),
                        read_fn=None, hot=None, progress_callback=None,
-                       corrections=None, **_ignored) -> Volume:
-    """CPU reconstruction (numpy bincount). Same result as the GPU path."""
+                       corrections=None, groups=None, frame_fn=None, cancelled=None,
+                       **_ignored) -> Volume:
+    """CPU reconstruction (numpy bincount). Same result as the GPU path.
+
+    `groups`, `frame_fn` and `cancelled` are optional (see the module text).
+    Without them the result is the same as in rspace3d 2.5.0."""
     read_fn = read_fn or _default_read_fn()
     frames, phis = _validate_series(frames, phis)
+    gidx, n_groups = _check_groups(groups, len(frames))
 
     ny, nx = detector.shape
     ys, xs = np.mgrid[0:ny, 0:nx]
@@ -244,14 +338,15 @@ def reconstruct_volume(frames, phis, UB, R0, detector, *, phi0,
     nvox = nh * nkl
     corr = _resolve_corrections(corrections, detector, r_lab)
     lo = np.asarray([lo_h, lo_k, lo_l], np.float32)
-    ssum = np.zeros(nvox, np.float64)
-    scount = np.zeros(nvox, np.int64)
-    ssq = np.zeros(nvox, np.float64)          # sum of g^2 * max(r, 1)
+    ssum = [np.zeros(nvox, np.float64) for _ in range(n_groups)]
+    scount = [np.zeros(nvox, np.int64) for _ in range(n_groups)]
+    ssq = [np.zeros(nvox, np.float64) for _ in range(n_groups)]   # sum of g^2 * max(r, 1)
     UBinv = np.linalg.inv(UB)
 
-    for i, (phi, img_host) in enumerate(zip(phis, _prefetch(frames, read_fn, 2))):
-        Rn = _axis_rot(osc_axis, sense * (phi - phi0)) @ R0
-        Mn = (UBinv @ Rn.T).astype(np.float32)
+    stream = _frame_stream(frames, read_fn, frame_fn, 2)
+    for i, (phi, (img_host, fix)) in enumerate(zip(phis, stream)):
+        _cancel_check(cancelled)
+        Mn = frame_matrix(UBinv, R0, osc_axis, sense, phi, phi0)
         img = img_host.ravel()
         vi = np.floor((r_lab @ Mn.T - lo) / step).astype(np.int64)
         inb = ((img >= 0)
@@ -260,24 +355,38 @@ def reconstruct_volume(frames, phis, UB, R0, detector, *, phi0,
                & (vi[:, 2] >= 0) & (vi[:, 2] < nl))
         if hot is not None:
             inb &= img < hot
+        if fix is not None:
+            off, gain = fix
+            if gain is not None:
+                gain = np.asarray(gain).ravel().astype(np.float64)
+                inb &= np.isfinite(gain)
         flat = vi[inb, 0] * nkl + vi[inb, 1] * nl + vi[inb, 2]
         r = img[inb].astype(np.float64)
-        w = r
-        w2 = np.maximum(r, 1.0)
-        if corr is not None:
-            g = corr[inb]
-            w = r * g
-            w2 = w2 * g * g
-        ssum += np.bincount(flat, weights=w, minlength=nvox)
-        scount += np.bincount(flat, minlength=nvox)
-        ssq += np.bincount(flat, weights=w2, minlength=nvox)
+        if fix is None:
+            w = r
+            w2 = np.maximum(r, 1.0)
+            if corr is not None:
+                g = corr[inb]
+                w = r * g
+                w2 = w2 * g * g
+        else:
+            ga = gain[inb] if gain is not None else np.ones_like(r)
+            if corr is not None:
+                ga = corr[inb] * ga
+            c = r
+            if off is not None:
+                c = r - np.asarray(off).ravel().astype(np.float64)[inb]
+            w = c * ga
+            w2 = np.maximum(r, 1.0) * ga * ga
+        gi = 0 if gidx is None else int(gidx[i])
+        ssum[gi] += np.bincount(flat, weights=w, minlength=nvox)
+        scount[gi] += np.bincount(flat, minlength=nvox)
+        ssq[gi] += np.bincount(flat, weights=w2, minlength=nvox)
         if progress_callback:
             progress_callback(i + 1, len(frames))
 
-    vol, var = _mean_and_variance(ssum, scount, ssq)
-    return Volume(vol.reshape(nh, nk, nl), H, K, L,
-                  np.asarray(UB), scount.reshape(nh, nk, nl), detector.wavelength,
-                  var.reshape(nh, nk, nl))
+    return _assemble(H, K, L, UB, detector.wavelength, (nh, nk, nl),
+                     list(zip(ssum, scount, ssq)))
 
 
 # ---------------------------------------------------------------- adapters
@@ -337,34 +446,111 @@ def reconstruct_to_volumedata(vol: Volume, source_folder=None, extra_meta=None):
                       variance=vol.variance)
 
 
-# ---------------------------------------------------------------- high level
-def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
-                        step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
-                        hot=None, use_gpu=True, device=0, prefetch=4, par_path=None,
-                        use_tabbin=False, progress_callback=None, log=None):
-    """One call: locate the cracker par + CBF frames, read the UB, get the
-    orientation, and reconstruct. Returns (Volume, info_dict).
 
-    use_tabbin : if True, fit the full geometry (detector pose, oscillation axis,
-        R0) from the CrysAlisPro peak-hunt tabbin (calibrate.geometry_from_tabbin) -
-        instrument-agnostic and robust to a wrong header or powder contamination.
-        If False, index frame 1 (orient_from_frame) assuming the header geometry and
-        a lab-Y oscillation axis (works for clean, correctly-headered datasets).
-    par_path : explicit .par to use (e.g. in a subfolder); else searched in `folder`.
-        It is also the par the tabbin calibration uses.
-    bins : (bh, bk, bl) factors that you will give to `bin_volume` before
-        symmetrisation. The grid is built so that hkl = 0 is a voxel centre
-        after this binning (see `_axes`). Use the default (1, 1, 1) if you do
-        not bin.
-    hot : raw-count cutoff above which pixels are ignored; None (default) keeps
-        every pixel, so saturated Bragg pixels are never clipped silently.
-    corrections : True applies solid-angle + polarisation corrections with the
-        beam polarised perpendicular to the oscillation axis (horizontal for the
-        usual vertical rotation axis); a dict is passed to `pixel_corrections`
-        (e.g. `horizontal=` to override the polarisation axis); an array is used
-        as is.
-    `log` is an optional callable(str) for human-readable progress lines.
+
+# ---------------------------------------------------------------- setup of a dataset
+@dataclass
+class ReconSetup:
+    """Geometry, frames and grid of one raw-frame dataset.
+
+    The fields are the arguments of `reconstruct_volume` and
+    `reconstruct_volume_gpu`. Make the setup one time (`prepare_setup`, or
+    `reconstruct_dataset(..., keep_setup=True)` in `info['setup']`). Then
+    each frame tool makes its passes over the frames without a new geometry
+    fit.
+
+    frames : frame paths (or keys of `read_fn`), in scan order.
+    numbers : frame numbers. The split into halves uses them.
+    phis : rotation angle of each frame in degrees.
+    corrections : per-pixel correction array (solid angle and polarisation),
+        or None.
+    hot : raw-count cutoff. Pixels at or above it are not used. None keeps all.
+    read_fn : callable(frame) -> int image. None reads the file with fabio.
+    meta : names and text values for the metadata (not used in passes).
     """
+    frames: list
+    numbers: list
+    phis: list
+    detector: Any
+    UB: np.ndarray
+    R0: np.ndarray
+    phi0: float
+    osc_axis: tuple = (0, 1, 0)
+    sense: int = 1
+    increment: float = 0.0
+    corrections: Any = None
+    ranges: tuple = ((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0))
+    step: float = 0.025
+    bins: tuple = (1, 1, 1)
+    hot: float | None = None
+    read_fn: Callable | None = None
+    device: int = 0
+    prefetch: int = 4
+    meta: dict = field(default_factory=dict)
+
+    @property
+    def n_frames(self) -> int:
+        return len(self.frames)
+
+    def reader(self) -> Callable:
+        """The function that reads one frame."""
+        return self.read_fn or _default_read_fn()
+
+    def halves_groups(self) -> np.ndarray:
+        """Group of each frame for the split into halves: 0 = odd frame number, 1 = even."""
+        return (np.asarray(self.numbers, np.int64) % 2 == 0).astype(np.int64)
+
+    def reconstruct(self, *, positions=None, groups=None, frame_fn=None, use_gpu=True,
+                    progress_callback=None, cancelled=None) -> Volume:
+        """Run the engine on all frames, or on the frame `positions` (indices into `frames`).
+
+        `frame_fn(i, img)` gets the position i in `frames`, also with `positions`.
+        """
+        if positions is None:
+            pos = list(range(self.n_frames))
+        else:
+            pos = [int(p) for p in positions]
+        fn = frame_fn
+        if frame_fn is not None and positions is not None:
+            fn = (lambda j, img: frame_fn(pos[j], img))
+        g = None if groups is None else np.asarray(groups)[pos]
+        gpu = use_gpu and has_cupy(self.device)
+        recon = reconstruct_volume_gpu if gpu else reconstruct_volume
+        return recon([self.frames[i] for i in pos], [self.phis[i] for i in pos],
+                     self.UB, self.R0, self.detector, phi0=self.phi0,
+                     osc_axis=self.osc_axis, sense=self.sense, ranges=self.ranges,
+                     step=self.step, bins=self.bins, read_fn=self.read_fn, hot=self.hot,
+                     corrections=self.corrections, progress_callback=progress_callback,
+                     device=self.device, prefetch=self.prefetch, groups=g, frame_fn=fn,
+                     cancelled=cancelled)
+
+
+def _checked_halves(setup: ReconSetup) -> np.ndarray:
+    """`setup.halves_groups()`. Raises ValueError if the frames do not have the two parities."""
+    g = setup.halves_groups()
+    if np.unique(g).size < 2:
+        raise ValueError("The split into halves needs odd and even frame numbers. "
+                         "All frames have the same parity.")
+    return g
+
+
+def gpu_memory_bytes(n_voxels: int, halves: bool = False) -> int:
+    """GPU accumulator memory of one reconstruction pass in bytes.
+
+    Each frame group needs a float64 sum, an int32 count and a float64 sum of
+    squares (20 bytes per voxel). The split into halves uses two groups."""
+    return int(n_voxels) * 20 * (2 if halves else 1)
+
+
+# ---------------------------------------------------------------- high level
+def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
+                  step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
+                  hot=None, device=0, prefetch=4, par_path=None, use_tabbin=False,
+                  log=None) -> ReconSetup:
+    """Find the frames and the par file of `folder`, get the geometry and make a `ReconSetup`.
+
+    The arguments are those of `reconstruct_dataset`. The function does not
+    read the frames for the volume."""
     import os
 
     say = log or (lambda *_: None)
@@ -434,30 +620,93 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
     else:
         corr, polarization_axis = corrections, "explicit array"
 
-    gpu = use_gpu and has_cupy(device)
-    recon = reconstruct_volume_gpu if gpu else reconstruct_volume
-    say(f"reconstructing {n}/{n_total} frames on {'GPU' if gpu else 'CPU'}, "
-        f"grid {[list(r) for r in ranges]} dq={step} ...")
-    t0 = time.time()
-    vol = recon(frames, phis, UB, R0, det, phi0=phi0, osc_axis=osc_axis, sense=sense,
-                ranges=ranges, step=step, bins=bins, hot=hot, corrections=corr,
-                progress_callback=progress_callback, device=device, prefetch=prefetch)
-    dt = time.time() - t0
-
-    info = {
-        "par": par_path, "name": name, "n_frames": n, "n_total": n_total,
-        "phi0": phi0, "increment": incr, "index_rms": geom_rms,
-        "index_inliers": geom_inl, "geom_hkl_dev": geom_dev,
-        "osc_axis": osc_axis, "sense": sense, "cell": cell, "gpu": gpu,
-        "time_s": dt, "ms_per_frame": 1e3 * dt / max(n, 1),
-        "measured_voxels": int((vol.counts > 0).sum()),
-        "total_voxels": int(vol.data.size),
-        "corrections": bool(corr is not None),
-        "polarization_axis": polarization_axis,
-        "hot_pixel_cutoff": hot,
+    meta = {
+        "par": par_path, "name": name, "folder": folder, "n_total": n_total,
+        "index_rms": geom_rms, "index_inliers": geom_inl, "geom_hkl_dev": geom_dev,
+        "cell": cell, "polarization_axis": polarization_axis,
         "geometry_method": "tabbin" if use_tabbin else "indexed_first_frame",
         "missing_frame_numbers": missing,
     }
+    return ReconSetup(frames=list(frames), numbers=[int(v) for v in nums], phis=phis,
+                      detector=det, UB=UB, R0=R0, phi0=phi0, osc_axis=osc_axis,
+                      sense=sense, increment=incr, corrections=corr, ranges=ranges,
+                      step=step, bins=bins, hot=hot, read_fn=None, device=device,
+                      prefetch=prefetch, meta=meta)
+
+
+def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
+                        step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
+                        hot=None, use_gpu=True, device=0, prefetch=4, par_path=None,
+                        use_tabbin=False, progress_callback=None, log=None,
+                        halves=False, cancelled=None, keep_setup=False):
+    """One call: locate the cracker par + CBF frames, read the UB, get the
+    orientation, and reconstruct. Returns (Volume, info_dict).
+
+    use_tabbin : if True, fit the full geometry (detector pose, oscillation axis,
+        R0) from the CrysAlisPro peak-hunt tabbin (calibrate.geometry_from_tabbin) -
+        instrument-agnostic and robust to a wrong header or powder contamination.
+        If False, index frame 1 (orient_from_frame) assuming the header geometry and
+        a lab-Y oscillation axis (works for clean, correctly-headered datasets).
+    par_path : explicit .par to use (e.g. in a subfolder); else searched in `folder`.
+        It is also the par the tabbin calibration uses.
+    bins : (bh, bk, bl) factors that you will give to `bin_volume` before
+        symmetrisation. The grid is built so that hkl = 0 is a voxel centre
+        after this binning (see `_axes`). Use the default (1, 1, 1) if you do
+        not bin.
+    hot : raw-count cutoff above which pixels are ignored; None (default) keeps
+        every pixel, so saturated Bragg pixels are never clipped silently.
+    corrections : True applies solid-angle + polarisation corrections with the
+        beam polarised perpendicular to the oscillation axis (horizontal for the
+        usual vertical rotation axis); a dict is passed to `pixel_corrections`
+        (e.g. `horizontal=` to override the polarisation axis); an array is used
+        as is.
+    halves : if True, the same pass also makes the odd-frame and the
+        even-frame volumes (frame-number parity). They are in `vol.parts`
+        (odd first). The GPU needs two times the accumulator memory. The
+        frames must have odd and even numbers. Else the function raises
+        ValueError.
+    cancelled : optional callable. It is called once per frame. If it returns
+        True, the pass stops with `averaging.Cancelled`.
+    `log` is an optional callable(str) for human-readable progress lines.
+    keep_setup : if True, `info['setup']` is the `ReconSetup` of the run.
+        Frame tools use it for more passes. It is not a JSON value. Remove it
+        before you serialise `info`, for example
+        `{k: v for k, v in info.items() if k != 'setup'}`. With the default
+        (False), `info` has no 'setup' key.
+    """
+    say = log or (lambda *_: None)
+    setup = prepare_setup(folder, ranges=ranges, step=step, bins=bins, nframes=nframes,
+                          corrections=corrections, hot=hot, device=device,
+                          prefetch=prefetch, par_path=par_path, use_tabbin=use_tabbin,
+                          log=log)
+    n, n_total = setup.n_frames, setup.meta["n_total"]
+    gpu = use_gpu and has_cupy(device)
+    say(f"reconstructing {n}/{n_total} frames on {'GPU' if gpu else 'CPU'}, "
+        f"grid {[list(r) for r in ranges]} dq={step} ...")
+    t0 = time.time()
+    vol = setup.reconstruct(groups=_checked_halves(setup) if halves else None, use_gpu=gpu,
+                            progress_callback=progress_callback, cancelled=cancelled)
+    dt = time.time() - t0
+
+    m = setup.meta
+    info = {
+        "par": m["par"], "name": m["name"], "n_frames": n, "n_total": n_total,
+        "phi0": setup.phi0, "increment": setup.increment, "index_rms": m["index_rms"],
+        "index_inliers": m["index_inliers"], "geom_hkl_dev": m["geom_hkl_dev"],
+        "osc_axis": setup.osc_axis, "sense": setup.sense, "cell": m["cell"], "gpu": gpu,
+        "time_s": dt, "ms_per_frame": 1e3 * dt / max(n, 1),
+        "measured_voxels": int((vol.counts > 0).sum()),
+        "total_voxels": int(vol.data.size),
+        "corrections": bool(setup.corrections is not None),
+        "polarization_axis": m["polarization_axis"],
+        "hot_pixel_cutoff": hot,
+        "geometry_method": m["geometry_method"],
+        "missing_frame_numbers": m["missing_frame_numbers"],
+    }
+    if keep_setup:
+        info["setup"] = setup
+    if halves:
+        info["halves_rule"] = "frame-number parity: part 0 = odd numbers, part 1 = even numbers"
     say(f"done in {dt:.1f}s ({info['ms_per_frame']:.1f} ms/frame); measured "
         f"{info['measured_voxels']:,}/{info['total_voxels']:,} voxels "
         f"({100*info['measured_voxels']/info['total_voxels']:.1f}%)")

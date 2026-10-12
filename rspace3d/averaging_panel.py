@@ -24,6 +24,18 @@ with `choice_metadata()`.
 The calculations are in `rspace3d.averaging` (`measure_volume`,
 `compare_candidates`). The panel keeps the reference volume, G and slices.
 It keeps no full candidate volume.
+
+Frame tools (raw-frame data only): the group is hidden until the host calls
+`enable_frame_tools(frame_request)`. The volume builder does not call it.
+`frame_request()` runs in the GUI thread. It returns a dict with these keys:
+'setup' (`rawrecon.ReconSetup`), 'raw' (the uncorrected VolumeData), 'laue',
+'use_gpu' and 'bin' (a function that bins a volume with the factors of the
+host). If the tools cannot run, it raises ValueError with a message for the
+user. The group makes
+corrected volumes (ring mask, ring mask + frame model), the odd-frame and
+even-frame halves of the selected volume and a frame map. The host gets the
+selected volume with `selected_volume()` (None = the uncorrected volume) and
+the signal `volume_changed` when the selection changes.
 """
 
 from __future__ import annotations
@@ -42,10 +54,12 @@ from PyQt6.QtWidgets import (
 import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.colors import LogNorm
 from matplotlib.figure import Figure
 
 from . import averaging as av
 from . import orbit_engine as oe
+from .averaging import FRAME_MAP_DEFINITION
 
 # Orbit members (voxels x operations) of the automatic crop. With the NumPy
 # engine, the slowest candidate ('adaptive, model 4') then takes less than
@@ -57,6 +71,47 @@ LOG_HEIGHT = 230
 
 EXTRA_TIP ='Sum ratio at the extra positions. The last Compare had no extra positions.'
 OLD_ROWS = QColor('#999999')
+
+# Frame tools: the steps, the volume slots and their names
+FRAME_STEPS = ('Split-half check', 'Frame map', 'Ring mask', 'Frame model')
+SLOT_NAMES = {'none': 'no correction', 'mask': 'ring mask', 'model': 'ring mask + frame model'}
+HALVES_RULE = 'frame-number parity: odd numbers, then even numbers'
+SPLIT_HEADER = 'split-half'
+SPLIT_TIP = ('Split-half difference (total) of the last Split-half check. Lower is better.\n'
+             + av.SPLIT_HALF_DEFINITION)
+FRAME_MAP_RANGE = 1.5   # the colour scale of the frame map goes from 1 / 1.5 to 1.5
+# Rows of the drawn frame map. The axes are at least about 200 px high (canvas
+# 300 px), so each drawn row gets at least one screen pixel.
+FRAME_MAP_ROWS = 200
+NO_RING_HINT = ('The ring detector needs frames without the rings before or after the ring '
+                'event in the selected frames. If all selected frames have the rings, it finds '
+                'no ring. The ring mask depends on the selected frames. Check the number of '
+                'ring frames after a change of the frame count.')
+FRAME_HELP = (
+    'Volume: the volume that Measure, Compare and the symmetrise step of this window use. '
+    'Ring mask: one pass finds powder rings in the frames. One more pass makes a volume '
+    'without the ring pixels. Frame model: the ring mask, then 3 iterations of a model of '
+    'the extra counts and the scale of each frame and 5-degree sector (6 more passes). '
+    'Frame map: one pass compares each frame with the leave-one-out orbit median of the '
+    'selected volume. The first use also needs the ring statistics pass. The frames are not '
+    'corrected with the frame model in this pass. ' + FRAME_MAP_DEFINITION + ' The colour '
+    'scale is logarithmic. White is 1, red is more counts and blue is fewer counts than in '
+    f'the other frames. The scale stops at 1/{FRAME_MAP_RANGE:g} and {FRAME_MAP_RANGE:g}. '
+    'Larger deviations get the end colour. Grey cells have no prediction. On a long scan, '
+    'one image row shows a block of frames. The row shows the value of the block that is '
+    'farthest from 1. ' + NO_RING_HINT + ' Split-half check: one pass '
+    'makes the '
+    'odd-frame and the even-frame halves of the selected volume. Each candidate is then '
+    'applied to each half. '
+    'Split-half difference: ' + av.SPLIT_HALF_DEFINITION + ' Lower is better. It does not '
+    'see contamination that is the same in the two halves. A new reconstruction, a new '
+    'folder, grid or frame count removes the results of the frame tools. A new Laue group '
+    'removes the frame model volume and the frame map. Validated scope: Laue group mmm and '
+    '0.2 degree frames (I15 and I19-2 data). Other Laue groups and frame widths work, but '
+    'they are not validated.')
+FRAME_TOOLS_PLACE = ('The Frame tools group is below Measure, Compare and Results. '
+                     'Scroll down to see it.')
+FRAME_MAP_EMPTY = 'Frame map: click Frame map or Frame model. The map shows here.'
 
 
 def engine_name() -> str:
@@ -135,14 +190,19 @@ class PanelWorker(QThread):
         self.args = args
 
     def run(self) -> None:
+        stopped = True
         try:
             self.finished.emit(self.func(*self.args, log=self.log_msg.emit,
                                          progress=self.progress.emit))
+            stopped = False
         except av.Cancelled:
             self.cancelled.emit()
         except Exception as e:
             import traceback
             self.error.emit(f"{e}\n{traceback.format_exc()}")
+        if stopped:
+            # The arrays of the stopped job are free now. Give their GPU memory back.
+            oe._free_gpu_memory()
 
 
 def _measure_job(volume_fn: Callable[..., Any], laue: str, crop: int | str | None,
@@ -167,7 +227,179 @@ def _measure_job(volume_fn: Callable[..., Any], laue: str, crop: int | str | Non
     measured = av.measure_volume(work, laue, use_gpu=use_gpu, log=log, progress=progress,
                                  cancelled=cancelled)
     return {'volume': vol, 'work': work, 'cropped': work is not vol, 'region': region,
-            'laue': laue, 'measured': measured}
+            'laue': laue, 'measured': measured,
+            'crop': int(crop) if work is not vol else None}
+
+
+# ── frame tools: helpers ──
+
+def reduce_frame_rows(nr: Any, max_rows: int = FRAME_MAP_ROWS) -> tuple[Any, int]:
+    """Frame map rows for the display and the number of frames per row.
+
+    If the map has more than `max_rows` frames, each row is a block of
+    frames. Per block and sector, the row keeps the finite value with the
+    largest |log(value)|. Thus a short event stays visible. A block without
+    a finite value stays NaN.
+    """
+    n, ns = nr.shape
+    nb = max(1, -(-n // max_rows))
+    if nb == 1:
+        return nr, 1
+    m = -(-n // nb)
+    pad = np.full((m * nb, ns), np.nan, np.float32)
+    pad[:n] = nr
+    blk = pad.reshape(m, nb, ns)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dev = np.abs(np.log(blk))
+    dev = np.where(np.isfinite(dev), dev, -1.0)
+    idx = dev.argmax(axis=1)
+    return np.take_along_axis(blk, idx[:, None, :], axis=1)[:, 0, :], nb
+
+
+def _gpu_free_bytes(device: int = 0) -> int | None:
+    """Free GPU memory in bytes (with the free blocks of the CuPy pool), or None."""
+    try:
+        import cupy as cp
+        with cp.cuda.Device(device):
+            free = cp.cuda.runtime.memGetInfo()[0]
+            return int(free + cp.get_default_memory_pool().free_bytes())
+    except Exception:
+        return None
+
+
+def halves_gpu_note(n_voxels: int, free_bytes: int | None) -> str | None:
+    """A note if the GPU accumulators of a halves pass need more than 0.7 x the free memory.
+
+    The same limit as the memory warning of the reconstruction GUI. None if
+    they fit or if the free memory is not known."""
+    from .rawrecon.engine import gpu_memory_bytes
+    need = gpu_memory_bytes(n_voxels, halves=True)
+    if free_bytes is None or need <= 0.7 * free_bytes:
+        return None
+    return (f'Split-half check: the halves pass needs about {need / 1e9:.1f} GB of GPU memory '
+            f'(two halves, 40 bytes per voxel). The GPU has {free_bytes / 1e9:.1f} GB free. '
+            'The halves pass uses the CPU.')
+
+
+# ── frame tools: jobs (worker thread, no change to the panel) ──
+
+def _rings_job(req: dict[str, Any], rings: dict[str, Any] | None, cancelled: Callable[[], bool],
+               log: Callable[[str], None], progress: Callable[[int, int], None],
+               found: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The kept ring detection, or a new one (one pass over the frames).
+
+    A new detection also goes into found['rings'] at once. The panel then
+    keeps it if a later stage of the job stops."""
+    if rings is not None:
+        return rings
+    from .rawrecon import frames as ft
+    from .rawrecon import rings as rg
+    from .rawrecon.frame_model import frame_scale_of
+    setup = req['setup']
+    log('Ring statistics: one pass over the frames.')
+    polar = rg.PixelPolar.of(setup.detector)
+    stats = rg.ring_statistics(setup, use_gpu=req['use_gpu'], progress=progress,
+                               cancelled=cancelled, log=log, polar=polar)
+    det = rg.detect_rings(stats, frame_scale=frame_scale_of(setup.increment))
+    summary = ft._jsonable(dict(mode='detected', **det.summary(stats.n1)))
+    del stats
+    radii = sorted({float(t['r']) for _, _, tab in det.windows for t in tab})
+    log(f"Rings: {summary['ring_windows']} event(s), {summary['ring_frames']} frames, "
+        f"{len(radii)} ring radii.")
+    out = {'mask': rg.RingMask.from_detection(polar, det) if det.found else None,
+           'summary': summary, 'radii_px': radii,
+           'radii_q': [float(rg.q_of_radius(setup.detector, r)) for r in radii]}
+    if found is not None:
+        found['rings'] = out
+    return out
+
+
+def _ring_record(vols: list[Any], rings: dict[str, Any]) -> None:
+    """Put the ring detection into metadata['frame_tools']['rings'] of each volume."""
+    for vd in vols:
+        info = vd.metadata.get('frame_tools')
+        if info is None:
+            continue
+        rec = dict(rings['summary'])
+        frac = (info.get('rings') or {}).get('masked_pixel_frac_total')
+        if frac is not None:
+            rec['masked_pixel_frac_total'] = frac
+        info['rings'] = rec
+
+
+def _ring_mask_job(req: dict[str, Any], rings: dict[str, Any] | None, found: dict[str, Any],
+                   cancelled: Callable[[], bool], log: Callable[[str], None],
+                   progress: Callable[[int, int], None]) -> dict[str, Any]:
+    """Ring detection (if not kept) and the volume with the ring mask."""
+    from .rawrecon import frames as ft
+    rings = _rings_job(req, rings, cancelled, log, progress, found)
+    res = ft.run_frame_chain(req['setup'], req['laue'], rings=rings['mask'], frame_model=False,
+                             raw=req['raw'], use_gpu=req['use_gpu'], progress=progress,
+                             cancelled=cancelled, log=log)
+    _ring_record([res.corrected], rings)
+    return {'rings': rings, 'mask': res.corrected}
+
+
+def _frame_model_job(req: dict[str, Any], rings: dict[str, Any] | None, found: dict[str, Any],
+                     need_mask: bool, cancelled: Callable[[], bool], log: Callable[[str], None],
+                     progress: Callable[[int, int], None]) -> dict[str, Any]:
+    """Ring detection (if not kept) and the frame chain (ring mask + frame model, 3 iterations)."""
+    from .rawrecon import frames as ft
+    rings = _rings_job(req, rings, cancelled, log, progress, found)
+    res = ft.run_frame_chain(req['setup'], req['laue'], rings=rings['mask'], frame_model=True,
+                             iterations=3, raw=req['raw'], use_gpu=req['use_gpu'],
+                             keep_tables=True, keep_masked=need_mask, progress=progress,
+                             cancelled=cancelled, log=log)
+    mask = res.masked if need_mask else None
+    _ring_record([res.corrected] + ([mask] if mask is not None else []), rings)
+    return {'rings': rings, 'model': res.corrected, 'mask': mask, 'tables': res.model,
+            'map': res.frame_map}
+
+
+def _frame_map_job(req: dict[str, Any], rings: dict[str, Any] | None, found: dict[str, Any],
+                   volume: Any, use_mask: bool, cancelled: Callable[[], bool],
+                   log: Callable[[str], None],
+                   progress: Callable[[int, int], None]) -> dict[str, Any]:
+    """Ring detection (if not kept) and the frame map of `volume`."""
+    from .rawrecon import frames as ft
+    rings = _rings_job(req, rings, cancelled, log, progress, found)
+    log('Frame map: one pass compares each frame with the leave-one-out orbit median.')
+    fmap = ft.frame_map(req['setup'], volume, req['laue'],
+                        mask=rings['mask'] if use_mask else None, rings=rings['radii_px'],
+                        use_gpu=req['use_gpu'], progress=progress, cancelled=cancelled, log=log)
+    return {'rings': rings, 'map': fmap}
+
+
+def _split_job(req: dict[str, Any], slot: str, rings: dict[str, Any] | None, tables: Any,
+               halves: list[Any] | None, laue: str, crop: int | None,
+               cands: list[dict[str, Any]], cancelled: Callable[[], bool],
+               log: Callable[[str], None], progress: Callable[[int, int], None]) -> dict[str, Any]:
+    """Halves of the volume in `slot` (one pass, if not kept) and their split-half differences."""
+    from .rawrecon import frames as ft
+    from .rawrecon.engine import reconstruct_to_volumedata
+    if halves is None:
+        from .rawrecon.engine import _checked_halves
+        setup = req['setup']
+        groups = _checked_halves(setup)
+        log(f"Split halves: one pass makes the odd-frame and the even-frame halves of "
+            f"'{SLOT_NAMES[slot]}'.")
+        if slot == 'model' and tables is None:
+            raise ValueError('The frame model tables are not available. Click Frame model again.')
+        mask = rings['mask'] if (rings is not None and slot != 'none') else None
+        model = tables if slot == 'model' else None
+        vol = ft.corrected_reconstruction(setup, model=model, mask=mask, groups=groups,
+                                          use_gpu=req.get('halves_gpu', req['use_gpu']),
+                                          progress=progress, cancelled=cancelled)
+        halves = [reconstruct_to_volumedata(p) for p in vol.parts]
+        del vol
+    work = [req['bin'](h) for h in halves]
+    if crop:
+        work = [av.centred_crop(w, crop) for w in work]
+    split = av.compare_split_halves(work[0], work[1], laue, cands, use_gpu=req['use_gpu'],
+                                    log=log, progress=progress, cancelled=cancelled)
+    split['halves_rule'] = HALVES_RULE
+    split['volume'] = SLOT_NAMES[slot]
+    return {'halves': halves, 'split': split}
 
 
 class AveragingPanel(QWidget):
@@ -175,6 +407,7 @@ class AveragingPanel(QWidget):
 
     busy_changed = pyqtSignal(bool)
     applied_changed = pyqtSignal()
+    volume_changed = pyqtSignal()        # frame tools: the selected volume changed
 
     def __init__(self, request: Callable[[], tuple[str, Callable[..., Any]]],
                  log: Callable[[str], None] | None = None,
@@ -195,13 +428,30 @@ class AveragingPanel(QWidget):
         self._cancel_flag = False
         self._saved_text = ''                    # label text before the job, for Cancel
         self._measured_once = False
+        # Frame tools (see the module docstring). The panel keeps at most the
+        # volumes of the slots 'mask' and 'model' and the two halves of the
+        # selected slot. The host keeps the uncorrected volume (slot 'none').
+        self._frame_request: Callable[[], dict[str, Any]] | None = None
+        self._slot = 'none'                      # the selected volume
+        self._fvols: dict[str, Any] = {}         # slot -> VolumeData (not binned)
+        self._fnotes: dict[str, str] = {}        # slot -> note for the volume list
+        self._rings: dict[str, Any] | None = None    # output of _rings_job
+        self._found: dict[str, Any] = {}         # ring detection of the running job
+        self._released: str | None = None        # slot that the running job removed first
+        self._tables: Any = None                 # FrameModel of the slot 'model'
+        self._halves: tuple[str, list[Any]] | None = None   # (slot, [odd, even]), not binned
+        self._split: dict[str, Any] | None = None    # compare_split_halves of the measured region
+        self._fmap: tuple[str, Any, str] | None = None    # (title, FrameMap, source slot)
+        self._fsummary: dict[str, dict[str, Any]] = {}   # slot -> values for the volume table
         self._build_ui()
         self.reset('')
 
     # ── UI ──
 
     def _build_ui(self) -> None:
-        outer = QHBoxLayout(self)
+        page = QVBoxLayout(self)
+        outer = QHBoxLayout()
+        page.addLayout(outer, stretch=1)
         left = QVBoxLayout()
         right = QVBoxLayout()
         outer.addLayout(left, stretch=4)
@@ -360,7 +610,9 @@ class AveragingPanel(QWidget):
         self.limits_label.setWordWrap(True)
         self.limits_label.setStyleSheet('color: #a05000;')
         v3.addWidget(self.limits_label)
-        self.figure = Figure(figsize=(6.4, 2.8), layout='constrained')
+        # 'compressed' keeps the axis labels of the equal-aspect slices inside the
+        # canvas after a resize ('constrained' can cut the left label).
+        self.figure = Figure(figsize=(6.4, 2.8), layout='compressed')
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setMinimumHeight(260)
         v3.addWidget(self.canvas, stretch=1)
@@ -388,6 +640,93 @@ class AveragingPanel(QWidget):
         v4.addWidget(self.applied_label)
         right.addWidget(g4)
 
+        # Frame tools (raw-frame data only, hidden until enable_frame_tools)
+        self.frame_group = self._build_frame_group()
+        self.frame_group.setVisible(False)
+        page.addWidget(self.frame_group)
+
+    def _build_frame_group(self) -> QGroupBox:
+        g = QGroupBox('Frame tools')
+        row = QHBoxLayout(g)
+        v = QVBoxLayout()
+        row.addLayout(v, stretch=4)
+        self.frame_help = QLabel(FRAME_HELP)
+        self.frame_help.setWordWrap(True)
+        self.frame_help.setStyleSheet('color: #555;')
+        v.addWidget(self.frame_help)
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel('Volume:'))
+        self.volume_combo = QComboBox()
+        self.volume_combo.setMinimumWidth(200)
+        self.volume_combo.setToolTip('The volume for Measure, Compare and the symmetrise step.\n'
+                                     'A change removes the results of Measure and Compare.')
+        self.volume_combo.currentIndexChanged.connect(self._on_volume_selected)
+        sel_row.addWidget(self.volume_combo, stretch=1)
+        v.addLayout(sel_row)
+        b_row = QHBoxLayout()
+        self.split_btn = QPushButton('Split-half check')
+        self.split_btn.setToolTip('Make the odd-frame and the even-frame halves of the selected\n'
+                                  'volume (one pass) and calculate the split-half difference of\n'
+                                  'each candidate. Click Measure first.\n'
+                                  'The halves pass needs about 120 bytes per voxel of host\n'
+                                  'memory at its peak (about 55 bytes for a plain pass).\n'
+                                  'On the GPU it needs 40 bytes per voxel (20 bytes for a\n'
+                                  'plain pass). If that is more than 70 % of the free GPU\n'
+                                  'memory, the halves pass uses the CPU.')
+        self.map_btn = QPushButton('Frame map')
+        self.map_btn.setToolTip('Compare each frame and 5-degree sector with the leave-one-out\n'
+                                'orbit median of the selected volume (one pass). The first use\n'
+                                'also runs the ring statistics pass. The frames are not\n'
+                                'corrected with the frame model in this pass.')
+        self.ring_btn = QPushButton('Ring mask')
+        self.ring_btn.setToolTip('Find powder rings and make a volume without the ring pixels.')
+        self.model_btn = QPushButton('Frame model')
+        self.model_btn.setToolTip('Ring mask and frame model (3 iterations). This makes the\n'
+                                  "volume 'ring mask + frame model'.\n"
+                                  'Host memory at the peak (measured): 6.0 GB more than before\n'
+                                  'the run for 1735 frames, 1785 radial bins and a grid of\n'
+                                  '297 x 297 x 241 voxels.')
+        self.frame_cancel_btn = QPushButton('Cancel')
+        self.frame_cancel_btn.setToolTip('Stop the frame tool after the current frame.\n'
+                                         'The panel keeps the earlier results and a finished\n'
+                                         'ring detection. A new Ring mask or Frame model run\n'
+                                         'removes the earlier volume of that step when it starts.')
+        self.split_btn.clicked.connect(self._split_check)
+        self.map_btn.clicked.connect(self._frame_map)
+        self.ring_btn.clicked.connect(self._ring_mask)
+        self.model_btn.clicked.connect(self._frame_model)
+        self.frame_cancel_btn.clicked.connect(self.cancel)
+        for w in (self.split_btn, self.map_btn, self.ring_btn, self.model_btn,
+                  self.frame_cancel_btn):
+            b_row.addWidget(w)
+        v.addLayout(b_row)
+        self.frame_label = QLabel()
+        self.frame_label.setWordWrap(True)
+        self.frame_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.frame_label)
+        self.volumes_table = QTableWidget(0, 5)
+        self.volumes_table.setHorizontalHeaderLabels(
+            ['volume', 'suggestion', 'score', SPLIT_HEADER, 'split diffuse'])
+        ref = av.BIAS_REFERENCE
+        for j, tip in ((2, f"Score of '{ref}' in the last Compare of this volume."),
+                       (3, f"Split-half difference (total) of '{ref}'."),
+                       (4, f"Split-half difference of '{ref}' outside the nodes.")):
+            self.volumes_table.horizontalHeaderItem(j).setToolTip(tip)
+        self._setup_table(self.volumes_table)
+        self.volumes_table.setFixedHeight(20 * 3 + 30)
+        v.addWidget(self.volumes_table)
+        self.split_table = QTableWidget(0, 0)
+        self.split_table.setToolTip(av.SPLIT_HALF_DEFINITION)
+        self._setup_table(self.split_table)
+        self.split_table.setFixedHeight(20 * (3 + oe.N_SHELLS) + 30)
+        self.split_table.setVisible(False)       # shown when a split-half result exists
+        v.addWidget(self.split_table)
+        self.frame_figure = Figure(figsize=(6.4, 3.0), layout='constrained')
+        self.frame_canvas = FigureCanvasQTAgg(self.frame_figure)
+        self.frame_canvas.setMinimumHeight(300)
+        row.addWidget(self.frame_canvas, stretch=5)
+        return g
+
     @staticmethod
     def _setup_table(t: QTableWidget) -> None:
         t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -407,6 +746,8 @@ class AveragingPanel(QWidget):
         had = self._state is not None or self._applied is not None
         was_applied = self._applied is not None
         self._state = self._compared = self._applied = self._suggestion = None
+        self._split = None
+        self._show_split()
         self.shell_table.clearContents()
         self.result_table.setRowCount(0)
         self.result_table.horizontalHeaderItem(3).setToolTip(EXTRA_TIP)
@@ -469,6 +810,10 @@ class AveragingPanel(QWidget):
         self.clear_btn.setEnabled(idle and self._applied is not None)
         self.measure_cancel_btn.setEnabled(self._busy and self._step == 'Measure')
         self.compare_cancel_btn.setEnabled(self._busy and self._step == 'Compare')
+        for w in (self.volume_combo, self.map_btn, self.ring_btn, self.model_btn):
+            w.setEnabled(idle)
+        self.split_btn.setEnabled(idle and measured)
+        self.frame_cancel_btn.setEnabled(self._busy and self._step in FRAME_STEPS)
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -488,25 +833,37 @@ class AveragingPanel(QWidget):
     # ── jobs ──
 
     def _step_label(self) -> QLabel:
-        """The label of the running step: Measure -> model_label, Compare -> suggest_label."""
+        """The label of the running step: Measure -> model_label, Compare -> suggest_label,
+        a frame tool -> frame_label."""
+        if self._step in FRAME_STEPS:
+            return self.frame_label
         return self.suggest_label if self._step == 'Compare' else self.model_label
 
     def _run(self, step: str, func: Callable[..., Any], args: tuple[Any, ...],
              done: Callable[[Any], None]) -> None:
         self._step = step
         self._cancel_flag = False
-        self._saved_text = self._step_label().text()
+        saved = self._step_label().text()
+        while saved.startswith('Cancelled.'):           # no repeated 'Cancelled.'
+            saved = saved[len('Cancelled.'):].lstrip()
+        self._saved_text = saved
         self._step_label().setText(f'{step} is running.')
         self._set_busy(True)
         if self.synchronous:
+            was_cancelled, failure = False, None
             try:
                 result = func(*args, self.is_cancelled, log=self._log_fn,
                               progress=self._progress_fn)
             except av.Cancelled:
-                self._on_cancelled()
-                return
+                was_cancelled = True
             except Exception as e:
-                self._on_error(str(e))
+                failure = str(e)
+            if was_cancelled or failure is not None:
+                oe._free_gpu_memory()       # the arrays of the stopped job are free now
+                if was_cancelled:
+                    self._on_cancelled()
+                else:
+                    self._on_error(failure)
                 return
             self._finish(done, result)
             return
@@ -521,6 +878,7 @@ class AveragingPanel(QWidget):
     def _finish(self, done: Callable[[Any], None], result: Any) -> None:
         self._set_busy(False)
         self._step = None
+        self._found, self._released = {}, None
         done(result)
 
     def cancel(self) -> None:
@@ -533,20 +891,53 @@ class AveragingPanel(QWidget):
     def is_cancelled(self) -> bool:
         return self._cancel_flag
 
+    def _after_stop(self) -> str:
+        """Keep a ring detection of the stopped job. Return a note on a removed volume."""
+        if self._rings is None and self._found.get('rings') is not None:
+            self._rings = self._found['rings']
+        self._found = {}
+        slot, self._released = self._released, None
+        if slot is None:
+            return ''
+        return (f" The panel removed the earlier '{SLOT_NAMES[slot]}' volume before the run. "
+                'Run the step again to make it.')
+
+    def _kept_text(self) -> str:
+        """The frame tools results that the panel keeps (for the label after a stop)."""
+        slots = ['none'] + [s for s in ('mask', 'model') if s in self._fvols]
+        text = 'The panel keeps the volumes ' + ', '.join(f"'{SLOT_NAMES[s]}'" for s in slots)
+        if self._rings is not None:
+            n = len(self._rings.get('radii_px') or [])
+            text += (f', the ring detection ({n} ring radii)' if self._rings.get('mask') is not None
+                     else ', the ring detection (no ring found)')
+        if self._fmap is not None:
+            text += ', the frame map'
+        return text + '.'
+
     def _on_cancelled(self) -> None:
         label, step = self._step_label(), self._step
         self._set_busy(False)
         self._step = None
-        label.setText(f'Cancelled. {self._saved_text}'.strip())
+        note = self._after_stop()
+        if step in FRAME_STEPS:
+            # The frame label is shared by the frame steps: do not show the text of an
+            # earlier step. Say which step stopped and what the panel keeps.
+            label.setText(f'{step} cancelled.{note} {self._kept_text()}')
+        else:
+            label.setText(f'Cancelled. {self._saved_text}'.strip())
         if step == 'Compare':
             self._mark_rows_old(False)
-        self._log_fn(f'{step} cancelled. The panel keeps the earlier results.')
+        if note:
+            self._log_fn(f'{step} cancelled.{note}')
+        else:
+            self._log_fn(f'{step} cancelled. The panel keeps the earlier results.')
         self._update_enabled()
 
     def _on_error(self, msg: str) -> None:
         label, step = self._step_label(), self._step or 'Measure'
         self._set_busy(False)
         self._step = None
+        note = self._after_stop()
         first = msg.split('\n', 1)[0]
         self._log_fn(f'Averaging panel error: {step} failed: {msg}')
         text = f'{step} failed: {first}'
@@ -554,7 +945,7 @@ class AveragingPanel(QWidget):
             text += ' The grey rows show an older Compare.'
         elif step == 'Measure' and self._state is not None:
             text += ' The panel keeps the earlier results.'
-        label.setText(text)
+        label.setText(text + note)
         self._update_enabled()
 
     def _mark_rows_old(self, old: bool) -> None:
@@ -708,6 +1099,10 @@ class AveragingPanel(QWidget):
             self.result_table.selectRow(sel)
         else:
             self._plot(av.BIAS_REFERENCE)
+        self._show_split()
+        ref = next((r for r in compared['rows'] if r['name'] == av.BIAS_REFERENCE), None)
+        self._summarise(suggestion=compared['suggestion'],
+                        score=None if ref is None else ref['score'])
         self._update_enabled()
 
     def _on_row_selected(self) -> None:
@@ -777,7 +1172,7 @@ class AveragingPanel(QWidget):
             reason = (f"The user selected '{name}'. The suggestion was '{sugg}'."
                       if sugg else f"The user selected '{name}'.")
         record = av.choice_record(name, reason, self._state['measured'], self._compared,
-                                  self._state['region'])
+                                  self._state['region'], split=self._split)
         self._applied = {'name': name, 'spec': dict(spec), 'record': record}
         self._update_applied_label()
         self._update_enabled()
@@ -793,3 +1188,407 @@ class AveragingPanel(QWidget):
         self._log_fn('The panel removed the applied averaging option. The window uses its own '
                      'settings.')
         self.applied_changed.emit()
+
+    # ── Frame tools: host interface ──
+
+    def enable_frame_tools(self, request: Callable[[], dict[str, Any]]) -> None:
+        """Show the frame tools. `request` is the frame request of the host (module docstring)."""
+        self._frame_request = request
+        self.frame_group.setVisible(True)
+        if FRAME_TOOLS_PLACE not in self.engine_label.text():
+            self.engine_label.setText(f'{self.engine_label.text()} {FRAME_TOOLS_PLACE}')
+        self._refresh_volumes()
+        self.frame_label.setText('Reconstruct a volume, then use the frame tools.')
+        self._frame_map_hint()
+
+    def _frame_map_hint(self) -> None:
+        """Clear the frame map figure and show a short hint in it."""
+        self.frame_figure.clear()
+        self.frame_figure.text(0.5, 0.5, FRAME_MAP_EMPTY, ha='center', va='center',
+                               fontsize=9, color='#555555', wrap=True)
+        self.frame_canvas.draw_idle()
+
+    def selected_slot(self) -> str:
+        """'none', 'mask' or 'model': the selected volume."""
+        return self._slot
+
+    def selected_volume(self) -> Any:
+        """The selected corrected volume (not binned), or None for the uncorrected volume."""
+        return self._fvols.get(self._slot)
+
+    def clear_frame_results(self, message: str = '') -> None:
+        """Remove all results of the frame tools and select the uncorrected volume."""
+        if not (self._fvols or self._rings or self._halves or self._fmap or self._fsummary
+                or self._split):
+            return
+        self._fvols.clear()
+        self._fnotes.clear()
+        self._fsummary.clear()
+        self._rings = self._tables = self._halves = self._fmap = self._split = None
+        self._show_split()
+        self._frame_map_hint()
+        self._select('none', message or 'The frame tools results were removed.')
+        self._refresh_volumes()
+        if message:
+            self.frame_label.setText(message)
+            self._log_fn(message)
+
+    def drop_laue_results(self, message: str) -> None:
+        """Remove the frame tools results that use the Laue group.
+
+        The host calls this when the Laue group changes. The prediction of the
+        frame model and of the frame map uses the Laue group. The panel removes
+        the 'ring mask + frame model' volume, its tables and halves, and the
+        frame map. The ring detection and the 'ring mask' volume stay. The
+        values of Measure, Compare and Split-half in the volume table go.
+        """
+        self.clear_scores()
+        if 'model' not in self._fvols and self._fmap is None:
+            return
+        if self._slot == 'model':
+            self._select('none', message)
+        if self._halves is not None and self._halves[0] == 'model':
+            self._halves = None
+        self._fvols.pop('model', None)
+        self._fnotes.pop('model', None)
+        self._fsummary.pop('model', None)
+        self._tables = None
+        self._fmap = None
+        self._frame_map_hint()
+        self._refresh_volumes()
+        self.frame_label.setText(message)
+        self._log_fn(message)
+
+    def clear_scores(self) -> None:
+        """Remove the suggestion, score and split-half values of all volumes in the volume table.
+
+        The host calls this when the Laue group or the bin factors change.
+        The volumes, their notes and the ring detection stay. `reset` does not
+        call this, because a volume change keeps the values of each volume.
+        """
+        for d in self._fsummary.values():
+            for key in ('suggestion', 'score', 'split', 'split_diffuse'):
+                d.pop(key, None)
+        if self._frame_request is not None:
+            self._refresh_volumes()
+
+    # ── Frame tools: volumes ──
+
+    def _refresh_volumes(self) -> None:
+        """Fill the volume list and the volume table from the kept volumes."""
+        slots = ['none'] + [s for s in ('mask', 'model') if s in self._fvols]
+        self.volume_combo.blockSignals(True)
+        self.volume_combo.clear()
+        for s in slots:
+            note = self._fnotes.get(s, '')
+            self.volume_combo.addItem(SLOT_NAMES[s] + (f' ({note})' if note else ''), s)
+        self.volume_combo.setCurrentIndex(slots.index(self._slot) if self._slot in slots else 0)
+        self.volume_combo.blockSignals(False)
+        self.volumes_table.setRowCount(len(slots))
+        for i, s in enumerate(slots):
+            d = self._fsummary.get(s, {})
+            cells = [self.volume_combo.itemText(i), d.get('suggestion') or '-',
+                     av._num(d.get('score')), av._num(d.get('split')),
+                     av._num(d.get('split_diffuse'))]
+            for j, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if j:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                          | Qt.AlignmentFlag.AlignVCenter)
+                if s == self._slot:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self.volumes_table.setItem(i, j, item)
+
+    def _summarise(self, **values: Any) -> None:
+        """Keep values of the selected volume for the volume table."""
+        if self._frame_request is None:
+            return
+        self._fsummary.setdefault(self._slot, {}).update(values)
+        self._refresh_volumes()
+
+    def _select(self, slot: str, message: str) -> None:
+        """Select a volume. A change releases the halves and resets Measure and Compare."""
+        if slot == self._slot:
+            return
+        self._slot = slot
+        if self._halves is not None and self._halves[0] != slot:
+            self._halves = None
+        self.reset(message)
+        self._refresh_volumes()
+        self.volume_changed.emit()
+
+    def _on_volume_selected(self, index: int) -> None:
+        slot = self.volume_combo.itemData(index)
+        if slot is not None:
+            self._select(slot, f"Volume '{SLOT_NAMES[slot]}' selected. Click Measure again.")
+
+    def _release(self, slot: str) -> None:
+        """Remove the kept volume of `slot` (and its halves) before a new run makes it again."""
+        if slot not in self._fvols:
+            return
+        if self._slot == slot:
+            self._select('none', f"The volume '{SLOT_NAMES[slot]}' is made again. "
+                         "The panel selected 'no correction'.")
+        if self._halves is not None and self._halves[0] == slot:
+            self._halves = None
+        del self._fvols[slot]
+        self._fnotes.pop(slot, None)
+        self._fsummary.pop(slot, None)
+        if slot == 'model':
+            self._tables = None
+        if self._fmap is not None and self._fmap[2] == slot:
+            # The map was made from this volume (or in its run): it goes with it.
+            self._fmap = None
+            self._frame_map_hint()
+        self._released = slot
+        self._refresh_volumes()
+        self._log_fn(f"The panel removed the earlier '{SLOT_NAMES[slot]}' volume.")
+
+    def _frame_req(self) -> dict[str, Any] | None:
+        """The frame request of the host, or None (with a message)."""
+        if self._frame_request is None:
+            return None
+        try:
+            return self._frame_request()
+        except ValueError as e:
+            self.frame_label.setText(str(e))
+            self._log_fn(str(e))
+            return None
+
+    # ── Frame tools: steps ──
+
+    def _ring_mask(self) -> None:
+        req = self._frame_req()
+        if req is None:
+            return
+        self._found, self._released = {}, None
+        self._release('mask')
+        self._run('Ring mask', _ring_mask_job, (req, self._rings, self._found),
+                  self._on_ring_mask)
+
+    def _on_ring_mask(self, out: dict[str, Any]) -> None:
+        self._rings = out['rings']
+        self._fvols['mask'] = out['mask']
+        found = self._rings['mask'] is not None
+        self._fnotes['mask'] = '' if found else 'no ring found'
+        self._refresh_volumes()
+        s = self._rings['summary']
+        self.frame_label.setText(
+            (f"Ring mask: {s['ring_windows']} event(s), {s['ring_frames']} frames, "
+             f"{len(self._rings['radii_px'])} ring radii. " if found else
+             'Ring mask: no ring found. The volume is the same as the uncorrected volume. '
+             + NO_RING_HINT + ' ')
+            + "Select 'ring mask' in Volume to measure it.")
+        self._log_fn(self.frame_label.text())
+        self._update_enabled()
+
+    def _frame_model(self) -> None:
+        req = self._frame_req()
+        if req is None:
+            return
+        self._found, self._released = {}, None
+        self._release('model')
+        self._run('Frame model', _frame_model_job,
+                  (req, self._rings, self._found, 'mask' not in self._fvols),
+                  self._on_frame_model)
+
+    def _on_frame_model(self, out: dict[str, Any]) -> None:
+        self._rings = out['rings']
+        found = self._rings['mask'] is not None
+        if out['mask'] is not None:
+            self._fvols['mask'] = out['mask']
+            self._fnotes['mask'] = '' if found else 'no ring found'
+        self._fvols['model'] = out['model']
+        info = out['model'].metadata.get('frame_tools') or {}
+        # The prediction of the frame model uses the Laue group. The note shows it.
+        self._fnotes['model'] = (('' if found else 'no ring found, frame model only, ')
+                                 + f"Laue group {info.get('laue_group', '-')}")
+        self._tables = out['tables']
+        its = info.get('iterations_info') or []
+        last = its[-1] if its else {}
+        text = (f"Frame model: {info.get('iterations', 0)} iterations. Last iteration: "
+                f"{last.get('frames_S', '-')} frames with a scale term, "
+                f"{last.get('frames_B', '-')} frames with extra counts. "
+                + ('' if found else 'No ring found: the volume has the frame model only. '
+                   + NO_RING_HINT + ' ')
+                + "Select 'ring mask + frame model' in Volume to measure it.")
+        self.frame_label.setText(text)
+        self._log_fn(text)
+        if out['map'] is not None:
+            title = ('Frame map of the first iteration (ring-masked volume)' if found else
+                     'Frame map of the first iteration (volume without ring mask)')
+            self._fmap = (title, out['map'], 'model')
+            self._plot_frame_map()
+        self._refresh_volumes()
+        self._update_enabled()
+
+    def _frame_map(self) -> None:
+        req = self._frame_req()
+        if req is None:
+            return
+        vol = self.selected_volume()
+        vol = req['raw'] if vol is None else vol
+        use_mask = self._slot != 'none'
+        self._found, self._released = {}, None
+        self._run('Frame map', _frame_map_job, (req, self._rings, self._found, vol, use_mask),
+                  self._on_frame_map)
+
+    def _on_frame_map(self, out: dict[str, Any]) -> None:
+        self._rings = out['rings']
+        if self._slot == 'model':
+            # The pass does not apply the frame model to the frames.
+            title = ("Frame map: uncorrected frames (ring mask only) compared with the "
+                     f"prediction of '{SLOT_NAMES[self._slot]}'")
+        else:
+            title = f"Frame map of '{SLOT_NAMES[self._slot]}'"
+        self._fmap = (title, out['map'], self._slot)
+        self._plot_frame_map()
+        s = out['map'].summary()
+        text = (f"{self._fmap[0]}: {s['frames_off_10pct']} of {s['n_frames']} frames differ "
+                'from the other frames by more than 10 % (median over the sectors of the '
+                'normalised ratio). Median deviation of one cell from 1: '
+                + ('-' if s['cell_dev_median'] is None else f"{100 * s['cell_dev_median']:.0f} %")
+                + '. Observed / predicted before the '
+                f"normalisation: median {av._num(s['excess_median'])}, range "
+                f"{av._num(s['excess_min'])} to {av._num(s['excess_max'])}. "
+                f"{len(self._rings['radii_px'])} ring radii (dashed lines).")
+        self.frame_label.setText(text)
+        self._log_fn(text)
+        self._update_enabled()
+
+    def _split_check(self) -> None:
+        if self._state is None:
+            self.frame_label.setText('Click Measure first. The split-half check uses the region '
+                                     'and the bin factors of Measure.')
+            return
+        req = self._frame_req()
+        if req is None:
+            return
+        if self._compared is not None:
+            cands = [dict(self._compared['specs'][r['name']]) for r in self._compared['rows']]
+        else:
+            cands = self._candidates()
+            if av.BIAS_REFERENCE not in [c['name'] for c in cands]:
+                cands.insert(0, dict(av.EQUAL_MAD))
+        halves = (self._halves[1] if self._halves is not None and self._halves[0] == self._slot
+                  else None)
+        if halves is None and req['use_gpu']:
+            note = halves_gpu_note(req['raw'].intensity.size,
+                                   _gpu_free_bytes(req['setup'].device))
+            if note is not None:
+                req = dict(req, halves_gpu=False)
+                self._log_fn(note)
+        st = self._state
+        args = (req, self._slot, self._rings, self._tables, halves, st['laue'], st.get('crop'),
+                cands)
+        self._run('Split-half check', _split_job, args, self._on_split)
+
+    def _on_split(self, out: dict[str, Any]) -> None:
+        self._halves = (self._slot, out['halves'])
+        self._split = out['split']
+        self._show_split()
+        ref = self._split['rows'].get(av.BIAS_REFERENCE) or {}
+        self._summarise(split=ref.get('total'), split_diffuse=ref.get('diffuse'))
+        lines = [f"Split-half difference of '{SLOT_NAMES[self._slot]}' ({HALVES_RULE}):"]
+        for name, r in self._split['rows'].items():
+            lines.append(f"  {name}: " + ('no estimate (the noise-model fit of a half failed)'
+                                          if r is None else
+                                          f"total {av._num(r['total'])}, diffuse "
+                                          f"{av._num(r['diffuse'])}, node {av._num(r['node'])}"))
+        self._log_fn('\n'.join(lines))
+        self.frame_label.setText(f"Split-half check of '{SLOT_NAMES[self._slot]}' done. The "
+                                 'table below and the column '
+                                 f"'{SPLIT_HEADER}' of Results show the values.")
+        self._update_enabled()
+
+    # ── Frame tools: display ──
+
+    def _show_split(self) -> None:
+        """Show the split-half results in the Results table and in the shell table."""
+        n = len(av.COMPARE_HEADERS)
+        split = self._split
+        if split is None:
+            self.result_table.setColumnCount(n)
+            self.split_table.setRowCount(0)
+            self.split_table.setColumnCount(0)
+            self.split_table.setVisible(False)
+            return
+        rows = split['rows']
+        self.result_table.setColumnCount(n + 1)
+        head = QTableWidgetItem(SPLIT_HEADER)
+        head.setToolTip(SPLIT_TIP)
+        self.result_table.setHorizontalHeaderItem(n, head)
+        for i in range(self.result_table.rowCount()):
+            name_item = self.result_table.item(i, 0)
+            r = rows.get(name_item.text()) if name_item is not None else None
+            item = QTableWidgetItem(av._num(None if r is None else r['total']))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.result_table.setItem(i, n, item)
+        names = list(rows)
+        edges = split['shell_edges']
+        labels = (['total', 'diffuse', 'node']
+                  + [f"{edges[k]:.3f}-{edges[k + 1]:.3f}" for k in range(len(edges) - 1)])
+        self.split_table.setColumnCount(len(names) + 1)
+        self.split_table.setHorizontalHeaderLabels([f"|q| ({split['q_unit']})"] + names)
+        self.split_table.setRowCount(len(labels))
+        for i, lab in enumerate(labels):
+            self.split_table.setItem(i, 0, QTableWidgetItem(lab))
+            for j, name in enumerate(names):
+                r = rows[name]
+                if r is None:
+                    val = None
+                elif i < 3:
+                    val = r[lab]
+                else:
+                    val = r['shells'][i - 3]
+                item = QTableWidgetItem(av._num(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.split_table.setItem(i, j + 1, item)
+        self.split_table.setVisible(True)
+
+    def _plot_frame_map(self) -> None:
+        """The frame x sector image and the radial residual profile of the kept frame map."""
+        if self._fmap is None:
+            return
+        title, fm, _ = self._fmap
+        self.frame_figure.clear()
+        ax1, ax2 = self.frame_figure.subplots(1, 2)
+        nr = fm.normalised()                     # FRAME_MAP_DEFINITION
+        n = nr.shape[0]
+        rows, per_row = reduce_frame_rows(nr)
+        c = FRAME_MAP_RANGE
+        cmap = matplotlib.colormaps['RdBu_r'].copy()
+        cmap.set_bad('0.65')                     # grey: no prediction
+        # Sector k is centred on 5 k degrees: the image extent is -2.5 to 357.5.
+        w = 360.0 / nr.shape[1]
+        im = ax1.imshow(np.ma.masked_invalid(rows), aspect='auto', origin='lower',
+                        interpolation='nearest', cmap=cmap, norm=LogNorm(1.0 / c, c),
+                        extent=(-w / 2, 360.0 - w / 2, -0.5, rows.shape[0] * per_row - 0.5))
+        ax1.set_ylim(-0.5, n - 0.5)
+        ax1.set_xlabel('azimuth sector (deg)', fontsize=8)
+        ax1.set_ylabel('frame position in the scan' if per_row == 1 else
+                       f'frame position in the scan ({per_row} frames per row)', fontsize=8)
+        ax1.set_title('obs / pred, divided by the sector median', fontsize=9)
+        cb = self.frame_figure.colorbar(im, ax=ax1, shrink=0.9, extend='both')
+        ticks = [t for t in (1 / 1.5, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5) if 1.0 / c <= t <= c]
+        cb.set_ticks(ticks, labels=[f'{t:.3g}'.rstrip('0') for t in ticks])
+        cb.minorticks_off()
+        cb.ax.tick_params(labelsize=8)
+        ok = np.isfinite(fm.rel_resid)
+        ax2.plot(fm.q[ok], 100.0 * fm.rel_resid[ok], lw=0.8, color='tab:blue')
+        ax2.axhline(0.0, color='k', lw=0.5)
+        radii_q = (self._rings or {}).get('radii_q', [])
+        for i, q in enumerate(radii_q):
+            ax2.axvline(q, color='tab:red', lw=0.8, ls='--',
+                        label='detected ring' if i == 0 else None)
+        if radii_q:
+            ax2.legend(fontsize=7, loc='upper right')
+        ax2.set_xlabel('|q| (1/Å)', fontsize=8)
+        ax2.set_ylabel('(obs - pred) / pred (%)', fontsize=8)
+        ax2.set_title('radial residual, all frames', fontsize=9)
+        for ax in (ax1, ax2):
+            ax.tick_params(labelsize=8)
+        self.frame_figure.suptitle(title, fontsize=8)
+        self.frame_canvas.draw_idle()

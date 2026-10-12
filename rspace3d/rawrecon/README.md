@@ -224,9 +224,25 @@ agrees with the independent route.
 | `find_cbf_frames(folder)`, `find_crysalis_par(folder, recursive=)` | `geometry` | robust file discovery |
 | `pixel_corrections(det, r_lab, *, solid_angle, polarization, polarization_fraction, horizontal)` | `corrections` | per-pixel geometric corrections |
 | `bragg_registration_rms(vol)` | `engine` | reference-free integer-registration check (see caveat §6) |
+| `prepare_setup(folder, ...) -> ReconSetup` | `engine` | finds the frames and the geometry without a pass over the frames. `reconstruct_dataset(..., keep_setup=True)` puts the setup in `info['setup']` |
+| `ReconSetup.reconstruct(*, positions, groups, frame_fn, use_gpu, progress_callback, cancelled)` | `engine` | one more engine pass with the same geometry |
+| `reconstruct_dataset(..., halves=True)` | `engine` | the same pass also makes the odd-frame and even-frame volumes (`vol.parts`). The frames must have odd and even numbers. The host needs about 120 bytes per voxel at the peak, against about 55 bytes per voxel without halves |
+| `gpu_memory_bytes(n_voxels, halves=False) -> int` | `engine` | GPU accumulator memory of one pass in bytes (20 bytes per voxel, two times with halves) |
+| `ring_statistics(setup) -> RingStats`, `detect_rings(stats) -> RingDetection` | `rings` | powder-ring detector on the frame data |
+| `RingMask.from_detection(polar, det)`, `RingMask.from_bands(setup, bands, unit)` | `rings` | per-frame ring-band pixel mask (detected, or bands that you give in px, 1/d or d) |
+| `predict_frame(setup, model, i) -> image` | `frames` | predicted raw counts of one frame from a model volume |
+| `leave_one_out_median(vol, laue) -> array` | `frames` | median of the other orbit members of each voxel (the prediction of the frame tools) |
+| `frame_statistics(setup, model, *, mask) -> FrameStats` | `frames` | pass A: residual statistics per frame, 5-degree sector and 1-pixel radial bin |
+| `frame_map(setup, volume, laue)` | `frames` | observed / predicted per frame and sector (`FrameMap.normalised()`: divided by the sector median over the frames), radial residual profile |
+| `frame_map_from_stats(setup, stats, rings) -> FrameMap` | `frames` | the frame map from the sums of pass A |
+| `fit_frame_model(D, P, N) -> FrameModel` | `frame_model` | the additive table B and the scale table S = 1 + a of each frame |
+| `frame_function(cells, model, mask)` | `frames` | the `frame_fn` of the engine for the ring mask and the frame model |
+| `corrected_reconstruction(setup, *, model, mask, groups)` | `frames` | reconstruction of g (obs - B) / S with the ring mask |
+| `run_frame_chain(setup, laue, *, rings, frame_model, iterations, halves, raw, options, use_gpu, keep_tables, keep_masked, progress, cancelled, log) -> FrameChainResult` | `frames` | the frame chain (checked for mmm): ring mask, frame model (3 iterations), plain orbit mean. `keep_tables=True` keeps the fitted tables in `.model`. `keep_masked=False` drops the ring-mask volume (`.masked`, with the frame model) and its halves (`.masked_halves`) |
 
 `Volume`: `data (nh,nk,nl; NaN=unmeasured)`, `H,K,L` axes, `UB` (1/d), `counts`,
-`wavelength`, `variance (nh,nk,nl; NaN=unmeasured)`. The grid may be anisotropic
+`wavelength`, `variance (nh,nk,nl; NaN=unmeasured)`, `parts` (one `Volume` per frame
+group, or None). The grid may be anisotropic
 (independent min/max per axis, common `dq`).
 
 ---
@@ -309,6 +325,18 @@ Other caveats:
   ~2x at the detector edges. For an instrument with a horizontal rotation axis,
   override the E-vector with `corrections={'horizontal': vector}`.
 
+Limits of the frame tools (section 12):
+- The frame chain (section 12) was validated with Laue group mmm and
+  0.2-degree frames (I19-2 and I15 data). Other Laue groups and frame widths
+  work, but they are not validated.
+- Other Laue groups were not checked on real data. The prediction uses the
+  orbit members of the Laue group without the identity. A test on synthetic
+  data gave a smaller error for 2/m, 4/mmm and m-3m. For Laue group -1 the
+  same test showed no gain from the chain.
+- Other frame widths were not checked. The method scales its frame windows
+  with 0.2 / width.
+- Other detectors and grids that are not symmetric about 0 were not checked.
+
 ---
 
 ## 11. Module map
@@ -321,7 +349,104 @@ rawrecon/
   corrections.py pixel_corrections (solid-angle + polarisation; Lorentz via
                  count-normalisation)
   engine.py      Volume, reconstruct_volume[_gpu], reconstruct_dataset,
-                 reconstruct_to_volumedata, bragg_registration_rms, has_cupy
+                 reconstruct_to_volumedata, bragg_registration_rms, has_cupy,
+                 ReconSetup, prepare_setup, gpu_memory_bytes
   tabbin.py      read_tabbin, find_tabbin
   calibrate.py   geometry_from_tabbin, FittedGeometry, _ground_mapping
+  rings.py       PixelPolar, ring_statistics, detect_rings, RingMask
+  frame_model.py ModelOptions, fit_frame_model, FrameModel, interp_B, interp_S
+  frames.py      FrameCells, predict_frame, leave_one_out_median,
+                 frame_statistics, frame_map, frame_map_from_stats,
+                 frame_function, corrected_reconstruction, run_frame_chain,
+                 FrameStats, FrameMap, FrameChainResult
 ```
+
+## 12. Frame tools
+
+The frame tools use the frames again after the reconstruction. They find
+contamination that changes from frame to frame, for example powder rings of
+a wire or a sample holder that is in the beam for some frames, an additive
+background in some frames, or a shadow. They need the `ReconSetup` of the
+dataset (`reconstruct_dataset(..., keep_setup=True)` puts it in
+`info['setup']`), so no new geometry fit is necessary. `prepare_setup` also
+gives the setup. `info['setup']` is not a JSON value. Remove it before you
+serialise `info`, for example `{k: v for k, v in info.items() if k != 'setup'}`.
+
+The frame chain is: ring mask, frame model (3 iterations), plain orbit mean
+(`run_frame_chain`).
+
+```python
+from rspace3d import rawrecon
+from rspace3d.volume_builder import save_volume_h5
+
+vol, info = rawrecon.reconstruct_dataset(folder, use_tabbin=True, halves=True,
+                                         keep_setup=True)
+setup = info['setup']
+# Use the Laue group of your sample. Only mmm was checked on real data.
+res = rawrecon.run_frame_chain(setup, 'mmm', raw=vol, halves=True, log=print)
+save_volume_h5('sample_frame_tools.h5', res.volume)   # metadata: frame_tools, frame_correction
+```
+
+Only Laue group mmm was checked on real data (see the limits at the end of
+section 10).
+
+The chain has these steps:
+
+1. Ring detection. One pass measures the trimmed mean of each 1-pixel annulus
+   and of each 30-degree sector of it in each frame. Narrow peaks at 4 or more
+   radii in a frame are powder rings if they have the same time course and
+   show in many azimuth sectors. A ring must show in at least 5 of the 12
+   sectors, or in 60 % of the valid sectors if that is fewer (minimum 2).
+   The mask covers each ring band in the frames of its event. The time
+   background is a running median over 201 frames (0.2-degree frames). Thus
+   the detector needs frames without the rings before or after the ring event
+   in the given frames. If all frames have the rings, it finds no ring. The
+   ring mask depends on the frames that you give. Check the number of ring
+   frames when you change the frame range.
+2. The volume with the ring mask. A masked pixel is not used.
+3. Three iterations of the frame model. The prediction is the median of the
+   other orbit members of each voxel. Pass A compares each frame with the
+   prediction in 5-degree sectors and 1-pixel radial bins. The fit finds a
+   scale S = 1 + a for each frame and sector and an additive table B for each
+   frame, sector and radial bin. The thresholds come from the scatter of the
+   data over the frames, so clean frames get no correction. The corrected
+   volume uses g (obs - B) / S for each pixel. Each iteration fits the tables
+   again from the original frames.
+4. The plain orbit mean (equal weights, no rejection) in the Laue group that
+   you give.
+
+The variance of a corrected pixel is g² max(obs, 1) / S² (Poisson variance of
+the raw count). The error of the model is not in the variance.
+
+`frame_map(setup, volume, laue)` gives the agreement of each frame and sector
+with a first average and the radial residual profile. `FrameMap.excess` keeps
+the observed / predicted sums of each frame and sector. The display value
+(`FrameMap.normalised()`) is this ratio divided by its median over the frames
+of the same sector: 1 means agreement with the other frames. `summary()`
+counts the frames whose median normalised ratio over the sectors differs from
+1 by more than 10 %. A cell without observed counts gets the value 0.001, so
+an empty frame shows at the bottom of the scale and counts as off. On real
+data the ratio before the normalisation is not 1. For the full frame map of
+one I19-2 scan (MAPbBr3) its median was 0.94. Each effect has a direction.
+Real changes between frames and sectors lower the ratio. They were the main
+cause of the 0.94. The cause of the slow change in this scan is not known.
+Absorption or a shadow are possible causes, not tested. The orbit median is
+lower than the orbit mean. This raises the ratio (about +2.5 % in a synthetic
+test). Cells at Bragg nodes have a low median ratio and a long upper tail,
+because a peak is in only a few frames. The fit of the frame model first removes the median over
+the frames of the residual of each cell and of the scale of each sector. Thus
+an offset that is the same in all frames does not change the fit.
+`RingMask.from_bands(setup, [(centre, half_width)], unit='q')` makes a mask
+from ring bands that you know. The frame-window sizes of the method are for
+0.2-degree frames. For another frame width the method scales them with
+0.2 / width. This scaling is not validated.
+
+Memory: pass A keeps 6 bytes per frame, sector and radial bin on the host
+(about 1.3 GB for 1735 frames and 1785 radial bins). The table fit needs more
+memory than the tables. Measured case (GPU, 1735 frames, 1785 radial bins,
+grid 297 x 297 x 241, `keep_tables=True`, no `raw`, no halves): the peak
+resident memory of the process was 6.0 GB above the memory before
+`run_frame_chain`. The peak is in the table fit. Between the passes the
+chain held 3.1 to 3.4 GB. The frames are streamed.
+The GPU holds the model volume, the pixel vectors (12 bytes per pixel) and
+the temporary arrays of one frame.
