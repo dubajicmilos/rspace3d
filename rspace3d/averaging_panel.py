@@ -46,7 +46,7 @@ import numpy as np
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSpinBox,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -638,6 +638,10 @@ class AveragingPanel(QWidget):
         self.applied_label = QLabel()
         self.applied_label.setWordWrap(True)
         v4.addWidget(self.applied_label)
+        # The save step of the host (see set_save_action), hidden until the host sets it
+        self.save_btn = QPushButton()
+        self.save_btn.setVisible(False)
+        v4.addWidget(self.save_btn)
         right.addWidget(g4)
 
         # Frame tools (raw-frame data only, hidden until enable_frame_tools)
@@ -796,6 +800,16 @@ class AveragingPanel(QWidget):
         """The host calls this while it works. The panel buttons are then off."""
         self.setEnabled(not busy)
 
+    def set_save_action(self, text: str, callback: Callable[[], None], tip: str = '') -> None:
+        """Show a button in the Apply group that starts the save step of the host.
+
+        The user can then apply an option and save without a change of tab."""
+        self.save_btn.setText(text)
+        self.save_btn.setToolTip(tip)
+        self.save_btn.clicked.connect(lambda _=False: callback())
+        self.save_btn.setVisible(True)
+        self._update_enabled()
+
     def _update_enabled(self) -> None:
         idle = not self._busy
         measured = self._state is not None
@@ -808,6 +822,7 @@ class AveragingPanel(QWidget):
             w.setEnabled(idle and bool(has_model))
         self.apply_btn.setEnabled(idle and self.apply_combo.count() > 0)
         self.clear_btn.setEnabled(idle and self._applied is not None)
+        self.save_btn.setEnabled(idle)
         self.measure_cancel_btn.setEnabled(self._busy and self._step == 'Measure')
         self.compare_cancel_btn.setEnabled(self._busy and self._step == 'Compare')
         for w in (self.volume_combo, self.map_btn, self.ring_btn, self.model_btn):
@@ -1592,3 +1607,144 @@ class AveragingPanel(QWidget):
             ax.tick_params(labelsize=8)
         self.frame_figure.suptitle(title, fontsize=8)
         self.frame_canvas.draw_idle()
+
+
+class AveragingSettings(QGroupBox):
+    """The averaging of the symmetrise step of a host GUI: 'Standard' or 'Custom'.
+
+    `standard` is a candidate dict (for example `averaging.COUNTS_MAD`).
+    `why` tells the user why the standard is this option. An option that
+    the user applies in the Averaging panel replaces these settings: the
+    host calls `set_override(name)` (None removes the note).
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, standard: dict[str, Any], why: str,
+                 parent: QWidget | None = None) -> None:
+        super().__init__('Averaging and outlier rejection', parent)
+        self.standard = dict(standard)
+        self._override: str | None = None
+        self._mode = 'standard'
+        self._custom = dict(self.standard)       # the last custom values
+        form = QFormLayout(self)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem(f"Standard: {self.standard['name']}", 'standard')
+        self.mode_combo.addItem('Custom', 'custom')
+        self.mode_combo.setToolTip('Standard: the option of the first tab (recommended for clean\n'
+                                   'data). Custom: set the weights, the rejection and sigma.')
+        form.addRow('Mode:', self.mode_combo)
+        self.weight_combo = QComboBox()
+        self.weight_combo.addItems(list(oe.WEIGHTINGS))
+        self.weight_combo.setToolTip("Weights of the orbit members. 'equal': plain mean.\n"
+                                     "'counts': each member has the weight of its pixel count.\n"
+                                     "'adaptive': each member has the weight 1 / variance of the\n"
+                                     'noise model.')
+        form.addRow('Weights:', self.weight_combo)
+        self.rej_combo = QComboBox()
+        self.rej_combo.addItems(['mad', 'model', 'none'])
+        self.rej_combo.setToolTip("Outlier rule. 'mad': reject a member farther than sigma x the\n"
+                                  "robust spread (MAD, at least the Poisson value) from the orbit\n"
+                                  "median. 'model': use sigma x the noise-model value.\n"
+                                  "'none': no rejection (spikes go into the mean).")
+        form.addRow('Outlier rejection:', self.rej_combo)
+        self.sigma_spin = QDoubleSpinBox()
+        self.sigma_spin.setRange(1.0, 10.0)
+        self.sigma_spin.setSingleStep(0.5)
+        self.sigma_spin.setDecimals(1)
+        self.sigma_spin.setToolTip('Rejection threshold. 3 = standard.\n'
+                                   'A higher value rejects less.')
+        form.addRow('Sigma:', self.sigma_spin)
+        self.help_label = QLabel(why)
+        self.help_label.setWordWrap(True)
+        self.help_label.setStyleSheet('color: #555;')
+        form.addRow(self.help_label)
+        self.note_label = QLabel()
+        self.note_label.setWordWrap(True)
+        form.addRow(self.note_label)
+        self.mode_combo.currentIndexChanged.connect(self._on_change)
+        self.weight_combo.currentIndexChanged.connect(self._on_change)
+        self.rej_combo.currentIndexChanged.connect(self._on_change)
+        self.sigma_spin.valueChanged.connect(self._on_change)
+        self.reset()
+
+    def reset(self) -> None:
+        """Select the standard option. The custom values are the standard values again."""
+        self.mode_combo.setCurrentIndex(0)
+        self._mode = 'standard'
+        self._custom = dict(self.standard)
+        self._show(self.standard)
+
+    def is_standard(self) -> bool:
+        return self.mode_combo.currentData() == 'standard'
+
+    def spec(self) -> dict[str, Any]:
+        """The candidate dict of the settings."""
+        if self.is_standard():
+            return dict(self.standard)
+        return av.make_candidate(self.weight_combo.currentText(), self.rej_combo.currentText(),
+                                 self.sigma_spin.value())
+
+    def kwargs(self) -> dict[str, Any]:
+        """Keywords for `symmetrize_volume`. For 'adaptive' or 'model' without a
+        noise model, `symmetrize_volume` fits the model to the volume."""
+        return av.candidate_kwargs(self.spec())
+
+    def describe(self) -> str:
+        """For example "'counts, mad 3' (standard)"."""
+        return f"'{self.spec()['name']}' ({'standard' if self.is_standard() else 'custom'})"
+
+    def set_override(self, name: str | None) -> None:
+        """The name of the option that the Averaging panel applied, or None."""
+        self._override = name
+        self._update()
+
+    def _show(self, spec: dict[str, Any]) -> None:
+        for w in (self.weight_combo, self.rej_combo, self.sigma_spin):
+            w.blockSignals(True)
+        self.weight_combo.setCurrentText(spec['weighting'])
+        self.rej_combo.setCurrentText(spec['rejection'])
+        self.sigma_spin.setValue(float(spec.get('sigma', 3.0)))
+        for w in (self.weight_combo, self.rej_combo, self.sigma_spin):
+            w.blockSignals(False)
+        self._update()
+
+    def _on_change(self, *_: Any) -> None:
+        mode = self.mode_combo.currentData()
+        if mode == 'standard':
+            if self._mode == 'custom':           # keep the custom values for a later switch
+                self._custom = av.make_candidate(self.weight_combo.currentText(),
+                                                 self.rej_combo.currentText(),
+                                                 self.sigma_spin.value())
+            self._show(self.standard)
+        elif self._mode == 'standard':
+            self._show(self._custom)
+        else:
+            self._update()
+        self._mode = mode
+        self.changed.emit()
+
+    def _update(self) -> None:
+        custom = not self.is_standard()
+        free = self._override is None
+        self.mode_combo.setEnabled(free)
+        self.weight_combo.setEnabled(free and custom)
+        self.rej_combo.setEnabled(free and custom)
+        self.sigma_spin.setEnabled(free and custom and self.rej_combo.currentText() != 'none')
+        if not free:
+            self.note_label.setText(f"Not used now. The symmetrise step uses '{self._override}', "
+                                    'applied in the Averaging tab. Click Clear in that tab to '
+                                    'use these settings again.')
+            self.note_label.setStyleSheet('color: #070; font-weight: bold;')
+        elif custom and (self.weight_combo.currentText() == 'adaptive'
+                         or self.rej_combo.currentText() == 'model'):
+            self.note_label.setText('This option needs a noise model. The symmetrise step fits it '
+                                    'to the volume first (about 30 s more with a GPU on a '
+                                    'large volume).')
+            self.note_label.setStyleSheet('color: #555;')
+        elif custom and self.rej_combo.currentText() == 'none':
+            self.note_label.setText('No rejection: spikes and zingers go into the mean.')
+            self.note_label.setStyleSheet('color: #a05000;')
+        else:
+            self.note_label.setText('')

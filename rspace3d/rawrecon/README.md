@@ -20,9 +20,11 @@ intensity in a voxel grid. The resulting volume goes through the existing
 python -m rspace3d.reconstruct_gui        # or the `rspace3d-reconstruct` console script
 ```
 Browse to a dataset folder (raw `.cbf` + `*_cracker.par` [+ `*_peakhunt.tabbin`]),
-set the `h/k/l` min/max and the voxel size `dq`, and click **Reconstruct**. Then
-click **Symmetrise + Save** or **Open in Viewer**. Leave *"Geometry from CrysAlisPro
-tabbin"* ticked; it is the default and the more robust option (§3).
+select the Laue group, set the `h/k/l` min/max and the voxel size `dq`, and click
+**Reconstruct and save**. The window reconstructs, symmetrises with the standard
+averaging (`'counts, mad 3'`) and saves the symmetrised and the raw volume. Then
+click **Open in viewer**. Leave *"Geometry from CrysAlisPro tabbin"* (Advanced tab)
+ticked; it is the default and the more robust option (§3).
 
 ### Programmatic
 ```python
@@ -58,7 +60,7 @@ Notes:
   reduced cell (e.g. a monoclinic sub-cell) that will not index the frames, whereas
   the cracker par holds the pseudocubic UB that CrysAlisPro actually refined.
   `find_crysalis_par` prefers the cracker par and has a `recursive=True` option
-  (GUI: *"Search subfolders for the .par file"*).
+  (GUI: *"Search subfolders for the .par file"*, Advanced tab).
 
 ---
 

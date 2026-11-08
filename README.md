@@ -169,7 +169,7 @@ Notes on file discovery:
   `<prefix><number>.cbf` are grouped by prefix and the largest group is used
   (sub-folders such as `bup/` or `tmp/` are ignored).
 - If the `.par` sits in a sub-folder, tick *Search subfolders for the .par file*
-  in the GUI or pass `par_path=` in the API.
+  in the Advanced tab of the GUI or pass `par_path=` in the API.
 - The CBF headers must carry `Angle_increment` and `Phi` (standard in miniCBF).
   The scan may be a phi or an omega scan: the rotation axis and its sense are
   fitted from the peak table, and the header angle is used only as a datum.
@@ -180,58 +180,97 @@ Notes on file discovery:
 rspace3d-reconstruct          # or: python -m rspace3d.reconstruct_gui
 ```
 
+The window has three tabs. For clean data you need only the first one.
+
+<img width="640" alt="The Reconstruct tab" src="docs/images/reconstruct_gui.png" />
+
+**Reconstruct tab** (top to bottom):
+
 1. **Dataset folder.** Click *Browse...* and select the folder. The GUI reports
-   the number of frames, detector size, wavelength, header distance, phi range
-   and the unit cell read from the `.par`. If it reports that no `.par` was
-   found, tick *Search subfolders for the .par file*.
+   the number of frames, detector size, wavelength, header distance, phi range,
+   the unit cell read from the `.par` and the data range: the largest |h|, |k|
+   and |l| at the detector corners (from the frame header). If it reports that
+   no `.par` was found, tick *Search subfolders for the .par file* in the
+   Advanced tab.
 
-2. **Reconstruction grid.** Set the `h`, `k` and `l` minimum and maximum in
-   reciprocal-lattice units (they need not be symmetric or equal) and the voxel
-   size `dq` (default 0.025 r.l.u.). The *Grid* line shows the voxel count and
-   the GPU memory needed during accumulation (20 bytes per voxel: float64 sum,
-   int32 pixel count and float64 sum of squares for the variance), and turns red
-   when this approaches the free VRAM. A 481 × 481 × 481 grid (-6 to 6 at 0.025)
-   needs about 2.2 GB.
-   - *bin H,K / L*: the bin factors for the symmetrised volume. Set them before
-     you reconstruct. The voxel centres are multiples of `dq` × bin, so hkl = 0
-     is a voxel centre after the binning. Then the operations of all 11 Laue
-     groups, trigonal and hexagonal included, are exact index maps. The grid
-     can extend past the minimum and maximum by up to half a binned voxel. The
-     raw volume is not binned.
-   - *frames (0 = all)*: use fewer frames for a quick test.
-   - *hot-pixel clip*: pixels with counts above this value are ignored. The
-     default (0 = off) keeps every pixel. A value such as 1e6 removes zingers
-     but also clips saturated Bragg maxima on detectors that count above it
-     (the Eiger at I19-2 reaches about 1.3e6 in Bragg cores).
+2. **Laue group and grid.** Select the Laue group of the phase. An experiment
+   that lowers the symmetry (for example an applied field) needs a lower group.
+   The window checks only that the cell metric allows the group (the test of
+   `laue_metric_residual`, limit 0.02). If the metric does not allow the group,
+   the window shows a note. When you load a folder, it then selects the group
+   of highest order that the cell allows. The metric cannot tell a cubic cell
+   from a cell with a small distortion, so the choice of the group stays yours.
+   Set the `h`, `k` and `l` minimum and maximum in reciprocal-lattice units
+   (they need not be symmetric or equal) and the voxel size `dq` (default
+   0.025 r.l.u.). The *Grid* line shows the voxel count and the GPU memory
+   needed during accumulation (20 bytes per voxel: float64 sum, int32 pixel
+   count and float64 sum of squares for the variance), and turns red when this
+   approaches the free VRAM. A 481 × 481 × 481 grid (-6 to 6 at 0.025) needs
+   about 2.2 GB.
 
-3. **Options.**
-   - *Solid-angle + polarisation corrections* (on by default), with the
-     polarisation fraction (0.95 for a synchrotron, 0.5 for an unpolarised
-     source). The Lorentz factor is applied implicitly by the per-voxel
-     normalisation.
-   - *Use GPU (CuPy)*: untick to force the CPU path.
-   - *Geometry from CrysAlisPro tabbin*: leave this ticked. It fits the full
-     geometry from the peak table. Unticking it falls back to indexing frame 1
-     with the header geometry, which works only for clean datasets with a
-     correct header and a vertical rotation axis.
+3. **Averaging and outlier rejection.** The line shows the option that the
+   symmetrise step uses. The standard for raw frames is `'counts, mad 3'`:
+   each orbit member has the weight of its pixel count, and a member farther
+   than 3 × the robust spread (MAD, at least the Poisson value) from the orbit
+   median is rejected. In the 2.4 benchmarks this option gave the lowest
+   diffuse noise on clean data (synthetic data: 0.53 to 0.58 × the RMSE of
+   `'equal, mad 3'`; real I15 data: split-half difference 18 % lower, Bragg
+   sums within 1 %), at the speed of the plain MAD rule. For data with powder
+   rings or other contamination, use the Averaging tab (see
+   [The Averaging panel](#the-averaging-panel-and-the-command-line-flags)).
 
-4. **Reconstruct.** The log shows the geometry fit (which pixel convention was
-   chosen, how many peaks indexed cleanly, the fit residual in Å⁻¹, the
-   self-check in r.l.u.), the unit cell, the progress per frame, the run time
-   and the fraction of voxels that received at least one pixel.
+4. **Output.** The output folder (default: the dataset folder) and the file
+   names: `<folder name>_recon_sym_<laue>.h5` (for example
+   `_recon_sym_mbar3m.h5` for `m-3m`) and, if *Also save the raw
+   (unsymmetrised) volume* is ticked (default), `<folder name>_recon_raw.h5`.
+   In the raw volume, unmeasured voxels are `NaN` and measured voxels with zero
+   counts are `0.0`. With the raw volume you can symmetrise again later
+   without a new reconstruction. The window asks before it overwrites a file.
 
-5. **Process the reconstructed volume** (enabled after a reconstruction):
-   - *Save raw volume* writes `<folder name>_recon_raw.h5`. Unmeasured voxels
-     are stored as `NaN`; measured voxels with zero counts are `0.0`.
-   - *Symmetrise + Save* applies the binning from step 2 and then
-     one pass of symmetry averaging with outlier rejection in the chosen Laue
-     group and sigma, and writes `<folder name>_recon_sym_<laue>.h5` (for
-     example `_recon_sym_mbar3m.h5` for `m-3m`). The log shows whether the
-     symmetry operations were exact maps. If you change the bin factors after
-     the reconstruction, some operations can need interpolation. Reconstruct
-     again with the new factors to keep them exact.
-   - *Open in Viewer* saves the raw volume next to the frames and opens it in
-     the viewer.
+5. **Reconstruct and save.** One click reconstructs, symmetrises (with the
+   bin factors of the Advanced tab) and saves. The log shows the geometry fit
+   (which pixel convention was chosen, how many peaks indexed cleanly, the fit
+   residual in Å⁻¹, the self-check in r.l.u.), the unit cell, the progress per
+   frame, the run time, the fraction of voxels that received at least one
+   pixel and whether the symmetry operations were exact maps. If only the Laue
+   group, the averaging or the output changed, the next click uses the
+   reconstruction in memory and does not reconstruct again. A change of the
+   grid, the frames, the bin factors or the pixel options starts a new
+   reconstruction. *Cancel* stops a reconstruction after the current frame;
+   the window keeps the earlier reconstruction. *Open in viewer* opens the
+   last saved symmetrised volume.
+
+**Advanced tab** (the defaults are the standard settings; *Reset to the
+standard settings* sets them again):
+
+- *Frames (0 = all)*: use fewer frames for a quick test.
+- *Search subfolders for the .par file*.
+- *Geometry from CrysAlisPro tabbin*: leave this ticked. It fits the full
+  geometry from the peak table. Unticking it falls back to indexing frame 1
+  with the header geometry, which works only for clean datasets with a
+  correct header and a vertical rotation axis.
+- *Use GPU (CuPy)*: untick to force the CPU path.
+- *Solid-angle + polarisation corrections* (on by default), with the
+  polarisation fraction (0.95 for a synchrotron, 0.5 for an unpolarised
+  source). The Lorentz factor is applied implicitly by the per-voxel
+  normalisation.
+- *Hot-pixel clip*: pixels with counts above this value are ignored. The
+  default (0 = off) keeps every pixel. A value such as 1e6 removes zingers
+  but also clips saturated Bragg maxima on detectors that count above it
+  (the Eiger at I19-2 reaches about 1.3e6 in Bragg cores).
+- *bin H,K / L*: the bin factors for the symmetrised volume. The voxel
+  centres are multiples of `dq` × bin, so hkl = 0 is a voxel centre after the
+  binning. Then the operations of all 11 Laue groups, trigonal and hexagonal
+  included, are exact index maps. The grid can extend past the minimum and
+  maximum by up to half a binned voxel. The raw volume is not binned.
+- *Averaging and outlier rejection*: *Standard* or *Custom* (weights
+  `equal`, `counts` or `adaptive`, rejection `mad`, `model` or `none`, and
+  sigma). For `adaptive` or `model`, the symmetrise step first fits the noise
+  model to the volume (about 30 s more with a GPU on a large volume).
+
+**Averaging tab**: measure and compare the averaging options on the volume in
+memory, and the frame tools (see below). Its *Symmetrise + Save* button saves
+with the applied option, so you do not have to go back to the first tab.
 
 ### Using the Python API
 
@@ -360,8 +399,8 @@ counts and blue is fewer counts than in the other frames. The scale stops at
 uncorrected volume, and *Frame model* applies the frame model only. The file
 name tag then follows the metadata (`_framemodel`, not
 `_ringmask_framemodel`). A change of the Laue group removes the 'ring mask + frame model'
-volume and the frame map. *Save raw volume*, *Symmetrise + Save* and *Open in Viewer* use the
-selected volume, and the file records the frame-tool metadata. The volume
+volume and the frame map. *Reconstruct and save* (Reconstruct tab) and *Symmetrise + Save*
+(Averaging tab) use the selected volume, and the file records the frame-tool metadata. The volume
 builder (route B) has no frames, so it does not show this group.
 
 Without these options the reconstruction is the same as before. Section 12 of
@@ -371,14 +410,14 @@ Without these options the reconstruction is the same as before. Section 12 of
 
 | Message or symptom | Cause and fix |
 |-------------------|---------------|
-| `no CrysAlisPro .par file found` | the `.par` is not in the selected folder; tick *Search subfolders* or pass `par_path=`. |
+| `no CrysAlisPro .par file found` | the `.par` is not in the selected folder; tick *Search subfolders* (Advanced tab) or pass `par_path=`. |
 | `need a *_cracker.par and a *_peakhunt.tabbin` | no peak-hunt table in the folder; run peak hunting in CrysAlisPro (a table named `*process_action*` is ignored on purpose). |
 | `only N cleanly-indexed tabbin peaks; cannot calibrate` | the peak table is not indexed with the UB in the `.par`; redo unit-cell finding and refinement after the peak hunt, or point to the `.par` that belongs to this peak hunt. |
 | `tabbin geometry fit failed self-check` | the fit did not converge: check that the `.cbf` frames in the folder are the scan that the peak hunt was run on (frame numbers in the table must match the file numbering), and that the experiment is a single-axis scan on a flat detector. |
 | `could not reliably index ...` (tabbin option unticked) | the header-geometry path failed (powder rings, wrong header beam centre or distance); use the tabbin path. |
-| GPU out of memory | shrink the grid (larger `dq` or narrower ranges); the *Grid* line shows the requirement. Or untick *Use GPU*. |
+| GPU out of memory | shrink the grid (larger `dq` or narrower ranges); the *Grid* line shows the requirement. Or untick *Use GPU* (Advanced tab). |
 | peaks smeared, Bragg RMS around 0.5 r.l.u. | wrong detector pixel convention or geometry; see section 4.1 of `rspace3d/rawrecon/README.md`. |
-| no GPU | the CPU path gives the same result at about 1 s per frame on a 481³ grid; use *frames* to test on a subset first, or a coarser `dq`. |
+| no GPU | the CPU path gives the same result at about 1 s per frame on a 481³ grid; use *Frames* (Advanced tab) to test on a subset first, or a coarser `dq`. |
 
 ## Route B: volume from CrysAlisPro unwarp layers
 
@@ -389,11 +428,11 @@ matrix in the `.par` file.
 ### Step 1: layer list
 
 CrysAlisPro reconstructs one HK plane per `l` value with `dc unwarp`. Generate
-the layer list with the *Generate dcunwarp file* section of the builder GUI
+the layer list in the *dcunwarp file* tab of the builder GUI
 (`rspace3d-builder`; set the l range, for example -6 to 6, the step, 0.02, and
 the resolution, 0.8 Å, then click *Generate*):
 
-<img width="350" height="355" alt="image" src="docs/images/builder_gui.png" />
+<img width="480" alt="The dcunwarp file tab of the builder GUI" src="docs/images/builder_gui.png" />
 
 or from the command line:
 
@@ -421,15 +460,24 @@ GUI:
 rspace3d-builder                 # or: python -m rspace3d.volume_builder_gui
 ```
 
-1. Browse to the `unwarp/` folder. The `*_cracker.par` (usually in the parent
-   folder) is picked up automatically; it provides the UB matrix for the hkl
-   grid.
-2. Choose the Laue group (used for outlier rejection and symmetrisation).
-3. Set the binning (2 × 2 recommended) and sigma (3.0; a higher value rejects
-   less).
+1. In the Process tab, browse to the `unwarp/` folder. The `*_cracker.par`
+   (usually in the parent folder) is picked up automatically; it provides the
+   UB matrix for the hkl grid.
+2. Choose the Laue group (used for outlier rejection and symmetrisation). The
+   window makes the same cell-metric check as the raw-frame GUI.
+3. Set the binning (2 × 2 recommended).
 4. Click *Process All*. Output: `<sample>_raw.h5` and `<sample>_sym_<laue>.h5`.
-   To compare averaging options before this step, use the Averaging tab (see
+   The averaging is the standard for unwarp layers, `'equal, mad 3'` (the
+   default of the earlier versions, same output bit for bit). The layers have
+   no detector pixel counts, so the counts weights of route A give almost no
+   gain here. To compare averaging options before this step, use the Averaging
+   tab (see
    [The Averaging panel](#the-averaging-panel-and-the-command-line-flags)).
+
+The Advanced tab has the averaging settings (*Standard* or *Custom*: weights,
+rejection and sigma; a higher sigma rejects less), the coverage-mask kernel
+(*Mask kernel*, default `auto`) and *Force re-read .img files* (by default the
+window uses the raw cache `<sample>_raw.h5` if it matches the folder).
 
 Command line:
 
@@ -551,6 +599,10 @@ print the table after the symmetrisation (`format_symmetry_diagnostics`).
 `symmetrize_volume` has three more keywords. Their defaults give the result
 above, bit for bit.
 
+The GUIs use a standard option (the Python default does not change):
+`'counts, mad 3'` for raw frames (route A) and `'equal, mad 3'` for unwarp
+layers (route B). Section [Using the GUI](#using-the-gui) gives the reasons.
+
 - `weighting`: `'equal'` (default), `'counts'` or `'adaptive'`. `'counts'`
   weights each member with its pixel count N_i (`vol.counts`, gathered with
   the same maps). Without counts, N_i = 1. `'adaptive'` weights each member
@@ -630,7 +682,8 @@ Both GUIs (`rspace3d-builder` and `rspace3d-reconstruct`) have an
 before you symmetrise it.
 
 1. Set the Laue group and the bin factors. In the volume builder, select the
-   unwarp folder. In the raw-frame GUI, reconstruct the volume first.
+   unwarp folder. In the raw-frame GUI, reconstruct the volume first (click
+   *Reconstruct and save* once: the window keeps the volume in memory).
 2. Open the Averaging tab and click **Measure**. The panel loads and bins the
    volume once (the volume builder uses the raw cache). The volume builder
    keeps this volume, and *Process All* uses it. Measure fits the noise
@@ -652,12 +705,14 @@ before you symmetrise it.
    a UB matrix) with lines at integer Miller indices. The table shows a candidate without rejection, but the
    panel never suggests it.
 4. Select a candidate (the panel preselects the suggestion) and click
-   **Apply**. *Process All* (volume builder) or *Symmetrise + Save*
-   (raw-frame GUI) then uses this option. The sigma box of that tab is then
-   off, and a label next to it names the option. The output file records the
-   choice, the reason and a short score summary in the attribute
+   **Apply**. Then click the save button below Apply: *Symmetrise + Save*
+   (raw-frame GUI) or *Process All* (volume builder). The main button of the
+   first tab also uses the applied option. The averaging settings of the
+   Advanced tab are then off, and a note names the option. The output file
+   records the choice, the reason and a short score summary in the attribute
    `averaging_choice`. If you do not click Apply, or if you click Clear, the
-   GUI uses its own settings.
+   GUI uses the averaging settings of the Advanced tab (by default the
+   standard option).
 
 **Cancel** stops Measure or Compare after the current step or candidate. The
 panel then keeps the earlier results.

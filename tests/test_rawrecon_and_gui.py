@@ -247,10 +247,11 @@ def test_reconstruct_gui_clears_previous_volume_on_folder_change(qapp, tmp_path)
     from rspace3d.reconstruct_gui import ReconstructGUI
     gui = ReconstructGUI()
     gui._vd = object(); gui._vol = object(); gui._info = {'name': 'old'}
-    gui._set_post_enabled(True)
+    gui._last_saved = str(tmp_path / 'old.h5')
     gui._set_folder(str(tmp_path))                        # no cbf frames
     assert gui._vd is None and gui._vol is None and gui._info is None
-    assert not gui._post_group.isEnabled() and not gui.recon_btn.isEnabled()
+    assert gui._last_saved is None and gui._recon_key is None
+    assert not gui.run_btn.isEnabled() and not gui.view_btn.isEnabled()
     assert gui.hot.value() == 0                           # no hot-pixel clip by default
 
 

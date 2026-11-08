@@ -1141,13 +1141,40 @@ def laue_metric_residual(vol: VolumeData, laue_group: str) -> float | None:
     if ub is None:
         return None
     wavelength = float(vol.metadata.get('wavelength') or 1.0)
-    recip = np.asarray(ub, dtype=np.float64) / wavelength
+    return cell_metric_residual(np.asarray(ub, dtype=np.float64) / wavelength, laue_group)
+
+
+# Largest metric residual that symmetrize_volume accepts without a warning
+METRIC_TOLERANCE = 0.02
+
+
+def cell_metric_residual(recip: npt.ArrayLike, laue_group: str) -> float:
+    """`laue_metric_residual` for a reciprocal basis (columns a*, b*, c*)."""
+    recip = np.asarray(recip, dtype=np.float64)
     gstar = recip.T @ recip
     scale = float(np.abs(gstar).max())
     worst = 0.0
     for op in get_symmetry_operations(laue_group):
         worst = max(worst, float(np.abs(op.T @ gstar @ op - gstar).max()) / scale)
     return worst
+
+
+def fitting_laue_group(recip: npt.ArrayLike, laue_group: str) -> tuple[float, str]:
+    """The residual of `laue_group`, and a group that the cell metric allows.
+
+    If the residual is not more than METRIC_TOLERANCE, the group is
+    `laue_group`. Else it is the group of highest order with a residual not
+    more than METRIC_TOLERANCE ('-1' fits all cells). The metric cannot
+    tell a cubic cell from a cell with a small distortion, so a group that
+    fits is not proof of the symmetry.
+    """
+    residual = cell_metric_residual(recip, laue_group)
+    if residual <= METRIC_TOLERANCE:
+        return residual, laue_group
+    for group in sorted(_EXPECTED_ORDERS, key=lambda g: -_EXPECTED_ORDERS[g]):
+        if cell_metric_residual(recip, group) <= METRIC_TOLERANCE:
+            return residual, group
+    return residual, '-1'
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1417,7 +1444,7 @@ def symmetrize_volume(vol: VolumeData, laue_group: str,
     av = orbit_engine.Averaging(weighting=weighting, rejection=rej)
 
     residual = laue_metric_residual(vol, laue_group)
-    if residual is not None and residual > 0.02:
+    if residual is not None and residual > METRIC_TOLERANCE:
         warnings.warn(
             f"Laue group {laue_group!r} does not preserve the reciprocal metric of "
             f"this cell (relative residual {residual:.3g}); check the group and the "

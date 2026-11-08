@@ -519,21 +519,60 @@ def _builder(qapp, monkeypatch, tmp_path, vol):
     return gui, stub, loads
 
 
+STANDARD_BUILDER = {'weighting': 'equal', 'rejection': 'mad', 'sigma': 3.0}
+STANDARD_RECON = {'weighting': 'counts', 'rejection': 'mad', 'sigma': 3.0}
+
+
+def _sym_kw(kw):
+    return {k: v for k, v in kw.items() if k != 'progress_callback'}
+
+
 def test_builder_gui_defaults_and_process_all_without_panel(qapp, monkeypatch, tmp_path):
     vol = _small(seed=6)
     gui, stub, loads = _builder(qapp, monkeypatch, tmp_path, vol)
     gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('m-3m'))
-    assert (gui.laue_combo.currentData(), gui.sigma_spin.value(), gui.bin_xy_spin.value(),
-            gui.bin_z_spin.value(), gui.morph_combo.currentData(),
-            gui.force_reload_chk.isChecked()) == ('m-3m', 3.0, 2, 1, 'auto', False)
-    assert gui.tabs.tabText(0) == 'Process' and gui.tabs.tabText(1) == 'Averaging'
+    assert (gui.laue_combo.currentData(), gui.avg_settings.spec()['name'],
+            gui.bin_xy_spin.value(), gui.bin_z_spin.value(), gui.morph_combo.currentData(),
+            gui.force_reload_chk.isChecked()) == ('m-3m', 'equal, mad 3', 2, 1, 'auto', False)
+    assert [gui.tabs.tabText(i) for i in range(gui.tabs.count())] == [
+        'Process', 'Averaging', 'Advanced', 'dcunwarp file']
+    assert "'equal, mad 3' (standard)" in gui.avg_label.text()
     gui._process_all()
     _wait(qapp, gui)
     assert loads == [(2, 1)]
     (v, laue, kw), = stub.sym
     assert v is vol and laue == 'm-3m'
-    assert set(kw) == {'sigma', 'progress_callback'} and kw['sigma'] == 3.0
+    assert _sym_kw(kw) == STANDARD_BUILDER and 'progress_callback' in kw
     assert 'averaging_choice' not in stub.saved[0][1].metadata
+
+
+def test_builder_standard_is_the_earlier_default_bit_for_bit():
+    """The standard of the volume builder gives the output of the earlier default (sigma=3)."""
+    vol = _small(seed=21, counts=False)
+    old = symmetrize_volume(vol, 'mmm', sigma=3.0, use_gpu=False)
+    new = symmetrize_volume(vol, 'mmm', use_gpu=False, **STANDARD_BUILDER)
+    assert _same(old.intensity, new.intensity)
+    assert _same(old.variance, new.variance) if old.variance is not None else True
+
+
+def test_builder_gui_custom_settings_and_reset(qapp, monkeypatch, tmp_path):
+    vol = _small(seed=22)
+    gui, stub, _ = _builder(qapp, monkeypatch, tmp_path, vol)
+    s = gui.avg_settings
+    assert not s.weight_combo.isEnabled() and not s.sigma_spin.isEnabled()
+    s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
+    assert s.weight_combo.isEnabled() and s.sigma_spin.isEnabled()
+    s.weight_combo.setCurrentText('equal')
+    s.rej_combo.setCurrentText('none')
+    assert not s.sigma_spin.isEnabled() and 'spikes' in s.note_label.text()
+    assert "'equal, none' (custom)" in gui.avg_label.text()
+    gui._process_all()
+    _wait(qapp, gui)
+    assert _sym_kw(stub.sym[-1][2]) == {'weighting': 'equal', 'rejection': 'none', 'sigma': None}
+    gui.morph_combo.setCurrentIndex(2)
+    gui._reset_advanced()
+    assert s.is_standard() and gui.morph_combo.currentData() == 'auto'
+    assert "'equal, mad 3' (standard)" in gui.avg_label.text()
 
 
 def test_builder_gui_apply_passes_the_options(qapp, monkeypatch, tmp_path):
@@ -558,7 +597,7 @@ def test_builder_gui_apply_passes_the_options(qapp, monkeypatch, tmp_path):
     assert gui._current_prepared() is None and gui.avg_panel.applied_name() is None
     gui._process_all()
     _wait(qapp, gui)
-    assert loads == [(1, 1), (1, 2)] and set(stub.sym[-1][2]) == {'sigma', 'progress_callback'}
+    assert loads == [(1, 1), (1, 2)] and _sym_kw(stub.sym[-1][2]) == STANDARD_BUILDER
 
 
 def test_builder_gui_shows_that_the_option_replaces_sigma(qapp, monkeypatch, tmp_path):
@@ -567,25 +606,28 @@ def test_builder_gui_shows_that_the_option_replaces_sigma(qapp, monkeypatch, tmp
     logged = []
     monkeypatch.setattr(gui, '_log', logged.append)
     gui.bin_xy_spin.setValue(1)
+    s = gui.avg_settings
     assert gui.avg_panel.model_label.text() == 'Click Measure to start.'
-    assert gui.sigma_spin.isEnabled() and gui.sigma_note.text() == ''
+    assert s.mode_combo.isEnabled() and s.note_label.text() == ''
     gui.avg_panel._measure()
     gui.avg_panel._compare()
     gui.avg_panel.apply_combo.setCurrentText('counts, mad 3')
     gui.avg_panel._apply()
-    assert not gui.sigma_spin.isEnabled() and "'counts, mad 3'" in gui.sigma_note.text()
+    assert not s.mode_combo.isEnabled() and "'counts, mad 3'" in s.note_label.text()
+    assert "'counts, mad 3', applied in the Averaging tab" in gui.avg_label.text()
     gui._process_all()
     _wait(qapp, gui)
     head = [ln for ln in logged if ln.startswith('Processing:')]
-    assert head and "averaging option 'counts, mad 3'" in head[-1] and 'sigma=' not in head[-1]
+    assert head and "averaging option 'counts, mad 3'" in head[-1] and '(standard)' not in head[-1]
     gui.avg_panel.clear_applied()
-    assert gui.sigma_spin.isEnabled() and gui.sigma_note.text() == ''
+    assert s.mode_combo.isEnabled() and s.note_label.text() == ''
     gui.avg_panel._apply()
     gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('4/mmm'))   # reset also undoes it
-    assert gui.sigma_spin.isEnabled() and gui.sigma_note.text() == ''
+    assert s.mode_combo.isEnabled() and s.note_label.text() == ''
     gui._process_all()
     _wait(qapp, gui)
-    assert 'sigma=3.0' in [ln for ln in logged if ln.startswith('Processing:')][-1]
+    assert "averaging 'equal, mad 3' (standard)" in [
+        ln for ln in logged if ln.startswith('Processing:')][-1]
 
 
 def test_builder_gui_apply_with_a_real_symmetrisation(qapp, monkeypatch, tmp_path):
@@ -615,11 +657,9 @@ def _recon(qapp, monkeypatch, tmp_path, vol):
     stub = _Stub()
     monkeypatch.setattr(rg, 'symmetrize_volume', stub.symmetrize)
     monkeypatch.setattr(rg, 'save_volume_h5', stub.save)
-    monkeypatch.setattr(rg.QFileDialog, 'getSaveFileName',
-                        staticmethod(lambda *a, **k: (str(tmp_path / 's.h5'), '')))
     gui = rg.ReconstructGUI()
     gui._vd, gui._info, gui._folder = vol, {'name': 'x'}, str(tmp_path)
-    gui._set_post_enabled(True)
+    gui._confirm_overwrite = lambda paths: True
     gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('mmm'))
     gui.avg_panel.synchronous = True
     gui.avg_panel.crop_chk.setChecked(False)
@@ -629,13 +669,25 @@ def _recon(qapp, monkeypatch, tmp_path, vol):
 def test_reconstruct_gui_defaults_and_symmetrise_without_panel(qapp, monkeypatch, tmp_path):
     vol = _small(seed=9)
     gui, stub = _recon(qapp, monkeypatch, tmp_path, vol)
-    assert (gui.sigma.value(), gui.bin_xy.value(), gui.bin_z.value()) == (3.0, 1, 1)
-    assert gui.tabs.tabText(1) == 'Averaging' and gui.frame_tools_group is gui.avg_panel.frame_group
+    assert (gui.avg_settings.spec()['name'], gui.bin_xy.value(), gui.bin_z.value()) == (
+        'counts, mad 3', 1, 1)
+    assert [gui.tabs.tabText(i) for i in range(gui.tabs.count())] == [
+        'Reconstruct', 'Averaging', 'Advanced']
+    assert gui.frame_tools_group is gui.avg_panel.frame_group
     assert gui.avg_panel.selected_volume() is None and gui.source_note.isHidden()
+    assert "'counts, mad 3' (standard)" in gui.avg_label.text()
     gui._symmetrize_save()
     _wait(qapp, gui)
     (v, laue, kw), = stub.sym
-    assert v is vol and set(kw) == {'sigma', 'progress_callback'} and kw['sigma'] == 3.0
+    assert v is vol and _sym_kw(kw) == STANDARD_RECON
+    # the raw volume first, then the symmetrised volume, with the names of the Reconstruct tab
+    assert [os.path.basename(p) for p, _ in stub.saved] == ['x_recon_raw.h5', 'x_recon_sym_mmm.h5']
+    assert stub.saved[0][1] is vol and gui._last_saved == str(tmp_path / 'x_recon_sym_mmm.h5')
+    assert gui.view_btn.isEnabled()
+    # a second save does not write the same raw volume again
+    gui._symmetrize_save()
+    _wait(qapp, gui)
+    assert [os.path.basename(p) for p, _ in stub.saved[2:]] == ['x_recon_sym_mmm.h5']
 
 
 def test_reconstruct_gui_apply_uses_the_binned_volume(qapp, monkeypatch, tmp_path):
@@ -654,11 +706,135 @@ def test_reconstruct_gui_apply_uses_the_binned_volume(qapp, monkeypatch, tmp_pat
     (v, laue, kw), = stub.sym
     assert v is binned and kw['weighting'] == 'adaptive' and kw['sigma'] == 4.0
     assert kw['noise_model'] is gui.avg_panel._state['measured']['model']
-    assert stub.saved[0][1].metadata['averaging_choice']['name'] == 'adaptive, model 4'
-    assert not gui.sigma.isEnabled() and "'adaptive, model 4'" in gui.sigma_note.text()
+    assert stub.saved[-1][1].metadata['averaging_choice']['name'] == 'adaptive, model 4'
+    s = gui.avg_settings
+    assert not s.mode_combo.isEnabled() and "'adaptive, model 4'" in s.note_label.text()
     gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('4/mmm'))
     assert gui.avg_panel.applied_name() is None
-    assert gui.sigma.isEnabled() and gui.sigma_note.text() == ''
+    assert s.mode_combo.isEnabled() and s.note_label.text() == ''
+
+
+def _fake_recon(calls, vol):
+    """A stand-in for ReconstructGUI._do_reconstruct: records the call, returns `vol`."""
+    def run(folder, ranges, step, bins, nframes, corr, hot, use_gpu, par, tabbin):
+        calls.append((ranges, step, bins))
+        info = {'name': 'x', 'time_s': 1.0, 'ms_per_frame': 1.0, 'gpu': False,
+                'index_rms': 0.0, 'index_inliers': 0, 'measured_voxels': 1,
+                'total_voxels': 1, 'bragg_rms': 0.0, 'setup': None}
+        return object(), vol, info
+    return run
+
+
+def test_reconstruct_gui_run_uses_the_reconstruction_in_memory(qapp, monkeypatch, tmp_path):
+    vol = _small(seed=11)
+    gui, stub = _recon(qapp, monkeypatch, tmp_path, vol)
+    gui._vd = gui._info = None
+    gui._par = str(tmp_path / 'x.par')
+    calls = []
+    gui._do_reconstruct = _fake_recon(calls, vol)
+    asked = []
+    gui._confirm_overwrite = lambda paths: asked.append(paths) or True
+    gui._run()                                     # reconstruct, symmetrise and save
+    _wait(qapp, gui)
+    _wait(qapp, gui)                               # the save worker after the reconstruction
+    assert len(calls) == 1 and len(stub.sym) == 1 and len(asked) == 1
+    assert _sym_kw(stub.sym[0][2]) == STANDARD_RECON
+    assert [os.path.basename(p) for p, _ in stub.saved] == ['x_recon_raw.h5', 'x_recon_sym_mmm.h5']
+    gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('4/mmm'))
+    gui._run()                                     # same settings: no new reconstruction
+    _wait(qapp, gui)
+    assert len(calls) == 1 and stub.sym[-1][1] == '4/mmm'
+    assert os.path.basename(stub.saved[-1][0]) == 'x_recon_sym_4mmm.h5'
+    gui.dq.setValue(0.05)                          # a grid change: reconstruct again
+    gui._run()
+    _wait(qapp, gui)
+    _wait(qapp, gui)
+    assert len(calls) == 2 and calls[-1][1] == 0.05
+    # a refused overwrite stops the run before the reconstruction
+    gui.dq.setValue(0.1)
+    gui._confirm_overwrite = lambda paths: False
+    gui._run()
+    assert len(calls) == 2 and not gui._busy
+
+
+def test_reconstruct_gui_cancel_keeps_the_earlier_volume(qapp, monkeypatch, tmp_path):
+    vol = _small(seed=12)
+    gui, stub = _recon(qapp, monkeypatch, tmp_path, vol)
+    gui._par = str(tmp_path / 'x.par')
+
+    def cancelled_recon(*args):
+        raise av.Cancelled('Cancelled.')
+    gui._do_reconstruct = cancelled_recon
+    gui.dq.setValue(0.05)
+    gui._run()
+    assert gui.cancel_btn.isEnabled()
+    _wait(qapp, gui)
+    assert gui._vd is vol and not gui._busy and not gui._pending_save
+    assert stub.sym == [] and not gui.cancel_btn.isEnabled() and gui.run_btn.isEnabled()
+
+
+def test_save_refuses_a_volume_of_other_grid_settings(qapp, monkeypatch, tmp_path):
+    from rspace3d import reconstruct_gui as rg
+    gui, stub = _recon(qapp, monkeypatch, tmp_path, _small(seed=14))
+    gui._recon_key = gui._settings_key()           # the volume in memory has these settings
+    warned = []
+    monkeypatch.setattr(rg.QMessageBox, 'warning', staticmethod(lambda *a: warned.append(a)))
+    gui.dq.setValue(0.05)
+    gui.avg_panel.save_btn.click()                 # Symmetrise + Save of the Averaging tab
+    assert stub.sym == [] and len(warned) == 1 and gui._worker is None
+    gui.dq.setValue(0.025)                         # the settings of the volume again
+    gui.avg_panel.save_btn.click()
+    _wait(qapp, gui)
+    assert len(stub.sym) == 1 and len(warned) == 1
+
+
+def test_averaging_settings_keep_the_custom_values():
+    from rspace3d.averaging_panel import AveragingSettings
+    s = AveragingSettings(av.COUNTS_MAD, 'why')
+    s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
+    assert s.spec()['name'] == 'counts, mad 3'     # custom starts at the standard values
+    s.weight_combo.setCurrentText('adaptive')
+    s.rej_combo.setCurrentText('model')
+    s.sigma_spin.setValue(4.0)
+    assert s.kwargs() == {'weighting': 'adaptive', 'rejection': 'model', 'sigma': 4.0,
+                          'noise_model': None}
+    s.mode_combo.setCurrentIndex(s.mode_combo.findData('standard'))
+    assert s.spec()['name'] == 'counts, mad 3' and s.weight_combo.currentText() == 'counts'
+    s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
+    assert s.spec()['name'] == 'adaptive, model 4' and 'noise model' in s.note_label.text()
+    s.reset()
+    s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
+    assert s.spec()['name'] == 'counts, mad 3'
+
+
+def test_symmetrise_without_a_volume_gives_a_message(qapp, monkeypatch, tmp_path):
+    gui, stub = _recon(qapp, monkeypatch, tmp_path, _small(seed=13))
+    gui._vd = None
+    gui.avg_panel.save_btn.click()
+    assert stub.sym == [] and gui._worker is None
+
+
+def test_laue_check_selects_a_group_that_the_cell_allows(qapp, monkeypatch, tmp_path):
+    from rspace3d.reconstruct_gui import ReconstructGUI
+    from rspace3d.volume_builder_gui import SimpleVolumeGUI
+    from rspace3d.volume_builder import fitting_laue_group
+    a, c, beta = 5.0, 7.0, np.radians(105.0)
+    real = np.array([[a, 0, 0], [0, 6.0, 0], [c * np.cos(beta), 0, c * np.sin(beta)]]).T
+    mono = np.linalg.inv(real).T                  # columns a*, b*, c*
+    cubic = np.eye(3) / 6.0
+    assert fitting_laue_group(cubic, 'm-3m') == (0.0, 'm-3m')
+    assert fitting_laue_group(mono, 'm-3m')[1] == '2/m'
+    for cls in (ReconstructGUI, SimpleVolumeGUI):
+        gui = cls()
+        gui._recip = mono
+        gui._check_laue(switch=True)
+        assert gui.laue_combo.currentData() == '2/m' and not gui.laue_note.isHidden()
+        gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('mmm'))
+        assert 'does not allow mmm' in gui.laue_note.text() and not gui.laue_note.isHidden()
+        gui._recip = cubic
+        gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('m-3m'))
+        assert gui.laue_note.isHidden()
+        gui.close()
 
 
 def test_gui_log_height_at_the_default_size(qapp):

@@ -45,11 +45,10 @@ def scene():
 
 def _gui(qapp, monkeypatch, tmp_path, sc):
     from rspace3d import reconstruct_gui as rg
-    monkeypatch.setattr(rg.QFileDialog, 'getSaveFileName',
-                        staticmethod(lambda *a, **k: (str(tmp_path / 's.h5'), '')))
     gui = rg.ReconstructGUI()
     gui._vd, gui._info, gui._folder = sc.raw, {'name': 'x', 'setup': sc.setup}, str(tmp_path)
-    gui._set_post_enabled(True)
+    gui._confirm_overwrite = lambda paths: True
+    gui.save_raw_chk.setChecked(False)
     gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('mmm'))
     gui.avg_panel.synchronous = True
     gui.avg_panel.crop_chk.setChecked(False)
@@ -170,7 +169,7 @@ def test_split_half_check_measure_compare_and_save(qapp, monkeypatch, tmp_path, 
     panel._apply()
     gui._symmetrize_save()
     _wait(qapp, gui._worker)
-    back = load_volume_h5(str(tmp_path / 's.h5'))
+    back = load_volume_h5(str(tmp_path / 'x_recon_sym_mmm_ringmask.h5'))
     assert back.metadata['frame_correction'] == 'ring_mask'
     assert back.metadata['frame_tools']['rings']['ring_windows'] == 1
     choice = back.metadata['averaging_choice']
@@ -320,8 +319,10 @@ def test_defaults_unchanged_when_the_tools_are_not_used(qapp, monkeypatch, tmp_p
     gui._symmetrize_save()
     _wait(qapp, gui._worker)
     (v, kw), = calls
-    assert v is scene.raw and set(kw) == {'sigma', 'progress_callback'} and kw['sigma'] == 3.0
-    back = load_volume_h5(str(tmp_path / 's.h5'))
+    assert v is scene.raw and kw['progress_callback'] is not None
+    assert {k: kw[k] for k in ('weighting', 'rejection', 'sigma')} == {
+        'weighting': 'counts', 'rejection': 'mad', 'sigma': 3.0}       # the standard
+    back = load_volume_h5(str(tmp_path / 'x_recon_sym_mmm.h5'))
     assert 'frame_correction' not in back.metadata and 'frame_tools' not in back.metadata
 
 

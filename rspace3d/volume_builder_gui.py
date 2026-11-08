@@ -7,6 +7,10 @@ Select unwarp folder → Process All:
   3. Bin 2x2 (HK), reject outliers, symmetrize
   4. Save processed volume as .h5 with Laue group suffix
 
+Tabs: Process (folder, Laue group, binning, Process All), Averaging (measure
+and compare the averaging options), Advanced (averaging settings, coverage
+mask, raw cache) and dcunwarp file (layer list for CrysAlisPro).
+
 Usage:
     python volume_builder_gui.py
 """
@@ -31,11 +35,20 @@ from .volume_builder import (
     load_unwarp_folder, bin_volume, symmetrize_volume,
     save_volume_h5, load_volume_h5, adaptive_morph_size, bin_native,
     raw_cache_mismatch, _read_header_fast, resolve_unit_cell, format_symmetry_diagnostics,
-    _filter_numbered_imgs, _img_number,
-    LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
+    _filter_numbered_imgs, _img_number, fitting_laue_group,
+    LAUE_GROUP_NAMES, METRIC_TOLERANCE, _EXPECTED_ORDERS, HAS_GPU,
 )
 from .make_dcunwarp import generate_dcunwarp
-from .averaging_panel import LOG_HEIGHT, AveragingPanel
+from .averaging import EQUAL_MAD
+from .averaging_panel import LOG_HEIGHT, AveragingPanel, AveragingSettings
+
+STANDARD_WHY = (
+    "Standard for unwarp layers: 'equal, mad 3', the default of the earlier versions. The "
+    'value is the plain mean of the orbit members. A member farther than 3 x the robust '
+    'spread (MAD, at least the Poisson value) from the orbit median is rejected. The layers '
+    'have no detector pixel counts: without a binning there are no counts, and with a '
+    'binning the counts are only the covered sub-pixels of each voxel. Thus the counts '
+    'weights give almost no gain here.')
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -83,6 +96,7 @@ class SimpleVolumeGUI(QMainWindow):
         self._dataset_valid = False
         # The binned volume of the Averaging panel: {'key', 'vol', 'raw_path', 'base'}
         self._prepared: dict[str, Any] | None = None
+        self._recip: Any = None     # reciprocal basis of the .img header (columns a*, b*, c*)
         self._build_ui()
 
         if HAS_GPU:
@@ -115,7 +129,8 @@ class SimpleVolumeGUI(QMainWindow):
         self.tabs.addTab(process_scroll, 'Process')
 
         # ── Folder selection ──
-        g1 = QGroupBox('Select Unwarp Folder')
+        g1 = QGroupBox('1. Unwarp folder  (CrysAlisPro unwarp .img layers)')
+        v1 = QVBoxLayout(g1)
         h1 = QHBoxLayout()
         self.folder_label = QLabel('No folder selected')
         self.folder_label.setWordWrap(True)
@@ -126,20 +141,199 @@ class SimpleVolumeGUI(QMainWindow):
             'Select the folder containing CrysAlisPro unwarp .img files.\n'
             'These are HK reciprocal space reconstructions at different l values.')
         h1.addWidget(self.browse_btn)
-        g1.setLayout(h1)
-        layout.addWidget(g1)
-
+        v1.addLayout(h1)
         self.info_label = QLabel('')
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet('color: #555; padding: 4px;')
-        layout.addWidget(self.info_label)
+        self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v1.addWidget(self.info_label)
+        layout.addWidget(g1)
 
-        # ── Generate dcunwarp ──
+        # ── Processing settings + one button ──
+        g2 = QGroupBox('2. Process')
+        f2 = QFormLayout()
+
+        self.laue_combo = QComboBox()
+        for key, label in LAUE_GROUP_NAMES.items():
+            self.laue_combo.addItem(label, key)
+        self.laue_combo.setCurrentIndex(list(LAUE_GROUP_NAMES.keys()).index('m-3m'))
+        self.laue_combo.setToolTip(
+            'Laue group for symmetrization and outlier rejection.\n'
+            'Determines which symmetry operations are applied to average\n'
+            'equivalent reflections in reciprocal space.\n\n'
+            'Common choices:\n'
+            '  m-3m  — cubic (e.g. MAPbBr3, CsPbCl3)\n'
+            '  4/mmm — tetragonal\n'
+            '  mmm   — orthorhombic\n'
+            '  2/m   — monoclinic\n'
+            '  -1    — triclinic (inversion only, no symmetry averaging)\n\n'
+            'The window checks only that the cell metric allows the group:\n'
+            'the metric cannot tell a cubic cell from a cell with a small\n'
+            'distortion.')
+        f2.addRow('Laue group:', self.laue_combo)
+        self.laue_note = QLabel('')
+        self.laue_note.setWordWrap(True)
+        self.laue_note.setVisible(False)
+        f2.addRow(self.laue_note)
+
+        bin_row = QHBoxLayout()
+        bin_row.addWidget(QLabel('H,K:'))
+        self.bin_xy_spin = QSpinBox()
+        self.bin_xy_spin.setRange(1, 16); self.bin_xy_spin.setValue(2)
+        self.bin_xy_spin.setToolTip(
+            'Bin factor for H and K axes.\n'
+            'Averages NxN pixels to reduce volume size and noise.\n'
+            '1 = no binning, 2 = 2x2 (4x smaller), 4 = 4x4 (16x smaller)')
+        bin_row.addWidget(self.bin_xy_spin)
+        bin_row.addWidget(QLabel('L:'))
+        self.bin_z_spin = QSpinBox()
+        self.bin_z_spin.setRange(1, 16); self.bin_z_spin.setValue(1)
+        self.bin_z_spin.setToolTip(
+            'Bin factor for L axis (stacking direction).\n'
+            '1 = keep all L slices, 2 = average pairs, etc.')
+        bin_row.addWidget(self.bin_z_spin)
+        bin_row.addStretch(1)
+        f2.addRow('Binning:', bin_row)
+
+        self.avg_label = QLabel('')
+        self.avg_label.setWordWrap(True)
+        f2.addRow('Averaging:', self.avg_label)
+
+        self.process_btn = QPushButton('Process All')
+        self.process_btn.setEnabled(False)
+        self.process_btn.setMinimumHeight(40)
+        self.process_btn.setStyleSheet('font-weight: bold; font-size: 13px;')
+        self.process_btn.clicked.connect(self._process_all)
+        self.process_btn.setToolTip(
+            'Run the full pipeline:\n'
+            '1. Load all .img files into 3D volume (with per-frame coverage mask)\n'
+            '2. Save raw volume as .h5\n'
+            '3. Bin the volume\n'
+            '4. Single-pass symmetrize + outlier rejection (orbit MAD clip)\n'
+            '5. Save processed volume as .h5')
+        f2.addRow(self.process_btn)
+
+        g2.setLayout(f2)
+        layout.addWidget(g2)
+        layout.addStretch(1)
+
+        # ── Averaging panel ──
+        self.avg_panel = AveragingPanel(self._averaging_request, log=self._log,
+                                        progress=self._update_progress)
+        self.avg_panel.busy_changed.connect(self._on_panel_busy)
+        self.avg_panel.applied_changed.connect(self._on_applied_changed)
+        self.avg_panel.set_save_action(
+            'Process All', self._process_all,
+            'Symmetrise with the applied option (or with the settings of the\n'
+            'Advanced tab) and save. The same step as Process All in the\n'
+            'Process tab.')
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.avg_panel)
+        self.tabs.addTab(scroll, 'Averaging')
+
+        self._build_advanced_tab()
+        self._build_dcunwarp_tab()
+
+        self.laue_combo.currentIndexChanged.connect(self._on_laue_changed)
+        for w in (self.bin_xy_spin, self.bin_z_spin):
+            w.valueChanged.connect(self._invalidate_prepared)
+        self.morph_combo.currentIndexChanged.connect(self._invalidate_prepared)
+        self.force_reload_chk.toggled.connect(self._invalidate_prepared)
+        self.avg_settings.changed.connect(self._update_avg_label)
+
+        # ── Progress + log ──
+        bottom = QWidget()
+        bl = QVBoxLayout(bottom)
+        bl.setContentsMargins(0, 0, 0, 0)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
+        bl.addWidget(self.progress)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
+        bl.addWidget(self.log)
+        self.split.addWidget(bottom)
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 0)
+        # About 230 px for the progress bar and the log at the default window size
+        self.split.setSizes([LOG_HEIGHT * 3, LOG_HEIGHT])
+        self._update_avg_label()
+
+    def _build_advanced_tab(self):
+        self.adv_tab = QWidget()
+        layout = QVBoxLayout(self.adv_tab)
+        adv_scroll = QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_scroll.setWidget(self.adv_tab)
+        self.tabs.addTab(adv_scroll, 'Advanced')
+        intro = QLabel('The defaults are the standard settings. Change them only if you need to.')
+        intro.setStyleSheet('color: #555;')
+        layout.addWidget(intro)
+
+        self.avg_settings = AveragingSettings(EQUAL_MAD, STANDARD_WHY)
+        layout.addWidget(self.avg_settings)
+
+        g = QGroupBox('Unwarp layers')
+        f = QFormLayout(g)
+        f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        # Coverage-mask kernel (auto by default; allow odd integer override)
+        self.morph_combo = QComboBox()
+        self.morph_combo.addItem('auto', 'auto')
+        for n in (3, 5, 7, 9, 11, 13, 15):
+            self.morph_combo.addItem(str(n), n)
+        self.morph_combo.setToolTip(
+            'Coverage-mask morphological-opening kernel.\n'
+            'Decides which zero pixels are real low-count measurements\n'
+            'vs unmeasured detector regions (gaps, beamstop, edges).\n\n'
+            "'auto' (default) picks ~5% of one Bragg cell from the\n"
+            'detector geometry — adapts to detector distance, pixel\n'
+            'count and unit cell size.\n\n'
+            'Override with a fixed odd integer if needed (3 = original\n'
+            'behaviour; larger = fewer false positives, may shave thin\n'
+            'detector gaps).')
+        f.addRow('Mask kernel:', self.morph_combo)
+
+        # Force-reload toggle (default: reuse _raw.h5 if it exists and
+        # matches the requested morph_size).
+        self.force_reload_chk = QCheckBox('Force re-read .img files')
+        self.force_reload_chk.setChecked(False)
+        self.force_reload_chk.setToolTip(
+            'When unchecked (default): if a {prefix}_raw.h5 already exists\n'
+            'in the unwarp folder AND its morph_size matches the request,\n'
+            'load from there and skip the .img read + raw save steps.\n\n'
+            'Check this to always re-read the .img files and overwrite\n'
+            'the cached raw file (e.g. if frames changed on disk).')
+        f.addRow('', self.force_reload_chk)
+        layout.addWidget(g)
+
+        self.reset_btn = QPushButton('Reset to the standard settings')
+        self.reset_btn.setToolTip('Set all settings of this tab to the standard values.')
+        self.reset_btn.clicked.connect(self._reset_advanced)
+        row = QHBoxLayout()
+        row.addWidget(self.reset_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addStretch(1)
+
+    def _build_dcunwarp_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.tabs.addTab(tab, 'dcunwarp file')
         g_dc = QGroupBox('Generate dcunwarp file (for CrysAlisPro)')
         g_dc.setToolTip(
             'Generate a .dcunwarp layer list file for CrysAlisPro.\n'
             'Use this BEFORE processing to create HK reconstructions\n'
             'at each l value via the "dc unwarp" command in CrysAlisPro.')
+        v = QVBoxLayout(g_dc)
+        help_label = QLabel(
+            'Step 1 of route B. Make the layer list, then run "dc unwarp" in CrysAlisPro '
+            'with it. CrysAlisPro writes the .img layers into an unwarp folder. Select '
+            'that folder in the Process tab.')
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet('color: #555;')
+        v.addWidget(help_label)
         dc_layout = QHBoxLayout()
 
         dc_layout.addWidget(QLabel('l min:'))
@@ -174,148 +368,16 @@ class SimpleVolumeGUI(QMainWindow):
         self.dc_btn.clicked.connect(self._generate_dcunwarp)
         self.dc_btn.setToolTip('Create .dcunwarp file in the selected folder')
         dc_layout.addWidget(self.dc_btn)
-
-        g_dc.setLayout(dc_layout)
+        dc_layout.addStretch(1)
+        v.addLayout(dc_layout)
         layout.addWidget(g_dc)
-
-        # ── Processing settings + one button ──
-        g2 = QGroupBox('Process')
-        f2 = QFormLayout()
-
-        self.laue_combo = QComboBox()
-        for key, label in LAUE_GROUP_NAMES.items():
-            self.laue_combo.addItem(label, key)
-        self.laue_combo.setCurrentIndex(list(LAUE_GROUP_NAMES.keys()).index('m-3m'))
-        self.laue_combo.setToolTip(
-            'Laue group for symmetrization and outlier rejection.\n'
-            'Determines which symmetry operations are applied to average\n'
-            'equivalent reflections in reciprocal space.\n\n'
-            'Common choices:\n'
-            '  m-3m  — cubic (e.g. MAPbBr3, CsPbCl3)\n'
-            '  4/mmm — tetragonal\n'
-            '  mmm   — orthorhombic\n'
-            '  2/m   — monoclinic\n'
-            '  -1    — triclinic (inversion only, no symmetry averaging)')
-        f2.addRow('Laue group:', self.laue_combo)
-
-        bin_row = QHBoxLayout()
-        bin_row.addWidget(QLabel('H,K:'))
-        self.bin_xy_spin = QSpinBox()
-        self.bin_xy_spin.setRange(1, 16); self.bin_xy_spin.setValue(2)
-        self.bin_xy_spin.setToolTip(
-            'Bin factor for H and K axes.\n'
-            'Averages NxN pixels to reduce volume size and noise.\n'
-            '1 = no binning, 2 = 2x2 (4x smaller), 4 = 4x4 (16x smaller)')
-        bin_row.addWidget(self.bin_xy_spin)
-        bin_row.addWidget(QLabel('L:'))
-        self.bin_z_spin = QSpinBox()
-        self.bin_z_spin.setRange(1, 16); self.bin_z_spin.setValue(1)
-        self.bin_z_spin.setToolTip(
-            'Bin factor for L axis (stacking direction).\n'
-            '1 = keep all L slices, 2 = average pairs, etc.')
-        bin_row.addWidget(self.bin_z_spin)
-        f2.addRow('Binning:', bin_row)
-
-        self.sigma_spin = QDoubleSpinBox()
-        self.sigma_spin.setRange(1.0, 10.0)
-        self.sigma_spin.setValue(3.0)
-        self.sigma_spin.setSingleStep(0.5)
-        self.sigma_spin.setDecimals(1)
-        self.sigma_spin.setToolTip(
-            'Outlier rejection threshold in units of robust standard deviation.\n'
-            'For each voxel, the symmetry-equivalent orbit is gathered and\n'
-            'members deviating more than N*sigma*MAD from the orbit median\n'
-            'are excluded from the symmetrized mean.\n\n'
-            '3.0 = standard\n'
-            '5.0 = conservative (removes only extreme outliers)\n'
-            '1.5 = aggressive (tighter clipping, use with caution)')
-        sigma_row = QHBoxLayout()
-        sigma_row.addWidget(self.sigma_spin)
-        self.sigma_note = QLabel('')
-        self.sigma_note.setStyleSheet('color: #070; font-weight: bold;')
-        sigma_row.addWidget(self.sigma_note, stretch=1)
-        f2.addRow('Outlier sigma:', sigma_row)
-
-        # Coverage-mask kernel (auto by default; allow odd integer override)
-        self.morph_combo = QComboBox()
-        self.morph_combo.addItem('auto', 'auto')
-        for n in (3, 5, 7, 9, 11, 13, 15):
-            self.morph_combo.addItem(str(n), n)
-        self.morph_combo.setToolTip(
-            'Coverage-mask morphological-opening kernel.\n'
-            'Decides which zero pixels are real low-count measurements\n'
-            'vs unmeasured detector regions (gaps, beamstop, edges).\n\n'
-            "'auto' (default) picks ~5% of one Bragg cell from the\n"
-            'detector geometry — adapts to detector distance, pixel\n'
-            'count and unit cell size.\n\n'
-            'Override with a fixed odd integer if needed (3 = original\n'
-            'behaviour; larger = fewer false positives, may shave thin\n'
-            'detector gaps).')
-        f2.addRow('Mask kernel:', self.morph_combo)
-
-        # Force-reload toggle (default: reuse _raw.h5 if it exists and
-        # matches the requested morph_size).
-        self.force_reload_chk = QCheckBox('Force re-read .img files')
-        self.force_reload_chk.setChecked(False)
-        self.force_reload_chk.setToolTip(
-            'When unchecked (default): if a {prefix}_raw.h5 already exists\n'
-            'in the unwarp folder AND its morph_size matches the request,\n'
-            'load from there and skip the .img read + raw save steps.\n\n'
-            'Check this to always re-read the .img files and overwrite\n'
-            'the cached raw file (e.g. if frames changed on disk).')
-        f2.addRow('', self.force_reload_chk)
-
-        self.process_btn = QPushButton('Process All')
-        self.process_btn.setEnabled(False)
-        self.process_btn.setMinimumHeight(40)
-        self.process_btn.setStyleSheet('font-weight: bold; font-size: 13px;')
-        self.process_btn.clicked.connect(self._process_all)
-        self.process_btn.setToolTip(
-            'Run the full pipeline:\n'
-            '1. Load all .img files into 3D volume (with per-frame coverage mask)\n'
-            '2. Save raw volume as .h5\n'
-            '3. Bin the volume\n'
-            '4. Single-pass symmetrize + outlier rejection (orbit MAD clip)\n'
-            '5. Save processed volume as .h5')
-        f2.addRow(self.process_btn)
-
-        g2.setLayout(f2)
-        layout.addWidget(g2)
         layout.addStretch(1)
 
-        # ── Averaging panel ──
-        self.avg_panel = AveragingPanel(self._averaging_request, log=self._log,
-                                        progress=self._update_progress)
-        self.avg_panel.busy_changed.connect(self._on_panel_busy)
-        self.avg_panel.applied_changed.connect(self._on_applied_changed)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.avg_panel)
-        self.tabs.addTab(scroll, 'Averaging')
-        self.laue_combo.currentIndexChanged.connect(
-            lambda _: self.avg_panel.reset('The Laue group changed. Click Measure again.'))
-        for w in (self.bin_xy_spin, self.bin_z_spin):
-            w.valueChanged.connect(self._invalidate_prepared)
-        self.morph_combo.currentIndexChanged.connect(self._invalidate_prepared)
-        self.force_reload_chk.toggled.connect(self._invalidate_prepared)
-
-        # ── Progress + log ──
-        bottom = QWidget()
-        bl = QVBoxLayout(bottom)
-        bl.setContentsMargins(0, 0, 0, 0)
-        self.progress = QProgressBar()
-        self.progress.setTextVisible(True)
-        bl.addWidget(self.progress)
-
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
-        bl.addWidget(self.log)
-        self.split.addWidget(bottom)
-        self.split.setStretchFactor(0, 1)
-        self.split.setStretchFactor(1, 0)
-        # About 230 px for the progress bar and the log at the default window size
-        self.split.setSizes([LOG_HEIGHT * 3, LOG_HEIGHT])
+    def _reset_advanced(self) -> None:
+        self.avg_settings.reset()
+        self.morph_combo.setCurrentIndex(0)
+        self.force_reload_chk.setChecked(False)
+        self._log('Advanced: the settings are the standard settings again.')
 
     # ── Folder ──
 
@@ -329,6 +391,7 @@ class SimpleVolumeGUI(QMainWindow):
     def _set_folder(self, folder):
         self._folder_path = folder
         self._dataset_valid = False
+        self._recip = None
         self._invalidate_prepared()
         self.folder_label.setText(folder)
         self._log(f'Folder: {folder}')
@@ -382,12 +445,19 @@ class SimpleVolumeGUI(QMainWindow):
 
         self._dataset_valid = True
         self.process_btn.setEnabled(True)
+        try:
+            self._recip = (np.asarray(hdr['ub'], np.float64).reshape(3, 3)
+                           / float(hdr['wavelength']))
+        except Exception:
+            self._recip = None
+        self._check_laue(switch=True)
 
     def _fail_folder(self, msg):
         self._dataset_valid = False
         self.info_label.setText(msg)
         self._log('  ERROR: ' + msg)
         self.process_btn.setEnabled(False)
+        self._check_laue()
 
     # ── Generate dcunwarp ──
 
@@ -431,8 +501,12 @@ class SimpleVolumeGUI(QMainWindow):
     # ── Process All ──
 
     def _process_all(self):
+        if not self._dataset_valid or not self._folder_path:
+            msg = 'Select an unwarp folder with .img files first (Process tab).'
+            self._log(msg)
+            self.statusBar().showMessage(msg)  # type: ignore[union-attr]
+            return
         laue = self.laue_combo.currentData()
-        sigma = self.sigma_spin.value()
         morph = self.morph_combo.currentData()
         force_reload = self.force_reload_chk.isChecked()
         bin_xy = self.bin_xy_spin.value()
@@ -447,9 +521,10 @@ class SimpleVolumeGUI(QMainWindow):
             sym_kw = self.avg_panel.symmetrize_kwargs(prepared['vol'], laue)
             choice = self.avg_panel.choice_metadata() if sym_kw else None
         if sym_kw:
-            rule = f"averaging option '{choice['name'] if choice else '?'}'"
+            rule = f"averaging option '{choice['name'] if choice else '?'}' from the Averaging tab"
         else:
-            rule = f'sigma={sigma}'
+            sym_kw = self.avg_settings.kwargs()
+            rule = f'averaging {self.avg_settings.describe()}'
 
         self._set_busy(True, 'Processing...')
         self._log(f'\n{"="*50}')
@@ -460,7 +535,7 @@ class SimpleVolumeGUI(QMainWindow):
 
         self._worker = WorkerThread(
             self._do_process_all,
-            self._folder_path, laue, sigma, morph, bin_xy, bin_z,
+            self._folder_path, laue, rule, morph, bin_xy, bin_z,
             force_reload, prepared, sym_kw, choice)
         self._worker.progress.connect(self._update_progress)
         self._worker.log_msg.connect(self._log)
@@ -506,14 +581,61 @@ class SimpleVolumeGUI(QMainWindow):
         return laue, volume_fn
 
     def _on_applied_changed(self) -> None:
-        """An applied averaging option replaces the outlier sigma of Process All."""
+        """An applied averaging option replaces the settings of the Advanced tab."""
+        self.avg_settings.set_override(self.avg_panel.applied_name())
+        self._update_avg_label()
+
+    def _update_avg_label(self, *_: Any) -> None:
         name = self.avg_panel.applied_name()
-        self.sigma_spin.setEnabled(name is None)
-        self.sigma_note.setText('' if name is None
-                                else f"Not used. Process All uses '{name}' (Averaging tab).")
+        if name is not None:
+            text = (f"'{name}', applied in the Averaging tab. Click Clear in that tab to use "
+                    'the settings of the Advanced tab again.')
+            self.avg_label.setStyleSheet('color: #070; font-weight: bold;')
+        elif self.avg_settings.is_standard():
+            text = (f'{self.avg_settings.describe()}: equal weights and MAD outlier rejection '
+                    'at 3 sigma. Change it in the Advanced tab, or compare the options on your '
+                    'volume in the Averaging tab.')
+            self.avg_label.setStyleSheet('')
+        else:
+            text = f'{self.avg_settings.describe()}, set in the Advanced tab.'
+            self.avg_label.setStyleSheet('color: #a05000; font-weight: bold;')
+        self.avg_label.setText(text)
+
+    def _on_laue_changed(self, *_: Any) -> None:
+        self.avg_panel.reset('The Laue group changed. Click Measure again.')
+        self._check_laue()
+
+    def _check_laue(self, switch: bool = False) -> None:
+        """Show a note if the cell metric does not allow the Laue group.
+
+        With `switch`, select the allowed group of highest order instead."""
+        if self._recip is None:
+            self.laue_note.setVisible(False)
+            return
+        laue = self.laue_combo.currentData()
+        residual, fit = fitting_laue_group(self._recip, laue)
+        if fit == laue:
+            self.laue_note.setVisible(False)
+            return
+        if switch:
+            self.laue_combo.setCurrentIndex(self.laue_combo.findData(fit))
+            text = (f'The cell metric does not allow {laue} (residual {residual:.2g}). The '
+                    f'window selected {fit}: the group of highest order that the cell allows. '
+                    'Check the Laue group.')
+            self._log('Laue group: ' + text)
+            style = 'color: #a05000; font-weight: bold;'
+        else:
+            text = (f'The cell metric does not allow {laue} (residual {residual:.2g}, limit '
+                    f'{METRIC_TOLERANCE:g}). The group of highest order that the cell allows '
+                    f'is {fit}.')
+            style = 'color: #a00; font-weight: bold;'
+        self.laue_note.setText(text)
+        self.laue_note.setStyleSheet(style)
+        self.laue_note.setVisible(True)
 
     def _on_panel_busy(self, busy: bool) -> None:
         self.process_tab.setEnabled(not busy)
+        self.adv_tab.setEnabled(not busy)
         if busy:
             self.statusBar().showMessage('Averaging panel is running...')  # type: ignore[union-attr]
         else:
@@ -523,7 +645,7 @@ class SimpleVolumeGUI(QMainWindow):
         self,
         folder: str,
         laue: str,
-        sigma: float,
+        rule: str,
         morph: int | str,
         bin_xy: int,
         bin_z: int,
@@ -549,15 +671,10 @@ class SimpleVolumeGUI(QMainWindow):
         n_ops = _EXPECTED_ORDERS[laue]
         log(f'Step 4/4: Symmetrize + outlier rejection ({device})...')
         t0 = time.time()
-        if sym_kw:
-            log(f'  Laue group: {laue} ({n_ops} ops), averaging option '
-                f'\'{choice["name"] if choice else "?"}\' from the Averaging panel')
-            vol = symmetrize_volume(vol, laue, progress_callback=cb, **sym_kw)
-            if choice is not None:
-                vol.metadata['averaging_choice'] = choice
-        else:
-            log(f'  Laue group: {laue} ({n_ops} ops), sigma={sigma}')
-            vol = symmetrize_volume(vol, laue, sigma=sigma, progress_callback=cb)
+        log(f'  Laue group: {laue} ({n_ops} ops), {rule}')
+        vol = symmetrize_volume(vol, laue, progress_callback=cb, **(sym_kw or {}))
+        if choice is not None:
+            vol.metadata['averaging_choice'] = choice
         dt_sym = time.time() - t0
         n_removed = vol.metadata.get('n_outliers_removed', 0)
         log(f'  Done in {dt_sym:.1f}s '
@@ -725,6 +842,7 @@ class SimpleVolumeGUI(QMainWindow):
         self.browse_btn.setEnabled(not busy)
         self.process_btn.setEnabled(not busy and self._dataset_valid)
         self.dc_btn.setEnabled(not busy)
+        self.adv_tab.setEnabled(not busy)
         self.avg_panel.set_host_busy(busy)
         self.statusBar().showMessage(message if message else ('Ready' if not busy else ''))
 
