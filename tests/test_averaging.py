@@ -398,8 +398,8 @@ def test_automatic_candidates_reject_outliers():
     for has_counts in (True, False):
         cands = automatic_candidates(has_counts)
         names = [c['name'] for c in cands]
-        assert names[0] == BIAS_REFERENCE == 'equal, mad 3'
-        assert ('counts, mad 3' in names) == has_counts and 'adaptive, model 4' in names
+        assert names[0] == BIAS_REFERENCE == 'equal weights, spread limit (3 sigma)'
+        assert ('pixel-count weights, spread limit (3 sigma)' in names) == has_counts and 'noise weights, noise limit (4 sigma)' in names
         assert all(c['rejection'] != 'none' for c in cands)
 
 
@@ -408,7 +408,8 @@ def test_suggest_uses_the_mad_reference_and_checks_both_sides():
     model, grad = fit_noise_model(vol, '4/mmm', use_gpu=False, return_gradient=True)
     scores = score_candidates(vol, '4/mmm', noise_model=model, grad=grad, n_members=200_000,
                               use_gpu=False)
-    names = ['equal, mad 3', 'counts, mad 3', 'adaptive, model 4']
+    names = ['equal weights, spread limit (3 sigma)', 'pixel-count weights, spread limit (3 sigma)',
+             'pixel-count weights, noise limit (4 sigma)', 'noise weights, noise limit (4 sigma)']
     assert list(scores['candidates']) == names and scores['has_counts']
     outs = {}
     for c in automatic_candidates(True):
@@ -442,30 +443,30 @@ def _ok(**kw):
 
 
 def test_suggest_rules_and_preselection():
-    scores = _fake({'equal, mad 3': 1.2, 'counts, mad 3': 1.1, 'adaptive, model 4': 1.0})
+    scores = _fake({'equal weights, spread limit (3 sigma)': 1.2, 'pixel-count weights, spread limit (3 sigma)': 1.1, 'noise weights, noise limit (4 sigma)': 1.0})
     good = {n: _ok() for n in scores['candidates']}
-    assert suggest(scores, good)[0] == 'adaptive, model 4'
+    assert suggest(scores, good)[0] == 'noise weights, noise limit (4 sigma)'
     # a ratio above 1 + tol fails too (both sides)
     for kw, text in (({'node_sum_ratio': 1.05}, 'node sum ratio'),
                      ({'node_sum_ratio': 0.95}, 'node sum ratio'),
                      ({'extra_sum_ratio': {'(0.5, 0.5, 0.5)': 1.03}}, 'sum ratio at'),
                      ({'diffuse_sum_ratio': 0.97}, 'diffuse sum ratio'),
                      ({'n_lost': 3}, '3 voxels NaN')):
-        bias = dict(good, **{'adaptive, model 4': _ok(**kw)})
+        bias = dict(good, **{'noise weights, noise limit (4 sigma)': _ok(**kw)})
         name, reason = suggest(scores, bias)
-        assert name == 'counts, mad 3' and text in reason, kw
+        assert name == 'pixel-count weights, spread limit (3 sigma)' and text in reason, kw
     # no estimate for some members
-    name, reason = suggest(_fake(scores_by_name={'counts, mad 3': 1.1, 'adaptive, model 4': 1.0},
-                                 n_no={'adaptive, model 4': 5}), good)
-    assert name == 'counts, mad 3' and 'no estimate for 5' in reason
+    name, reason = suggest(_fake(scores_by_name={'pixel-count weights, spread limit (3 sigma)': 1.1, 'noise weights, noise limit (4 sigma)': 1.0},
+                                 n_no={'noise weights, noise limit (4 sigma)': 5}), good)
+    assert name == 'pixel-count weights, spread limit (3 sigma)' and 'no estimate for 5' in reason
     # nothing passes: the preselection
     bad = {n: _ok(n_lost=1) for n in scores['candidates']}
     name, reason = suggest(scores, bad)
-    assert name == 'counts, mad 3' and 'No candidate passes' in reason
-    name, reason = suggest(_fake({'equal, mad 3': 1.2, 'adaptive, model 4': 1.0}, False), bad)
-    assert name == 'equal, mad 3' and 'no pixel counts' in reason
-    assert preselect(True, 'The fit failed.')[0] == 'counts, mad 3'
-    assert preselect(False)[0] == 'equal, mad 3'
+    assert name == 'pixel-count weights, spread limit (3 sigma)' and 'No candidate passes' in reason
+    name, reason = suggest(_fake({'equal weights, spread limit (3 sigma)': 1.2, 'noise weights, noise limit (4 sigma)': 1.0}, False), bad)
+    assert name == 'equal weights, spread limit (3 sigma)' and 'no pixel counts' in reason
+    assert preselect(True, 'The fit failed.')[0] == 'pixel-count weights, spread limit (3 sigma)'
+    assert preselect(False)[0] == 'equal weights, spread limit (3 sigma)'
 
 
 def test_bias_checks_count_the_lost_voxels():
@@ -524,3 +525,17 @@ def test_noise_model_rejects_invalid_parameters():
     with pytest.raises(ValueError):
         NoiseModel(gain=float('nan'))
     assert NoiseModel(gain=0.0, floor=1.0).params == (0.0, 0.0, 0.0, 1.0)
+
+
+def test_suggest_node_check_against_the_sum_without_rejection():
+    a, b = 'pixel-count weights, spread limit (3 sigma)', 'pixel-count weights, noise limit (4 sigma)'
+    scores = _fake({a: 1.1, b: 1.0})
+    # the reference keeps 0.50 of the node sum; b keeps 0.50 * 1.20 = 0.60: more is not a failure
+    bias = {a: _ok(), b: _ok(node_sum_ratio=1.20)}
+    assert suggest(scores, bias)[0] == a                      # the old rule: both sides
+    assert suggest(scores, bias, node_kept=0.5)[0] == b
+    # b keeps 0.50 * 0.97 = 0.485: 0.015 less than the reference, inside the tolerance 0.02
+    assert suggest(scores, {a: _ok(), b: _ok(node_sum_ratio=0.97)}, node_kept=0.5)[0] == b
+    # b keeps 0.50 * 0.95 = 0.475: 0.025 less than the reference
+    name, reason = suggest(scores, {a: _ok(), b: _ok(node_sum_ratio=0.95)}, node_kept=0.5)
+    assert name == a and 'keeps 0.4750 of the node sum' in reason

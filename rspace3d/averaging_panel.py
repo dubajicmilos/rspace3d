@@ -5,7 +5,7 @@ raw-frame reconstruction GUI.
 The panel has three steps:
 
 * Measure: fits the noise model, symmetrises once with the default options
-  ('equal, mad 3') and shows the diagnostics per |q| shell.
+  ('equal weights, spread limit (3 sigma)') and shows the diagnostics per |q| shell.
 * Compare: scores a list of averaging options, compares their sums with the
   default and shows a table, a suggestion and one slice.
 * Apply: the host GUI uses the selected option in its normal symmetrise
@@ -62,7 +62,7 @@ from . import orbit_engine as oe
 from .averaging import FRAME_MAP_DEFINITION
 
 # Orbit members (voxels x operations) of the automatic crop. With the NumPy
-# engine, the slowest candidate ('adaptive, model 4') then takes less than
+# engine, the slowest candidate ('noise weights, noise limit (4 sigma)') then takes less than
 # about one minute (measured: 5.3 s for 60 million members, m-3m).
 CROP_BUDGET = 500_000_000
 
@@ -491,7 +491,7 @@ class AveragingPanel(QWidget):
         v1.addLayout(crop_row)
         self.measure_btn = QPushButton('Measure')
         self.measure_btn.setToolTip('Fit the noise model and run the default options\n'
-                                    "('equal, mad 3') once. Show the diagnostics per |q| shell.")
+                                    "('equal weights, spread limit (3 sigma)') once. Show the diagnostics per |q| shell.")
         self.measure_btn.clicked.connect(self._measure)
         self.measure_cancel_btn = QPushButton('Cancel')
         self.measure_cancel_btn.setToolTip('Stop Measure after the current step.\n'
@@ -513,7 +513,7 @@ class AveragingPanel(QWidget):
             'Sampled orbits with max/min member pixel count above 10.\n'
             "A volume without pixel counts shows '-'.")
         self.shell_table.horizontalHeaderItem(6).setToolTip(
-            'Node sum with MAD 3 / node sum without rejection.')
+            'Node sum with the spread limit (3 sigma) / node sum without rejection.')
         self._setup_table(self.shell_table)
         # all 10 shells without a vertical scroll bar
         self.shell_table.setFixedHeight(20 * oe.N_SHELLS + 30)
@@ -530,9 +530,9 @@ class AveragingPanel(QWidget):
         v2.addWidget(self.cand_list)
         add_row = QHBoxLayout()
         self.add_weight = QComboBox()
-        self.add_weight.addItems(list(oe.WEIGHTINGS))
+        _fill(self.add_weight, av.WEIGHT_LABELS, oe.WEIGHTINGS)
         self.add_rej = QComboBox()
-        self.add_rej.addItems(['mad', 'model', 'none'])
+        _fill(self.add_rej, av.REJECTION_LABELS, ('mad', 'model', 'none'))
         self.add_sigma = QDoubleSpinBox()
         self.add_sigma.setRange(1.0, 10.0)
         self.add_sigma.setValue(3.5)
@@ -569,7 +569,7 @@ class AveragingPanel(QWidget):
         v2.addLayout(sl_row)
         self.compare_btn = QPushButton('Compare')
         self.compare_btn.setToolTip('Score the ticked candidates, compare their sums with\n'
-                                    "'equal, mad 3' and make a suggestion.")
+                                    "'equal weights, spread limit (3 sigma)' and make a suggestion.")
         self.compare_btn.clicked.connect(self._compare)
         self.compare_cancel_btn = QPushButton('Cancel')
         self.compare_cancel_btn.setToolTip('Stop Compare after the current candidate.\n'
@@ -589,13 +589,15 @@ class AveragingPanel(QWidget):
         self.result_table.setHorizontalHeaderLabels(av.COMPARE_HEADERS)
         self.result_table.horizontalHeaderItem(1).setToolTip(
             'Leave-one-member-out score. Lower is better.')
+        self.result_table.horizontalHeaderItem(2).setToolTip(
+            'Sum near the Bragg nodes divided by the same sum without rejection.')
         self.result_table.horizontalHeaderItem(3).setToolTip(EXTRA_TIP)
         self.result_table.horizontalHeaderItem(5).setToolTip(
-            "Voxels that are finite in 'equal, mad 3' and NaN with this candidate.")
+            "Voxels that are finite in 'equal weights, spread limit (3 sigma)' and NaN with this candidate.")
         self.result_table.horizontalHeaderItem(6).setToolTip(
             'Sampled members for which the candidate gives no estimate.')
         self.result_table.horizontalHeaderItem(7).setToolTip(
-            "Time of the symmetrisation. The time of 'equal, mad 3' is from Measure.")
+            "Time of the symmetrisation. The time of 'equal weights, spread limit (3 sigma)' is from Measure.")
         self._setup_table(self.result_table)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -1045,7 +1047,7 @@ class AveragingPanel(QWidget):
         return out
 
     def _add_custom(self) -> None:
-        spec = av.make_candidate(self.add_weight.currentText(), self.add_rej.currentText(),
+        spec = av.make_candidate(self.add_weight.currentData(), self.add_rej.currentData(),
                                  self.add_sigma.value())
         for i in range(self.cand_list.count()):
             item = self.cand_list.item(i)
@@ -1609,6 +1611,12 @@ class AveragingPanel(QWidget):
         self.frame_canvas.draw_idle()
 
 
+def _fill(combo: QComboBox, labels: dict[str, str], keys: Any) -> None:
+    """Items with the clear words as text and the keywords as data."""
+    for key in keys:
+        combo.addItem(labels[key], key)
+
+
 class AveragingSettings(QGroupBox):
     """The averaging of the symmetrise step of a host GUI: 'Standard' or 'Custom'.
 
@@ -1636,24 +1644,25 @@ class AveragingSettings(QGroupBox):
                                    'data). Custom: set the weights, the rejection and sigma.')
         form.addRow('Mode:', self.mode_combo)
         self.weight_combo = QComboBox()
-        self.weight_combo.addItems(list(oe.WEIGHTINGS))
-        self.weight_combo.setToolTip("Weights of the orbit members. 'equal': plain mean.\n"
-                                     "'counts': each member has the weight of its pixel count.\n"
-                                     "'adaptive': each member has the weight 1 / variance of the\n"
-                                     'noise model.')
+        _fill(self.weight_combo, av.WEIGHT_LABELS, oe.WEIGHTINGS)
+        self.weight_combo.setToolTip("Weights of the orbit members. 'equal weights': plain mean.\n"
+                                     "'pixel-count weights': each member has the weight of its\n"
+                                     "pixel count. 'noise weights': each member has the weight\n"
+                                     '1 / variance of the noise model.')
         form.addRow('Weights:', self.weight_combo)
         self.rej_combo = QComboBox()
-        self.rej_combo.addItems(['mad', 'model', 'none'])
-        self.rej_combo.setToolTip("Outlier rule. 'mad': reject a member farther than sigma x the\n"
-                                  "robust spread (MAD, at least the Poisson value) from the orbit\n"
-                                  "median. 'model': use sigma x the noise-model value.\n"
-                                  "'none': no rejection (spikes go into the mean).")
+        _fill(self.rej_combo, av.REJECTION_LABELS, ('mad', 'model', 'none'))
+        self.rej_combo.setToolTip("Outlier rule. 'spread limit': reject a member farther than\n"
+                                  "sigma x the spread of the orbit members (MAD, at least the\n"
+                                  "Poisson value) from the orbit median. 'noise limit': the limit\n"
+                                  "is sigma x the noise that the noise model gives.\n"
+                                  "'no rejection': spikes go into the mean.")
         form.addRow('Outlier rejection:', self.rej_combo)
         self.sigma_spin = QDoubleSpinBox()
         self.sigma_spin.setRange(1.0, 10.0)
         self.sigma_spin.setSingleStep(0.5)
         self.sigma_spin.setDecimals(1)
-        self.sigma_spin.setToolTip('Rejection threshold. 3 = standard.\n'
+        self.sigma_spin.setToolTip('Rejection threshold: you can set any value from 1 to 10.\n'
                                    'A higher value rejects less.')
         form.addRow('Sigma:', self.sigma_spin)
         self.help_label = QLabel(why)
@@ -1683,7 +1692,7 @@ class AveragingSettings(QGroupBox):
         """The candidate dict of the settings."""
         if self.is_standard():
             return dict(self.standard)
-        return av.make_candidate(self.weight_combo.currentText(), self.rej_combo.currentText(),
+        return av.make_candidate(self.weight_combo.currentData(), self.rej_combo.currentData(),
                                  self.sigma_spin.value())
 
     def kwargs(self) -> dict[str, Any]:
@@ -1692,7 +1701,7 @@ class AveragingSettings(QGroupBox):
         return av.candidate_kwargs(self.spec())
 
     def describe(self) -> str:
-        """For example "'counts, mad 3' (standard)"."""
+        """For example "'pixel-count weights, spread limit (3 sigma)' (standard)"."""
         return f"'{self.spec()['name']}' ({'standard' if self.is_standard() else 'custom'})"
 
     def set_override(self, name: str | None) -> None:
@@ -1703,8 +1712,8 @@ class AveragingSettings(QGroupBox):
     def _show(self, spec: dict[str, Any]) -> None:
         for w in (self.weight_combo, self.rej_combo, self.sigma_spin):
             w.blockSignals(True)
-        self.weight_combo.setCurrentText(spec['weighting'])
-        self.rej_combo.setCurrentText(spec['rejection'])
+        self.weight_combo.setCurrentIndex(self.weight_combo.findData(spec['weighting']))
+        self.rej_combo.setCurrentIndex(self.rej_combo.findData(spec['rejection']))
         self.sigma_spin.setValue(float(spec.get('sigma', 3.0)))
         for w in (self.weight_combo, self.rej_combo, self.sigma_spin):
             w.blockSignals(False)
@@ -1714,8 +1723,8 @@ class AveragingSettings(QGroupBox):
         mode = self.mode_combo.currentData()
         if mode == 'standard':
             if self._mode == 'custom':           # keep the custom values for a later switch
-                self._custom = av.make_candidate(self.weight_combo.currentText(),
-                                                 self.rej_combo.currentText(),
+                self._custom = av.make_candidate(self.weight_combo.currentData(),
+                                                 self.rej_combo.currentData(),
                                                  self.sigma_spin.value())
             self._show(self.standard)
         elif self._mode == 'standard':
@@ -1731,19 +1740,19 @@ class AveragingSettings(QGroupBox):
         self.mode_combo.setEnabled(free)
         self.weight_combo.setEnabled(free and custom)
         self.rej_combo.setEnabled(free and custom)
-        self.sigma_spin.setEnabled(free and custom and self.rej_combo.currentText() != 'none')
+        self.sigma_spin.setEnabled(free and custom and self.rej_combo.currentData() != 'none')
         if not free:
             self.note_label.setText(f"Not used now. The symmetrise step uses '{self._override}', "
                                     'applied in the Averaging tab. Click Clear in that tab to '
                                     'use these settings again.')
             self.note_label.setStyleSheet('color: #070; font-weight: bold;')
-        elif custom and (self.weight_combo.currentText() == 'adaptive'
-                         or self.rej_combo.currentText() == 'model'):
+        elif (self.spec().get('weighting') == 'adaptive'
+              or self.spec().get('rejection') == 'model'):
             self.note_label.setText('This option needs a noise model. The symmetrise step fits it '
                                     'to the volume first (about 30 s more with a GPU on a '
                                     'large volume).')
             self.note_label.setStyleSheet('color: #555;')
-        elif custom and self.rej_combo.currentText() == 'none':
+        elif custom and self.rej_combo.currentData() == 'none':
             self.note_label.setText('No rejection: spikes and zingers go into the mean.')
             self.note_label.setStyleSheet('color: #a05000;')
         else:

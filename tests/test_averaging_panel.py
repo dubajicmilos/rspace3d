@@ -169,9 +169,15 @@ def test_slice_geometry_of_a_sheared_raster():
 
 
 def test_known_candidate_and_kwargs():
-    assert av.known_candidate('adaptive, model 4') == av.ADAPTIVE_MODEL
-    assert av.known_candidate('equal, none')['rejection'] == 'none'
-    assert av.known_candidate('equal, mad') is None and av.known_candidate('foo') is None
+    assert av.known_candidate('noise weights, noise limit (4 sigma)') == av.ADAPTIVE_MODEL
+    assert av.known_candidate('equal weights, no rejection')['rejection'] == 'none'
+    # the names of rspace3d 2.4 to 2.7 give the same options
+    assert av.known_candidate('counts, model 4') == av.COUNTS_MODEL
+    assert av.known_candidate('counts, mad 3') == av.COUNTS_MAD
+    assert av.known_candidate('equal, none') == av.make_candidate('equal', 'none')
+    assert av.known_candidate('pixel-count weights, noise limit (2.5 sigma)')['sigma'] == 2.5
+    assert av.known_candidate('counts, noise limit 4') is None
+    assert av.known_candidate('equal weights, spread limit') is None and av.known_candidate('foo') is None
     m = NoiseModel(gain=1.0)
     g = np.zeros((2, 2, 2), np.float32)
     assert av.candidate_kwargs(av.EQUAL_MAD, m, g) == {'weighting': 'equal', 'rejection': 'mad',
@@ -188,13 +194,13 @@ def test_no_rejection_is_never_suggested(monkeypatch):
 
     def best_plain(*a, **k):
         out = real(*a, **k)
-        out['candidates']['equal, none']['total']['trimmed_mean'] = 0.0
+        out['candidates']['equal weights, no rejection']['total']['trimmed_mean'] = 0.0
         return out
     monkeypatch.setattr(av, 'score_candidates', best_plain)
     cands = av.automatic_candidates(True) + [av.make_candidate('equal', 'none')]
     c = av.compare_candidates(vol, 'mmm', measured, cands, use_gpu=False)
-    assert c['suggestion'] != 'equal, none'
-    assert [r['name'] for r in c['rows']][-1] == 'equal, none'      # shown in the table
+    assert c['suggestion'] != 'equal weights, no rejection'
+    assert [r['name'] for r in c['rows']][-1] == 'equal weights, no rejection'      # shown in the table
     assert "never uses the candidates without rejection" in c['reason']
 
 
@@ -220,30 +226,30 @@ def test_panel_measures_compares_and_suggests(qapp):
     assert panel.cand_list.count() == len(checked) + len(av.more_candidates(True))
     assert panel.compare_btn.isEnabled()
     # one hand-picked option and an extra position
-    panel.add_weight.setCurrentText('equal')
-    panel.add_rej.setCurrentText('none')
+    panel.add_weight.setCurrentText('equal weights')
+    panel.add_rej.setCurrentText('no rejection')
     panel._add_custom()
     panel.extra_edit.setText('0.5 0.5 0.5')
     panel._compare()
     c = panel._compared
     names = [r['name'] for r in c['rows']]
-    assert names == checked + ['equal, none']
+    assert names == checked + ['equal weights, no rejection']
     assert panel.result_table.rowCount() == len(names)
-    assert c['suggestion'] in checked and c['suggestion'] != 'equal, none'
+    assert c['suggestion'] in checked and c['suggestion'] != 'equal weights, no rejection'
     assert panel.apply_combo.currentText() == c['suggestion']
     assert all(s.ndim == 2 for s in c['slices'].values())
     assert '(0.5, 0.5, 0.5)' in c['rows'][0]['extra']
     assert not any(isinstance(v, VolumeData) for v in c.values())      # no full volumes
     assert av.LIMITS_TEXT == panel.limits_label.text()
     assert any('Suggestion:' in ln for ln in lines)
-    # Apply 'adaptive, model 4'
-    panel.apply_combo.setCurrentText('adaptive, model 4')
+    # Apply 'noise weights, noise limit (4 sigma)'
+    panel.apply_combo.setCurrentText('noise weights, noise limit (4 sigma)')
     panel._apply()
     kw = panel.symmetrize_kwargs(vol, 'mmm')
     assert kw['weighting'] == 'adaptive' and kw['rejection'] == 'model' and kw['sigma'] == 4.0
     assert kw['noise_model'] is m['model'] and kw['grad'] is m['grad']
     rec = panel.choice_metadata()
-    assert rec['name'] == 'adaptive, model 4' and rec['suggested'] == c['suggestion']
+    assert rec['name'] == 'noise weights, noise limit (4 sigma)' and rec['suggested'] == c['suggestion']
     assert set(rec['candidates']) == set(names)
     # another volume or group: no options
     assert panel.symmetrize_kwargs(_small(seed=3), 'mmm') == {}
@@ -316,12 +322,12 @@ def test_panel_cancel_keeps_the_earlier_state(qapp):
     state, compared = panel._state, panel._compared
     suggest = panel.suggest_label.text()
     # Compare cancelled between two candidates: the earlier comparison stays
-    cancel_at("Symmetrise with 'counts")
+    cancel_at("Symmetrise with 'pixel-count")
     panel._compare()
     assert panel._compared is compared and panel._state is state
     assert panel.suggest_label.text() == f'Cancelled. {suggest}'
     assert panel.result_table.rowCount() == len(compared['rows'])
-    assert not any("Symmetrise with 'adaptive" in ln for ln in lines[-3:])
+    assert not any("Symmetrise with 'noise weights" in ln for ln in lines[-3:])
     # Measure cancelled after the fit: the earlier measurement stays
     cancel_at('Symmetrise with the default')
     panel._measure()
@@ -337,7 +343,7 @@ def test_panel_fit_error_is_clear_and_gives_the_preselection(qapp):
     panel._measure()
     m = panel._state['measured']
     assert m['model'] is None and m['fit_error'] == av.FIT_NO_SCATTER
-    assert panel.apply_combo.currentText() == 'equal, mad 3'
+    assert panel.apply_combo.currentText() == 'equal weights, spread limit (3 sigma)'
     with pytest.raises(ValueError, match='no scatter'):
         av.fit_noise_model(vol, 'mmm', use_gpu=False)
     bad = _small(seed=17)
@@ -405,7 +411,7 @@ def test_panel_crop_does_not_pass_the_gradient(qapp):
     assert panel._state['cropped'] and panel._state['work'].intensity.shape == (15, 15, 15)
     assert 'centred crop 15 x 15 x 15' in panel.model_label.text()
     panel._compare()
-    panel.apply_combo.setCurrentText('adaptive, model 4')
+    panel.apply_combo.setCurrentText('noise weights, noise limit (4 sigma)')
     panel._apply()
     kw = panel.symmetrize_kwargs(vol, 'mmm')
     assert 'grad' not in kw and kw['noise_model'] is panel._state['measured']['model']
@@ -420,7 +426,7 @@ def test_panel_failed_fit_gives_the_preselection(qapp):
     assert m['model'] is None and 'too few orbits' in m['fit_error']
     assert 'failed' in panel.model_label.text()
     assert not panel.compare_btn.isEnabled()
-    assert panel.apply_combo.count() == 1 and panel.apply_combo.currentText() == 'equal, mad 3'
+    assert panel.apply_combo.count() == 1 and panel.apply_combo.currentText() == 'equal weights, spread limit (3 sigma)'
     panel._apply()
     assert panel.symmetrize_kwargs(vol, 'mmm') == {'weighting': 'equal', 'rejection': 'mad',
                                                    'sigma': 3.0}
@@ -520,7 +526,8 @@ def _builder(qapp, monkeypatch, tmp_path, vol):
 
 
 STANDARD_BUILDER = {'weighting': 'equal', 'rejection': 'mad', 'sigma': 3.0}
-STANDARD_RECON = {'weighting': 'counts', 'rejection': 'mad', 'sigma': 3.0}
+STANDARD_RECON = {'weighting': 'counts', 'rejection': 'model', 'sigma': 4.0,
+                  'noise_model': None}
 
 
 def _sym_kw(kw):
@@ -533,10 +540,10 @@ def test_builder_gui_defaults_and_process_all_without_panel(qapp, monkeypatch, t
     gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('m-3m'))
     assert (gui.laue_combo.currentData(), gui.avg_settings.spec()['name'],
             gui.bin_xy_spin.value(), gui.bin_z_spin.value(), gui.morph_combo.currentData(),
-            gui.force_reload_chk.isChecked()) == ('m-3m', 'equal, mad 3', 2, 1, 'auto', False)
+            gui.force_reload_chk.isChecked()) == ('m-3m', 'equal weights, spread limit (3 sigma)', 2, 1, 'auto', False)
     assert [gui.tabs.tabText(i) for i in range(gui.tabs.count())] == [
         'Process', 'Averaging', 'Advanced', 'dcunwarp file']
-    assert "'equal, mad 3' (standard)" in gui.avg_label.text()
+    assert "'equal weights, spread limit (3 sigma)' (standard)" in gui.avg_label.text()
     gui._process_all()
     _wait(qapp, gui)
     assert loads == [(2, 1)]
@@ -562,17 +569,17 @@ def test_builder_gui_custom_settings_and_reset(qapp, monkeypatch, tmp_path):
     assert not s.weight_combo.isEnabled() and not s.sigma_spin.isEnabled()
     s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
     assert s.weight_combo.isEnabled() and s.sigma_spin.isEnabled()
-    s.weight_combo.setCurrentText('equal')
-    s.rej_combo.setCurrentText('none')
+    s.weight_combo.setCurrentText('equal weights')
+    s.rej_combo.setCurrentText('no rejection')
     assert not s.sigma_spin.isEnabled() and 'spikes' in s.note_label.text()
-    assert "'equal, none' (custom)" in gui.avg_label.text()
+    assert "'equal weights, no rejection' (custom)" in gui.avg_label.text()
     gui._process_all()
     _wait(qapp, gui)
     assert _sym_kw(stub.sym[-1][2]) == {'weighting': 'equal', 'rejection': 'none', 'sigma': None}
     gui.morph_combo.setCurrentIndex(2)
     gui._reset_advanced()
     assert s.is_standard() and gui.morph_combo.currentData() == 'auto'
-    assert "'equal, mad 3' (standard)" in gui.avg_label.text()
+    assert "'equal weights, spread limit (3 sigma)' (standard)" in gui.avg_label.text()
 
 
 def test_builder_gui_apply_passes_the_options(qapp, monkeypatch, tmp_path):
@@ -582,7 +589,7 @@ def test_builder_gui_apply_passes_the_options(qapp, monkeypatch, tmp_path):
     gui.avg_panel._measure()                     # loads and bins once
     assert loads == [(1, 1)] and gui._current_prepared()['vol'] is vol
     gui.avg_panel._compare()
-    gui.avg_panel.apply_combo.setCurrentText('counts, mad 3')
+    gui.avg_panel.apply_combo.setCurrentText('pixel-count weights, spread limit (3 sigma)')
     gui.avg_panel._apply()
     gui._process_all()
     _wait(qapp, gui)
@@ -591,7 +598,7 @@ def test_builder_gui_apply_passes_the_options(qapp, monkeypatch, tmp_path):
     assert v is vol and laue == 'mmm'
     assert (kw['weighting'], kw['rejection'], kw['sigma']) == ('counts', 'mad', 3.0)
     assert 'noise_model' not in kw
-    assert stub.saved[0][1].metadata['averaging_choice']['name'] == 'counts, mad 3'
+    assert stub.saved[0][1].metadata['averaging_choice']['name'] == 'pixel-count weights, spread limit (3 sigma)'
     # a changed bin factor drops the volume and the applied option
     gui.bin_z_spin.setValue(2)
     assert gui._current_prepared() is None and gui.avg_panel.applied_name() is None
@@ -611,14 +618,14 @@ def test_builder_gui_shows_that_the_option_replaces_sigma(qapp, monkeypatch, tmp
     assert s.mode_combo.isEnabled() and s.note_label.text() == ''
     gui.avg_panel._measure()
     gui.avg_panel._compare()
-    gui.avg_panel.apply_combo.setCurrentText('counts, mad 3')
+    gui.avg_panel.apply_combo.setCurrentText('pixel-count weights, spread limit (3 sigma)')
     gui.avg_panel._apply()
-    assert not s.mode_combo.isEnabled() and "'counts, mad 3'" in s.note_label.text()
-    assert "'counts, mad 3', applied in the Averaging tab" in gui.avg_label.text()
+    assert not s.mode_combo.isEnabled() and "'pixel-count weights, spread limit (3 sigma)'" in s.note_label.text()
+    assert "'pixel-count weights, spread limit (3 sigma)', applied in the Averaging tab" in gui.avg_label.text()
     gui._process_all()
     _wait(qapp, gui)
     head = [ln for ln in logged if ln.startswith('Processing:')]
-    assert head and "averaging option 'counts, mad 3'" in head[-1] and '(standard)' not in head[-1]
+    assert head and "averaging option 'pixel-count weights, spread limit (3 sigma)'" in head[-1] and '(standard)' not in head[-1]
     gui.avg_panel.clear_applied()
     assert s.mode_combo.isEnabled() and s.note_label.text() == ''
     gui.avg_panel._apply()
@@ -626,7 +633,7 @@ def test_builder_gui_shows_that_the_option_replaces_sigma(qapp, monkeypatch, tmp
     assert s.mode_combo.isEnabled() and s.note_label.text() == ''
     gui._process_all()
     _wait(qapp, gui)
-    assert "averaging 'equal, mad 3' (standard)" in [
+    assert "averaging 'equal weights, spread limit (3 sigma)' (standard)" in [
         ln for ln in logged if ln.startswith('Processing:')][-1]
 
 
@@ -639,7 +646,7 @@ def test_builder_gui_apply_with_a_real_symmetrisation(qapp, monkeypatch, tmp_pat
     gui.bin_xy_spin.setValue(1)
     gui.avg_panel._measure()
     gui.avg_panel._compare()
-    gui.avg_panel.apply_combo.setCurrentText('adaptive, model 4')
+    gui.avg_panel.apply_combo.setCurrentText('noise weights, noise limit (4 sigma)')
     gui.avg_panel._apply()
     gui._process_all()
     _wait(qapp, gui)
@@ -649,7 +656,7 @@ def test_builder_gui_apply_with_a_real_symmetrisation(qapp, monkeypatch, tmp_pat
                             noise_model=m['model'], use_gpu=False)
     assert _same(back.intensity, ref.intensity)
     assert back.metadata['weighting'] == 'adaptive' and back.metadata['rejection'] == 'model'
-    assert back.metadata['averaging_choice']['name'] == 'adaptive, model 4'
+    assert back.metadata['averaging_choice']['name'] == 'noise weights, noise limit (4 sigma)'
 
 
 def _recon(qapp, monkeypatch, tmp_path, vol):
@@ -670,12 +677,12 @@ def test_reconstruct_gui_defaults_and_symmetrise_without_panel(qapp, monkeypatch
     vol = _small(seed=9)
     gui, stub = _recon(qapp, monkeypatch, tmp_path, vol)
     assert (gui.avg_settings.spec()['name'], gui.bin_xy.value(), gui.bin_z.value()) == (
-        'counts, mad 3', 1, 1)
+        'pixel-count weights, noise limit (4 sigma)', 1, 1)
     assert [gui.tabs.tabText(i) for i in range(gui.tabs.count())] == [
         'Reconstruct', 'Averaging', 'Advanced']
     assert gui.frame_tools_group is gui.avg_panel.frame_group
     assert gui.avg_panel.selected_volume() is None and gui.source_note.isHidden()
-    assert "'counts, mad 3' (standard)" in gui.avg_label.text()
+    assert "'pixel-count weights, noise limit (4 sigma)' (standard)" in gui.avg_label.text()
     gui._symmetrize_save()
     _wait(qapp, gui)
     (v, laue, kw), = stub.sym
@@ -699,19 +706,40 @@ def test_reconstruct_gui_apply_uses_the_binned_volume(qapp, monkeypatch, tmp_pat
     assert binned is not None and binned.intensity.shape == (31, 31, 7)
     assert gui.avg_panel._state['volume'] is binned
     gui.avg_panel._compare()
-    gui.avg_panel.apply_combo.setCurrentText('adaptive, model 4')
+    gui.avg_panel.apply_combo.setCurrentText('noise weights, noise limit (4 sigma)')
     gui.avg_panel._apply()
     gui._symmetrize_save()
     _wait(qapp, gui)
     (v, laue, kw), = stub.sym
     assert v is binned and kw['weighting'] == 'adaptive' and kw['sigma'] == 4.0
     assert kw['noise_model'] is gui.avg_panel._state['measured']['model']
-    assert stub.saved[-1][1].metadata['averaging_choice']['name'] == 'adaptive, model 4'
+    assert stub.saved[-1][1].metadata['averaging_choice']['name'] == 'noise weights, noise limit (4 sigma)'
     s = gui.avg_settings
-    assert not s.mode_combo.isEnabled() and "'adaptive, model 4'" in s.note_label.text()
+    assert not s.mode_combo.isEnabled() and "'noise weights, noise limit (4 sigma)'" in s.note_label.text()
     gui.laue_combo.setCurrentIndex(gui.laue_combo.findData('4/mmm'))
     assert gui.avg_panel.applied_name() is None
-    assert s.mode_combo.isEnabled() and s.note_label.text() == ''
+    assert s.mode_combo.isEnabled() and 'noise model' in s.note_label.text()
+
+
+def test_reconstruct_gui_standard_falls_back_when_the_fit_fails(qapp, monkeypatch, tmp_path):
+    from rspace3d import reconstruct_gui as rg
+    vol = _small(seed=9)
+    gui, stub = _recon(qapp, monkeypatch, tmp_path, vol)
+    lines = []
+    gui._log = lines.append
+
+    def no_fit(v, laue, **kw):
+        if kw.get('rejection') == 'model':
+            stub.sym.append((v, laue, kw))
+            raise ValueError('rejection needs a noise model, and the noise-model fit failed.')
+        return stub.symmetrize(v, laue, **kw)
+    monkeypatch.setattr(rg, 'symmetrize_volume', no_fit)
+    gui._symmetrize_save()
+    _wait(qapp, gui)
+    assert [kw['rejection'] for _, _, kw in stub.sym] == ['model', 'mad']
+    assert _sym_kw(stub.sym[1][2]) == {'weighting': 'counts', 'rejection': 'mad', 'sigma': 3.0}
+    assert any("Use 'pixel-count weights, spread limit (3 sigma)'" in ln for ln in lines)
+    assert gui._last_saved == str(tmp_path / 'x_recon_sym_mmm.h5')
 
 
 def _fake_recon(calls, vol):
@@ -792,19 +820,19 @@ def test_averaging_settings_keep_the_custom_values():
     from rspace3d.averaging_panel import AveragingSettings
     s = AveragingSettings(av.COUNTS_MAD, 'why')
     s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
-    assert s.spec()['name'] == 'counts, mad 3'     # custom starts at the standard values
-    s.weight_combo.setCurrentText('adaptive')
-    s.rej_combo.setCurrentText('model')
+    assert s.spec()['name'] == 'pixel-count weights, spread limit (3 sigma)'     # custom starts at the standard values
+    s.weight_combo.setCurrentText('noise weights')
+    s.rej_combo.setCurrentText('noise limit')
     s.sigma_spin.setValue(4.0)
     assert s.kwargs() == {'weighting': 'adaptive', 'rejection': 'model', 'sigma': 4.0,
                           'noise_model': None}
     s.mode_combo.setCurrentIndex(s.mode_combo.findData('standard'))
-    assert s.spec()['name'] == 'counts, mad 3' and s.weight_combo.currentText() == 'counts'
+    assert s.spec()['name'] == 'pixel-count weights, spread limit (3 sigma)' and s.weight_combo.currentText() == 'pixel-count weights'
     s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
-    assert s.spec()['name'] == 'adaptive, model 4' and 'noise model' in s.note_label.text()
+    assert s.spec()['name'] == 'noise weights, noise limit (4 sigma)' and 'noise model' in s.note_label.text()
     s.reset()
     s.mode_combo.setCurrentIndex(s.mode_combo.findData('custom'))
-    assert s.spec()['name'] == 'counts, mad 3'
+    assert s.spec()['name'] == 'pixel-count weights, spread limit (3 sigma)'
 
 
 def test_symmetrise_without_a_volume_gives_a_message(qapp, monkeypatch, tmp_path):

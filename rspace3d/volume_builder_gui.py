@@ -43,7 +43,7 @@ from .averaging import EQUAL_MAD
 from .averaging_panel import LOG_HEIGHT, AveragingPanel, AveragingSettings
 
 STANDARD_WHY = (
-    "Standard for unwarp layers: 'equal, mad 3', the default of the earlier versions. The "
+    "Standard for unwarp layers: 'equal weights, spread limit (3 sigma)', the default of the earlier versions. The "
     'value is the plain mean of the orbit members. A member farther than 3 x the robust '
     'spread (MAD, at least the Poisson value) from the orbit median is rejected. The layers '
     'have no detector pixel counts: without a binning there are no counts, and with a '

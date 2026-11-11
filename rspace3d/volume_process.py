@@ -17,8 +17,9 @@ Options:
     --no-gpu  Force CPU even if GPU available
 
 Averaging options (without them the CLI works as before):
-    --weighting        equal, counts or adaptive
-    --rejection        none, mad or model (mad and model use --sigma)
+    --weighting        equal, counts (pixel-count weights) or adaptive (noise weights)
+    --rejection        none, mad (spread limit) or model (noise limit);
+                       mad and model use --sigma
     --report           fit the noise model, score the candidates, print the
                        bias table and the suggestion, then stop
                        ('--report continue' goes on with your options)
@@ -148,10 +149,13 @@ def _main() -> None:
     avg = parser.add_argument_group(
         'averaging options', 'Without these flags the symmetrisation is the same as before.')
     avg.add_argument('--weighting', choices=['equal', 'counts', 'adaptive'], default=None,
-                     help="Weights of the orbit members (default: equal). 'counts' uses the "
-                          "pixel counts. 'adaptive' uses the fitted noise model.")
+                     help="Weights of the orbit members (default: equal). 'counts' "
+                          "(pixel-count weights) uses the pixel counts. 'adaptive' (noise "
+                          "weights) uses the fitted noise model.")
     avg.add_argument('--rejection', choices=['none', 'mad', 'model'], default=None,
-                     help="Outlier rule. 'mad' and 'model' use --sigma. Default: 'mad' if "
+                     help="Outlier rule. 'mad' (spread limit): the limit is --sigma x the "
+                          "spread of the orbit members. 'model' (noise limit): the limit is "
+                          "--sigma x the noise of the fitted noise model. Default: 'mad' if "
                           "--sigma > 0, else 'none'.")
     avg.add_argument('--report', nargs='?', const='stop', choices=['stop', 'continue'],
                      default=None,

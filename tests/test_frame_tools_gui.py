@@ -321,7 +321,7 @@ def test_defaults_unchanged_when_the_tools_are_not_used(qapp, monkeypatch, tmp_p
     (v, kw), = calls
     assert v is scene.raw and kw['progress_callback'] is not None
     assert {k: kw[k] for k in ('weighting', 'rejection', 'sigma')} == {
-        'weighting': 'counts', 'rejection': 'mad', 'sigma': 3.0}       # the standard
+        'weighting': 'counts', 'rejection': 'model', 'sigma': 4.0}     # the standard
     back = load_volume_h5(str(tmp_path / 'x_recon_sym_mmm.h5'))
     assert 'frame_correction' not in back.metadata and 'frame_tools' not in back.metadata
 
@@ -390,7 +390,7 @@ def test_laue_or_bin_change_removes_the_scores_of_the_volume_table(qapp, monkeyp
                                                                    scene):
     gui, panel = _gui(qapp, monkeypatch, tmp_path, scene)
     panel.ring_btn.click()
-    vals = dict(suggestion='equal, mad 3', score=1.5, split=0.01, split_diffuse=0.02)
+    vals = dict(suggestion='equal weights, spread limit (3 sigma)', score=1.5, split=0.01, split_diffuse=0.02)
 
     def fill():
         for s in ('none', 'mask'):

@@ -209,13 +209,20 @@ The window has three tabs. For clean data you need only the first one.
    about 2.2 GB.
 
 3. **Averaging and outlier rejection.** The line shows the option that the
-   symmetrise step uses. The standard for raw frames is `'counts, mad 3'`:
-   each orbit member has the weight of its pixel count, and a member farther
-   than 3 × the robust spread (MAD, at least the Poisson value) from the orbit
-   median is rejected. In the 2.4 benchmarks this option gave the lowest
-   diffuse noise on clean data (synthetic data: 0.53 to 0.58 × the RMSE of
-   `'equal, mad 3'`; real I15 data: split-half difference 18 % lower, Bragg
-   sums within 1 %), at the speed of the plain MAD rule. For data with powder
+   symmetrise step uses. The standard for raw frames is
+   `'pixel-count weights, noise limit (4 sigma)'`: each orbit member has the
+   weight of its pixel count. The app fits a noise model to the volume, and a
+   member farther than 4 × its expected noise from the orbit median is
+   rejected. This rule removes intensity that is in one frame only (for
+   example the halo of a strong Bragg reflection). The spread limit does not
+   remove it, because its lowest limit is the Poisson value of one count and
+   a voxel is the mean of many pixels. In tests on four raw-frame datasets
+   (I15 and I19-2) the noise limit gave a split-half difference in the
+   diffuse region that is 0.5 to 3.9 % lower than the spread limit, and 10 to
+   18 % higher near the Bragg nodes on the I15 datasets. If the noise-model
+   fit fails, the app uses `'pixel-count weights, spread limit (3 sigma)'`
+   and writes this in the log. The number is the threshold; set a different
+   value in the Advanced tab (*Custom*). For data with powder
    rings or other contamination, use the Averaging tab (see
    [The Averaging panel](#the-averaging-panel-and-the-command-line-flags)).
 
@@ -467,7 +474,7 @@ rspace3d-builder                 # or: python -m rspace3d.volume_builder_gui
    window makes the same cell-metric check as the raw-frame GUI.
 3. Set the binning (2 × 2 recommended).
 4. Click *Process All*. Output: `<sample>_raw.h5` and `<sample>_sym_<laue>.h5`.
-   The averaging is the standard for unwarp layers, `'equal, mad 3'` (the
+   The averaging is the standard for unwarp layers, `'equal weights, spread limit (3 sigma)'` (the
    default of the earlier versions, same output bit for bit). The layers have
    no detector pixel counts, so the counts weights of route A give almost no
    gain here. To compare averaging options before this step, use the Averaging
@@ -600,8 +607,24 @@ print the table after the symmetrisation (`format_symmetry_diagnostics`).
 above, bit for bit.
 
 The GUIs use a standard option (the Python default does not change):
-`'counts, mad 3'` for raw frames (route A) and `'equal, mad 3'` for unwarp
-layers (route B). Section [Using the GUI](#using-the-gui) gives the reasons.
+`'pixel-count weights, noise limit (4 sigma)'` for raw frames (route A) and
+`'equal weights, spread limit (3 sigma)'` for unwarp layers (route B). Section
+[Using the GUI](#using-the-gui) gives the reasons.
+
+The option names use clear words for the keywords of `symmetrize_volume`:
+
+| name | keyword |
+|---|---|
+| equal weights | `weighting='equal'` |
+| pixel-count weights | `weighting='counts'` |
+| noise weights | `weighting='adaptive'` |
+| spread limit | `rejection='mad'` |
+| noise limit | `rejection='model'` |
+| no rejection | `rejection='none'` |
+
+The number in a name is the threshold `sigma`. You can set any positive
+value. The names of rspace3d 2.4 to 2.7 (`'counts, mad 3'`) are still
+accepted by `known_candidate`.
 
 - `weighting`: `'equal'` (default), `'counts'` or `'adaptive'`. `'counts'`
   weights each member with its pixel count N_i (`vol.counts`, gathered with
@@ -650,9 +673,10 @@ else:
     name, reason = suggest(scores, bias)
 ```
 
-`automatic_candidates` gives `'equal, mad 3'` (the default above),
-`'counts, mad 3'` (only for a volume with pixel counts) and
-`'adaptive, model 4'`. Each one rejects outliers. An option without
+`automatic_candidates` gives `'equal weights, spread limit (3 sigma)'` (the default above),
+`'pixel-count weights, spread limit (3 sigma)'` and
+`'pixel-count weights, noise limit (4 sigma)'` (only for a volume with pixel
+counts) and `'noise weights, noise limit (4 sigma)'`. Each one rejects outliers. An option without
 rejection is never in this set, because spikes then go into the mean. You
 can still give any option to `symmetrize_volume`.
 
@@ -665,14 +689,20 @@ members without an estimate. The sample has only general positions, so the
 voxels on mirror planes and rotation axes are not scored.
 
 `bias_checks` compares the sums near the integer nodes, near other positions
-and in the diffuse region with the `'equal, mad 3'` result. It also counts
+and in the diffuse region with the `'equal weights, spread limit (3 sigma)'` result. It also counts
 the voxels that are finite in that result and NaN in the candidate.
 
 `suggest` takes the candidate with the lowest score that passes all checks.
-A candidate fails if a node, extra-position or diffuse sum ratio differs
+A candidate fails if an extra-position or diffuse sum ratio differs
 from 1 by more than 2 %, if it makes voxels NaN, or if `n_no_estimate` > 0.
-If no candidate passes, `suggest` returns the preselection: `'counts, mad 3'`
-for a volume with pixel counts, else `'equal, mad 3'`. Volumes that you
+The node check uses the sum without rejection (`node_kept` of
+`measure_volume`), because the reference rejects members also and can remove
+a large part of the sum near the Bragg nodes. A candidate fails if it removes
+more of this sum than the reference does, by more than 2 % of the sum without
+rejection. A candidate that keeps more passes. Without `node_kept`, the node
+sum ratio must be within 2 % of 1, as in rspace3d 2.4 to 2.7.
+If no candidate passes, `suggest` returns the preselection: `'pixel-count weights, spread limit (3 sigma)'`
+for a volume with pixel counts, else `'equal weights, spread limit (3 sigma)'`. Volumes that you
 subtract (for example field on and field off) must use the same options.
 
 ### The Averaging panel and the command-line flags
@@ -687,7 +717,7 @@ before you symmetrise it.
 2. Open the Averaging tab and click **Measure**. The panel loads and bins the
    volume once (the volume builder uses the raw cache). The volume builder
    keeps this volume, and *Process All* uses it. Measure fits the noise
-   model and symmetrises once with `'equal, mad 3'`. The text shows the model
+   model and symmetrises once with `'equal weights, spread limit (3 sigma)'`. The text shows the model
    parameters. The table shows these values per |q| shell: χ²/ν, R_sym, the
    rejected fraction, the Poisson-floor share, the spread of the member pixel
    counts (the fraction of orbits with max/min count above 10) and the node
@@ -698,10 +728,10 @@ before you symmetrise it.
    weights, other sigma values with the *Add* row). Type extra positions, for
    example `0.5 0.5 0.5; 0 0 0.5`, and select a slice. Click **Compare**. The
    table shows the score, the node, extra and diffuse sum ratios against
-   `'equal, mad 3'`, the lost voxels, the members without an estimate and the
+   `'equal weights, spread limit (3 sigma)'`, the lost voxels, the members without an estimate and the
    time of each candidate. The panel shows the suggestion and its reason. It
    shows the slice of the selected candidate and its difference to
-   `'equal, mad 3'`, in Cartesian reciprocal space (1/Å, or hkl units without
+   `'equal weights, spread limit (3 sigma)'`, in Cartesian reciprocal space (1/Å, or hkl units without
    a UB matrix) with lines at integer Miller indices. The table shows a candidate without rejection, but the
    panel never suggests it.
 4. Select a candidate (the panel preselects the suggestion) and click

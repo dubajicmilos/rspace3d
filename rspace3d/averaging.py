@@ -40,6 +40,7 @@ for the first pass and G on the full volume.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -705,10 +706,16 @@ def fit_noise_model(vol: Any, laue_group: str, n_members: int = 2_000_000, seed:
 # Scores of averaging options
 # ──────────────────────────────────────────────────────────────────
 
-EQUAL_MAD = {'name': 'equal, mad 3', 'weighting': 'equal', 'rejection': 'mad', 'sigma': 3.0}
-COUNTS_MAD = {'name': 'counts, mad 3', 'weighting': 'counts', 'rejection': 'mad', 'sigma': 3.0}
-ADAPTIVE_MODEL = {'name': 'adaptive, model 4', 'weighting': 'adaptive', 'rejection': 'model',
-                  'sigma': 4.0}
+EQUAL_MAD = {'name': 'equal weights, spread limit (3 sigma)', 'weighting': 'equal', 'rejection': 'mad', 'sigma': 3.0}
+COUNTS_MAD = {'name': 'pixel-count weights, spread limit (3 sigma)', 'weighting': 'counts', 'rejection': 'mad', 'sigma': 3.0}
+COUNTS_MODEL = {'name': 'pixel-count weights, noise limit (4 sigma)', 'weighting': 'counts',
+                'rejection': 'model', 'sigma': 4.0}
+ADAPTIVE_MODEL = {'name': 'noise weights, noise limit (4 sigma)', 'weighting': 'adaptive',
+                  'rejection': 'model', 'sigma': 4.0}
+# The words of the option names. The keys are the keywords of `symmetrize_volume`.
+WEIGHT_LABELS = {'equal': 'equal weights', 'counts': 'pixel-count weights',
+                 'adaptive': 'noise weights'}
+REJECTION_LABELS = {'none': 'no rejection', 'mad': 'spread limit', 'model': 'noise limit'}
 # The reference of `bias_checks` for `suggest`: the default of rspace3d 2.3.0
 BIAS_REFERENCE = EQUAL_MAD['name']
 
@@ -716,15 +723,18 @@ BIAS_REFERENCE = EQUAL_MAD['name']
 def automatic_candidates(has_counts: bool) -> list[dict[str, Any]]:
     """The candidates that the app compares automatically (`score_candidates`, `suggest`).
 
-    'equal, mad 3' (the default of rspace3d 2.3.0 and the bias reference),
-    'counts, mad 3' (only if the volume has pixel counts) and
-    'adaptive, model 4'. Each candidate rejects outliers. An option without
+    'equal weights, spread limit (3 sigma)' (the default of rspace3d 2.3.0 and the bias reference),
+    'pixel-count weights, spread limit (3 sigma)' and
+    'pixel-count weights, noise limit (4 sigma)' (only if the volume has
+    pixel counts) and 'noise weights, noise limit (4 sigma)'. Each candidate
+    rejects outliers. An option without
     rejection is never in this set, because spikes then go into the mean.
     A user can still give any option to `symmetrize_volume`.
     """
     cands = [dict(EQUAL_MAD)]
     if has_counts:
         cands.append(dict(COUNTS_MAD))
+        cands.append(dict(COUNTS_MODEL))
     cands.append(dict(ADAPTIVE_MODEL))
     return cands
 
@@ -735,7 +745,7 @@ def _candidate(spec: Mapping[str, Any]) -> tuple[str, oe.Averaging, float | None
     rejection = spec.get('rejection', 'none')
     sigma = spec.get('sigma', 3.0 if rejection != 'none' else None)
     sigma = None if rejection == 'none' else float(sigma)
-    name = spec.get('name', f"{weighting}, {rejection}" + (f" {sigma:g}" if sigma else ''))
+    name = spec.get('name', option_name(weighting, rejection, sigma))
     min_valid = int(np.ceil(float(spec.get('min_valid', 3))))
     return (str(name), oe.Averaging(weighting=weighting, rejection=rejection), sigma,
             min_valid, bool(spec.get('poisson_floor', True)))
@@ -968,7 +978,7 @@ def bias_checks(results: Mapping[str, Any], reference: Any, radius: float = 0.1,
 
     `results` maps a name to a symmetrised volume (`VolumeData` or array of
     the same shape as `reference`). `reference` is a `VolumeData` (it also
-    gives the grid). For `suggest`, use the 'equal, mad 3' result
+    gives the grid). For `suggest`, use the 'equal weights, spread limit (3 sigma)' result
     (`BIAS_REFERENCE`, the default of rspace3d 2.3.0). For each result, the
     function adds the voxels that are finite in the result and in the
     reference:
@@ -1071,7 +1081,7 @@ def bias_checks(results: Mapping[str, Any], reference: Any, radius: float = 0.1,
 
 
 def preselect(has_counts: bool, cause: str = '') -> tuple[str, str]:
-    """The safe preselection: 'counts, mad 3' with pixel counts, else 'equal, mad 3'.
+    """The safe preselection: 'pixel-count weights, spread limit (3 sigma)' with pixel counts, else 'equal weights, spread limit (3 sigma)'.
 
     `suggest` returns it if no candidate passes the checks. Use it also if
     `fit_noise_model` raises ValueError (the app then has no scores).
@@ -1091,23 +1101,33 @@ def preselect(has_counts: bool, cause: str = '') -> tuple[str, str]:
 
 
 def suggest(scores: Mapping[str, Any], bias: Mapping[str, Any], node_tol: float = 0.02,
-            diffuse_tol: float = 0.02) -> tuple[str, str]:
+            diffuse_tol: float = 0.02, node_kept: float | None = None) -> tuple[str, str]:
     """The candidate with the lowest total trimmed score that passes all checks.
 
     `scores` is the output of `score_candidates` and `bias` the output of
-    `bias_checks` with the 'equal, mad 3' result as the reference
+    `bias_checks` with the 'equal weights, spread limit (3 sigma)' result as the reference
     (`BIAS_REFERENCE`), with the same names. A candidate fails if:
 
     * it gives no estimate for some sampled members (n_no_estimate > 0),
     * it has no bias check,
     * it makes voxels NaN that are finite in the reference (n_lost > 0),
-    * its node sum ratio, or the sum ratio of an extra position, differs
-      from 1 by more than `node_tol`,
+    * its node sum ratio differs from 1 by more than `node_tol` (only if
+      `node_kept` is None),
+    * the sum ratio of an extra position differs from 1 by more than
+      `node_tol`,
     * its diffuse sum ratio differs from 1 by more than `diffuse_tol`.
 
+    `node_kept` is the node sum of the reference divided by the node sum
+    without rejection (`measure_volume` gives it). The reference rejects
+    members also, and it can remove a large part of the sum near the Bragg
+    nodes. Thus, with `node_kept`, the node check compares each candidate
+    with the sum without rejection: a candidate fails only if it removes
+    more of this sum than the reference does, by more than `node_tol` of
+    the sum without rejection. A candidate that keeps more passes.
+
     If no candidate passes, the function returns the preselection
-    (`preselect`: 'counts, mad 3' if the volume has pixel counts, else
-    'equal, mad 3'). Returns the name and a reason text.
+    (`preselect`: 'pixel-count weights, spread limit (3 sigma)' if the volume has pixel counts, else
+    'equal weights, spread limit (3 sigma)'). Returns the name and a reason text.
     """
     cands = scores['candidates']
     ranked = sorted((c for c in cands if cands[c]['total']['trimmed_mean'] is not None),
@@ -1126,9 +1146,14 @@ def suggest(scores: Mapping[str, Any], bias: Mapping[str, Any], node_tol: float 
             n_lost = int(b.get('n_lost', 0))
             if n_lost > 0:
                 fails.append(f"it makes {n_lost} voxels NaN that are finite in the reference")
-            checks = [('node sum ratio', b.get('node_sum_ratio'), node_tol)]
-            checks += [(f"sum ratio at {lab}", val, node_tol)
-                       for lab, val in b.get('extra_sum_ratio', {}).items()]
+            node = b.get('node_sum_ratio')
+            checks = [(f"sum ratio at {lab}", val, node_tol)
+                      for lab, val in b.get('extra_sum_ratio', {}).items()]
+            if node_kept is None:
+                checks.insert(0, ('node sum ratio', node, node_tol))
+            elif node is not None and node_kept * (1.0 - node) > node_tol:
+                fails.append(f"it keeps {node_kept * node:.4f} of the node sum without "
+                             f"rejection (the reference keeps {node_kept:.4f})")
             checks.append(('diffuse sum ratio', b.get('diffuse_sum_ratio'), diffuse_tol))
             for what, val, tol in checks:
                 if val is not None and abs(val - 1.0) > tol:
@@ -1154,12 +1179,26 @@ LIMITS_TEXT = ("The score cannot see contamination that is the same in many memb
                "orbit (for example a powder ring). Look at the slices before you apply a choice.")
 
 
+def option_name(weighting: str, rejection: str, sigma: float | None = None) -> str:
+    """The name of an option, for example 'pixel-count weights, noise limit (4 sigma)'.
+
+    'spread limit' is the rejection 'mad': a member is rejected if it is
+    farther from the orbit median than sigma x the spread of the members.
+    'noise limit' is the rejection 'model': the limit is sigma x the noise
+    that the noise model gives for the member. The number is the threshold
+    `sigma`; a user can set any positive value.
+    """
+    text = f"{WEIGHT_LABELS.get(weighting, weighting)}, {REJECTION_LABELS.get(rejection, rejection)}"
+    return text if rejection == 'none' or not sigma else f"{text} ({float(sigma):g} sigma)"
+
+
 def make_candidate(weighting: str, rejection: str, sigma: float | None = None) -> dict[str, Any]:
-    """A candidate dict with the standard name, for example 'counts, mad 3'."""
+    """A candidate dict with the standard name (`option_name`)."""
     if rejection == 'none':
-        return {'name': f"{weighting}, none", 'weighting': weighting, 'rejection': 'none'}
+        return {'name': option_name(weighting, 'none'), 'weighting': weighting,
+                'rejection': 'none'}
     sigma = 3.0 if sigma is None else float(sigma)
-    return {'name': f"{weighting}, {rejection} {sigma:g}", 'weighting': weighting,
+    return {'name': option_name(weighting, rejection, sigma), 'weighting': weighting,
             'rejection': rejection, 'sigma': sigma}
 
 
@@ -1173,26 +1212,33 @@ def more_candidates(has_counts: bool) -> list[dict[str, Any]]:
     if has_counts:
         out.append(make_candidate('counts', 'none'))
     out.append(make_candidate('adaptive', 'none'))
-    if has_counts:
-        out.append(make_candidate('counts', 'model', 4.0))
     out.append(make_candidate('equal', 'model', 4.0))
     return out
 
 
 def known_candidate(name: str) -> dict[str, Any] | None:
-    """The candidate dict of a standard name ('weighting, rejection [sigma]'), or None."""
-    try:
-        weighting, rest = (p.strip() for p in name.split(',', 1))
-        parts = rest.split()
-        rejection = parts[0]
-        sigma = float(parts[1]) if len(parts) > 1 else None
-        if (weighting not in oe.WEIGHTINGS or rejection not in oe.REJECTIONS
-                or (rejection == 'none') != (sigma is None) or len(parts) > 2):
-            return None
-    except (ValueError, IndexError):
+    """The candidate dict of a standard name (`option_name`), or None.
+
+    The names of rspace3d 2.4 to 2.7 ('counts, mad 3', 'equal, none') are
+    also accepted. The dict then has the new name.
+    """
+    words_w = {**{v: k for k, v in WEIGHT_LABELS.items()}, **{k: k for k in WEIGHT_LABELS}}
+    words_r = {**{v: k for k, v in REJECTION_LABELS.items()}, **{k: k for k in REJECTION_LABELS}}
+    m = re.fullmatch(r"([^,]+), (.+?)(?: \((\S+) sigma\)| (\d\S*))?", name.strip())
+    if m is None:
         return None
-    spec = make_candidate(weighting, rejection, sigma)
-    return spec if spec['name'] == name else None
+    weighting, rejection = words_w.get(m.group(1)), words_r.get(m.group(2))
+    number = m.group(3) or m.group(4)
+    old = m.group(1) in WEIGHT_LABELS and m.group(2) in REJECTION_LABELS and m.group(3) is None
+    new = m.group(1) not in WEIGHT_LABELS and m.group(2) not in REJECTION_LABELS and m.group(4) is None
+    if weighting is None or rejection is None or not (old or new)             or (rejection == 'none') != (number is None):
+        return None
+    try:
+        spec = make_candidate(weighting, rejection, None if number is None else float(number))
+    except ValueError:
+        return None
+    old_name = f"{weighting}, {rejection}" + (f" {spec['sigma']:g}" if number else '')
+    return spec if name.strip() in (spec['name'], old_name) else None
 
 
 def candidate_kwargs(spec: Mapping[str, Any], noise_model: NoiseModel | None = None,
@@ -1358,12 +1404,13 @@ def measure_volume(vol: Any, laue_group: str, use_gpu: bool | None = None,
     1. Fits the noise model and keeps G (`fit_noise_model` with
        `return_gradient=True`). If the fit fails, 'model' is None and
        'fit_error' holds the reason.
-    2. Symmetrises once with the default options ('equal, mad 3'). This is
+    2. Symmetrises once with the default options ('equal weights, spread limit (3 sigma)'). This is
        the reference of `bias_checks`. Its diagnostics give chi^2/nu,
        R_sym, the rejected fraction and the Poisson-floor share per shell.
     3. Symmetrises with equal weights and no rejection, and calculates the
        node sum of step 2 divided by the node sum without rejection, per
        shell (`node_sums_by_shell`).
+       'node_kept' is the same ratio for all shells together (`suggest`).
     4. With pixel counts: the spread of the member counts (`count_spread`).
 
     `cancelled` is a function without arguments. The function calls it
@@ -1395,7 +1442,7 @@ def measure_volume(vol: Any, laue_group: str, use_gpu: bool | None = None,
     times['fit_s'] = time.perf_counter() - t
     _check_cancel(cancelled)
     t = time.perf_counter()
-    log("Symmetrise with the default options ('equal, mad 3').")
+    log("Symmetrise with the default options ('equal weights, spread limit (3 sigma)').")
     ref = symmetrize_volume(vol, laue_group, sigma=3.0, use_gpu=use_gpu,
                             progress_callback=progress)
     times['reference_s'] = time.perf_counter() - t
@@ -1409,6 +1456,7 @@ def measure_volume(vol: Any, laue_group: str, use_gpu: bool | None = None,
     plain = symmetrize_volume(vol, laue_group, sigma=None, use_gpu=use_gpu,
                               propagate_variance=False, progress_callback=progress)
     out['node_ratio'] = node_sums_by_shell(ref, plain, laue_group, radius)['ratio']
+    out['node_kept'] = bias_checks({'ref': ref}, plain, radius)['ref']['node_sum_ratio']
     del plain
     times['no_rejection_s'] = time.perf_counter() - t
     out['count_spread'] = None
@@ -1434,7 +1482,7 @@ def compare_candidates(vol: Any, laue_group: str, measured: Mapping[str, Any],
     `measured` is the output of `measure_volume` for the same volume. The
     function scores all candidates (`score_candidates`), symmetrises the
     volume with each candidate, compares it with the reference
-    ('equal, mad 3', `bias_checks`) and keeps one slice of it
+    ('equal weights, spread limit (3 sigma)', `bias_checks`) and keeps one slice of it
     (`extract_volume_slice`, plane 0 HK, 1 HL, 2 KL). It keeps no full
     candidate volume. The reference is always in the comparison. The
     suggestion (`suggest`) uses only the candidates with rejection.
@@ -1451,6 +1499,7 @@ def compare_candidates(vol: Any, laue_group: str, measured: Mapping[str, Any],
     if model is None:
         raise ValueError("Compare needs a noise model, and the fit failed. "
                          + str(measured.get('fit_error') or ''))
+    kept = measured.get('node_kept')
     cands = [dict(c) for c in candidates]
     if BIAS_REFERENCE not in [c['name'] for c in cands]:
         cands.insert(0, dict(EQUAL_MAD))
@@ -1487,8 +1536,10 @@ def compare_candidates(vol: Any, laue_group: str, measured: Mapping[str, Any],
         del out
         sc = scores['candidates'][name]
         b = bias[name]
+        node = b['node_sum_ratio']
         rows.append({'name': name, 'rejection': c.get('rejection', 'none'),
-                     'score': sc['total']['trimmed_mean'], 'node': b['node_sum_ratio'],
+                     'score': sc['total']['trimmed_mean'], 'node': node,
+                     'node_kept': None if kept is None or node is None else kept * node,
                      'extra': dict(b['extra_sum_ratio']), 'diffuse': b['diffuse_sum_ratio'],
                      'lost': b['n_lost'], 'n_no_estimate': sc['n_no_estimate'],
                      'time_s': dt})
@@ -1496,7 +1547,7 @@ def compare_candidates(vol: Any, laue_group: str, measured: Mapping[str, Any],
     eligible ={r['name'] for r in rows if r['rejection'] != 'none'}
     name, reason = suggest({**scores, 'candidates': {k: v for k, v in scores['candidates'].items()
                                                      if k in eligible}},
-                           {k: v for k, v in bias.items() if k in eligible})
+                           {k: v for k, v in bias.items() if k in eligible}, node_kept=kept)
     skipped = sorted(set(scores['candidates']) - eligible)
     if skipped:
         reason += (" The suggestion never uses the candidates without rejection ("
@@ -1558,7 +1609,7 @@ def shell_table(measured: Mapping[str, Any]) -> str:
     out += ['  '.join(c.rjust(w[j]) for j, c in enumerate(r)) for r in rows]
     spread = measured.get('count_spread')
     out.append("floor % = voxels where the Poisson floor sets the scale. node ratio = node "
-               "sum with MAD 3 / node sum without rejection.")
+               "sum with the spread limit (3 sigma) / node sum without rejection.")
     if spread:
         out.append(f"spread % = sampled orbits with max/min member pixel count above "
                    f"{spread['ratio']:g}.")
@@ -1574,7 +1625,8 @@ def compare_rows(compared: Mapping[str, Any]) -> list[list[str]]:
     rows = []
     for r in compared['rows']:
         extra = ' '.join(_num(v) for v in r['extra'].values()) or '-'
-        rows.append([r['name'], _num(r['score']), _num(r['node']), extra, _num(r['diffuse']),
+        node = r['node'] if r.get('node_kept') is None else r['node_kept']
+        rows.append([r['name'], _num(r['score']), _num(node), extra, _num(r['diffuse']),
                      str(r['lost']), str(r['n_no_estimate']), f"{r['time_s']:.1f}"])
     return rows
 
@@ -1590,7 +1642,13 @@ def format_compare(compared: Mapping[str, Any]) -> str:
     if compared['extra_positions']:
         out.append('extra = sum ratio at ' + ', '.join(_offset_label(o) for o in
                                                          compared['extra_positions']) + '.')
-    out.append("Ratios are sums divided by the sums of 'equal, mad 3'. Lower scores are better.")
+    if any(r.get('node_kept') is not None for r in compared['rows']):
+        out.append("node = sum near the Bragg nodes divided by the same sum without rejection.")
+        out.append(f"extra and diffuse = sums divided by the sums of '{BIAS_REFERENCE}'. "
+                   "Lower scores are better.")
+    else:
+        out.append(f"Ratios are sums divided by the sums of '{BIAS_REFERENCE}'. "
+                   "Lower scores are better.")
     out.append(f"Suggestion: {compared['suggestion']}. {compared['reason']}")
     out.append(LIMITS_TEXT)
     return '\n'.join(out)
@@ -1618,7 +1676,8 @@ def choice_record(name: str, reason: str, measured: Mapping[str, Any] | None,
                               'floor': model.floor}
     for r in (compared or {}).get('rows', []):
         rec['candidates'][r['name']] = {
-            'score': r['score'], 'node_sum_ratio': r['node'], 'extra_sum_ratio': r['extra'],
+            'score': r['score'], 'node_sum_ratio': r['node'],
+            'node_kept': r.get('node_kept'), 'extra_sum_ratio': r['extra'],
             'diffuse_sum_ratio': r['diffuse'], 'lost_voxels': r['lost'],
             'n_no_estimate': r['n_no_estimate'], 'time_s': r['time_s']}
     if split:

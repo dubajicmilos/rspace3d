@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
 from . import rawrecon
-from .averaging import COUNTS_MAD, Cancelled
+from .averaging import COUNTS_MAD, COUNTS_MODEL, Cancelled, candidate_kwargs
 from .averaging_panel import LOG_HEIGHT, AveragingPanel, AveragingSettings
 from .volume_builder import (
     bin_volume, symmetrize_volume, save_volume_h5, format_symmetry_diagnostics,
@@ -44,12 +44,14 @@ from .volume_builder import (
 )
 
 STANDARD_WHY = (
-    "Standard for raw frames: 'counts, mad 3'. Each orbit member has the weight of its "
-    'pixel count. A member farther than 3 x the robust spread (MAD, at least the Poisson '
-    'value) from the orbit median is rejected. In the rspace3d 2.4 benchmarks this option '
-    'gave the lowest diffuse noise on clean data (real I15 data: split-half difference 18 % '
-    "below 'equal, mad 3', Bragg sums within 1 %) at the speed of the plain MAD rule. For "
-    'data with powder rings or other contamination, use the Averaging tab.')
+    f"Standard for raw frames: '{COUNTS_MODEL['name']}'. Each orbit member has the weight of "
+    'its pixel count. The app fits a noise model to the volume. A member farther than 4 x its '
+    'expected noise from the orbit median is rejected. This rule removes intensity that is in '
+    'one frame only (for example the halo of a strong Bragg reflection), which the spread limit '
+    'does not remove. In tests on I15 and I19-2 raw frames it gave the same or a lower diffuse '
+    'noise than the spread limit, and a higher noise near the Bragg peaks on I15. If the fit '
+    f"fails, the app uses '{COUNTS_MAD['name']}'. For data with powder rings or other "
+    'contamination, use the Averaging tab.')
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -418,7 +420,7 @@ class ReconstructGUI(QMainWindow):
         fc.addRow('bin H,K / L:', brow)
         layout.addWidget(gc)
 
-        self.avg_settings = AveragingSettings(COUNTS_MAD, STANDARD_WHY)
+        self.avg_settings = AveragingSettings(COUNTS_MODEL, STANDARD_WHY)
         layout.addWidget(self.avg_settings)
 
         self.reset_btn = QPushButton('Reset to the standard settings')
@@ -789,7 +791,7 @@ class ReconstructGUI(QMainWindow):
             return
         # The Averaging panel: its binned volume and its applied option, if any
         binned = self._current_binned()
-        sym_kw, choice = {}, None
+        sym_kw, choice, standard = {}, None, False
         if binned is not None:
             sym_kw = self.avg_panel.symmetrize_kwargs(binned, laue)
             choice = self.avg_panel.choice_metadata() if sym_kw else None
@@ -798,10 +800,12 @@ class ReconstructGUI(QMainWindow):
         else:
             sym_kw = self.avg_settings.kwargs()
             rule = f'averaging {self.avg_settings.describe()}'
+            standard = self.avg_settings.is_standard()
         self._set_busy(True, 'Symmetrising...')
         self._retire_worker()
         self._worker = WorkerThread(self._do_sym, vd, laue, sym_kw, rule, self.bin_xy.value(),
-                                    self.bin_z.value(), sym_path, binned, choice, raw_path)
+                                    self.bin_z.value(), sym_path, binned, choice, raw_path,
+                                    standard)
         self._worker.progress.connect(self._update_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_saved)
@@ -809,7 +813,7 @@ class ReconstructGUI(QMainWindow):
         self._worker.start()
 
     def _do_sym(self, vd, laue, sym_kw, rule, bin_xy, bin_z, path, binned=None, choice=None,
-                raw_path=None):
+                raw_path=None, standard=False):
         log = lambda m: QThread.currentThread()._emit_log(m)     # type: ignore[union-attr]
         cb = QThread.currentThread()._emit_progress             # type: ignore[union-attr]
         if raw_path:
@@ -828,7 +832,15 @@ class ReconstructGUI(QMainWindow):
         n_ops = _EXPECTED_ORDERS[laue]
         t = time.time()
         log(f'  symmetrising {laue} ({n_ops} ops), {rule} ...')
-        sym = symmetrize_volume(vd, laue, progress_callback=cb, **sym_kw)
+        try:
+            sym = symmetrize_volume(vd, laue, progress_callback=cb, **sym_kw)
+        except ValueError as exc:
+            # The standard needs a noise model. Without it, use the spread limit.
+            if not standard or 'noise-model fit failed' not in str(exc):
+                raise
+            log(f"  The noise-model fit failed. Use '{COUNTS_MAD['name']}'. ({exc})")
+            sym = symmetrize_volume(vd, laue, progress_callback=cb,
+                                    **candidate_kwargs(COUNTS_MAD))
         if choice is not None:
             sym.metadata['averaging_choice'] = choice
         n_out = sym.metadata.get('n_outliers_removed', 0)
@@ -964,8 +976,9 @@ class ReconstructGUI(QMainWindow):
                     'to use the settings of the Advanced tab again.')
             self.avg_label.setStyleSheet('color: #070; font-weight: bold;')
         elif self.avg_settings.is_standard():
-            text = (f'Averaging: {self.avg_settings.describe()}. Counts weights and MAD outlier '
-                    'rejection at 3 sigma: the best option for clean data in the benchmarks. '
+            text = (f'Averaging: {self.avg_settings.describe()}. Each value has the weight of '
+                    'its pixel count. A value farther than 4 x its expected noise from the '
+                    'median of its symmetry-equivalent values is rejected. '
                     'Change it in the Advanced tab, or compare the options on your volume in '
                     'the Averaging tab.')
             self.avg_label.setStyleSheet('')
