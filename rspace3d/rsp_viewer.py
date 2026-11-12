@@ -20,13 +20,13 @@ import numpy.typing as npt
 from scipy.ndimage import map_coordinates
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QSplitter, QToolBar, QStatusBar, QFileDialog, QComboBox,
-    QDoubleSpinBox, QCheckBox, QLabel, QPushButton, QSlider,
-    QDialog, QTextEdit, QDialogButtonBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
+    QSplitter, QStatusBar, QFileDialog, QComboBox, QScrollArea, QStackedWidget,
+    QDoubleSpinBox, QCheckBox, QPushButton, QSlider, QSizePolicy,
+    QDialog, QTextEdit, QDialogButtonBox, QGridLayout,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QPixmap
+from PyQt6.QtGui import QFontMetrics, QKeySequence, QPixmap, QShortcut
 
 import matplotlib
 matplotlib.use('QtAgg')
@@ -34,6 +34,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.colors import LogNorm, Normalize
 
+from . import ui
 from .rsp_reader import RSPLayer, read_rsp_layer
 from .volume_builder import VolumeData, load_volume_h5, compute_plane_M_inv, extract_volume_slice
 
@@ -45,13 +46,22 @@ COLORMAPS = [
 ]
 
 
+class ViewToolbar(NavigationToolbar2QT):
+    """The matplotlib tool bar with the view tools only: home, back, forward, pan and zoom.
+
+    The panel has its own button for the export of the image.
+    """
+    toolitems = [t for t in NavigationToolbar2QT.toolitems
+                 if t[0] in ('Home', 'Back', 'Forward', None, 'Pan', 'Zoom')]
+
+
 class UnifiedViewer(QMainWindow):
     """Single GUI for .img, .cbf, and .h5 reciprocal space data."""
 
     def __init__(self, filename: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle('Reciprocal Space Viewer')
-        self.resize(1300, 850)
+        ui.start_size(self, 1300, 850)
 
         # State
         self.layer: RSPLayer | None = None          # single .img
@@ -88,170 +98,372 @@ class UnifiedViewer(QMainWindow):
     # ──────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Toolbar row 1: file + display ──
-        tb = QToolBar('Controls')
-        tb.setMovable(False)
-        self.addToolBar(tb)
+        ui.ensure_theme()
+        self.setMinimumSize(1000, 640)
 
-        open_act = QAction('Open...', self)
-        open_act.setShortcut('Ctrl+O')
-        open_act.triggered.connect(self._open_file)
-        tb.addAction(open_act)
-        tb.addSeparator()
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._build_panel())
 
-        tb.addWidget(QLabel(' Cmap: '))
+        # The centre: the empty state or the image, and the line profile on the right.
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self._build_centre())
+        self.splitter.addWidget(self._build_profile())
+        self.splitter.setSizes([700, 330])
+        self.splitter.widget(1).setVisible(False)
+        outer.addWidget(self.splitter, 1)
+
+        # Status bar: the cursor readout is the message, the file summary is permanent.
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+        self.summary_label = ui.label('', 'caption')
+        self.status.addPermanentWidget(self.summary_label)
+        self.status.showMessage('Open a file to start.')
+
+        self.main_canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+        QShortcut(QKeySequence('Ctrl+O'), self, self._open_file)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.HelpContents), self,
+                  lambda: ui.open_help(self, 'viewer'))
+
+        self._sync_mode_widgets()
+        ui.guard_wheel(self)
+
+    def _heading(self, lay, text):
+        """A heading of the control panel, with 16 px of space above it."""
+        lay.addSpacing(ui.SPACE[1])
+        lay.addWidget(ui.label(text, 'section-title'))
+
+    @staticmethod
+    def _field(text, widget, tip='', width=84):
+        """A label and a control in one row. Returns the row and the label."""
+        lab = ui.label(text)
+        lab.setFixedWidth(width)
+        if tip:
+            lab.setToolTip(tip)
+        lay = ui.row(lab, stretch=False)
+        lay.addWidget(widget, 1)
+        return lay, lab
+
+    def _build_panel(self):
+        S = ui.SPACE
+        panel = QFrame()
+        panel.setObjectName('sidebar')
+        panel.setFixedWidth(272)
+        shell = QVBoxLayout(panel)
+        shell.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        shell.addWidget(scroll)
+        body = QWidget()
+        scroll.setWidget(body)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(S[3], S[3], S[3], S[3])
+        lay.setSpacing(S[1])
+
+        # 1. Name of the window
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        names.addWidget(ui.label('rspace3d', 'app-title'))
+        names.addWidget(ui.label('Viewer', 'caption'))
+        head = QHBoxLayout()
+        head.setSpacing(S[1])
+        head.addWidget(ui.Mark(), 0, Qt.AlignmentFlag.AlignTop)
+        head.addLayout(names, 1)
+        lay.addLayout(head)
+        lay.addSpacing(S[1])
+
+        # 2. File
+        self.open_btn = ui.button('Open file...', None,
+                                  'Open a volume (.h5), a CrysAlisPro layer (.img) or a raw '
+                                  'frame (.cbf). Shortcut: Ctrl+O.', self._open_file)
+        lay.addWidget(self.open_btn)
+        self.file_label = ui.label('', 'strong')
+        self.file_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.facts1 = ui.label('', 'caption', wrap=True)
+        self.facts2 = ui.label('', 'caption', wrap=True)
+        for w in (self.file_label, self.facts1, self.facts2):
+            lay.addWidget(w)
+
+        # 3. Colour scale
+        self._heading(lay, 'Colour scale')
         self.cmap_combo = QComboBox()
         self.cmap_combo.addItems(COLORMAPS)
         self.cmap_combo.setCurrentText('gnuplot2')
+        self.cmap_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmap_combo.setMinimumContentsLength(8)
+        self.cmap_combo.setToolTip('The colours that show the intensity.')
         self.cmap_combo.currentTextChanged.connect(self._update_cmap)
-        tb.addWidget(self.cmap_combo)
-        tb.addSeparator()
+        field, _ = self._field('Colour map', self.cmap_combo)
+        lay.addLayout(field)
 
-        tb.addWidget(QLabel(' Min: '))
         self.min_spin = QDoubleSpinBox()
         self.min_spin.setDecimals(1)
         self.min_spin.setRange(-1e8, 1e8)
         self.min_spin.setValue(0)
+        self.min_spin.setToolTip('Intensity that has the first colour of the map.')
         self.min_spin.valueChanged.connect(self._update_clim)
-        tb.addWidget(self.min_spin)
-
-        tb.addWidget(QLabel(' Max: '))
         self.max_spin = QDoubleSpinBox()
         self.max_spin.setDecimals(1)
         self.max_spin.setRange(-1e8, 1e8)
         self.max_spin.setValue(100)
+        self.max_spin.setToolTip('Intensity that has the last colour of the map.')
         self.max_spin.valueChanged.connect(self._update_clim)
-        tb.addWidget(self.max_spin)
-        tb.addSeparator()
+        for spin in (self.min_spin, self.max_spin):
+            spin.setMinimumWidth(64)      # the range of the box would make it wider
+        mm = QGridLayout()
+        mm.setHorizontalSpacing(ui.SPACE[1])
+        mm.setVerticalSpacing(ui.SPACE[0])
+        mm.addWidget(ui.label('Min'), 0, 0)
+        mm.addWidget(ui.label('Max'), 0, 1)
+        mm.addWidget(self.min_spin, 1, 0)
+        mm.addWidget(self.max_spin, 1, 1)
+        lay.addLayout(mm)
 
-        self.log_check = QCheckBox('Log')
+        self.auto_btn = ui.button('Auto', tip='Set Min and Max from the slice that is shown now.',
+                                  clicked=self._auto_range)
+        lay.addLayout(ui.row(self.auto_btn))
+        self.log_check = QCheckBox('Log scale')
+        self.log_check.setToolTip('Show the intensity on a logarithmic scale. Values at or '
+                                  'below zero get the first colour.')
         self.log_check.toggled.connect(self._update_clim)
-        tb.addWidget(self.log_check)
+        lay.addWidget(self.log_check)
 
-        self.grid_check = QCheckBox('Grid')
-        self.grid_check.toggled.connect(self._toggle_grid)
-        tb.addWidget(self.grid_check)
-
-        self.cbar_check = QCheckBox('Colorbar')
-        self.cbar_check.setChecked(True)
-        self.cbar_check.toggled.connect(self._toggle_colorbar)
-        tb.addWidget(self.cbar_check)
-        tb.addSeparator()
-
-        self.line_btn = QPushButton('Line Profile')
-        self.line_btn.setCheckable(True)
-        self.line_btn.toggled.connect(self._toggle_line_tool)
-        tb.addWidget(self.line_btn)
-
-        # ── Toolbar row 2: axis ranges + volume controls ──
-        tb2 = QToolBar('Navigation')
-        tb2.setMovable(False)
-        self.addToolBar(tb2)
-
-        tb2.addWidget(QLabel(' x range: '))
+        # 4. View
+        self._heading(lay, 'View')
         self.xrange_spin = QDoubleSpinBox()
         self.xrange_spin.setDecimals(1)
         self.xrange_spin.setRange(0.5, 100)
         self.xrange_spin.setValue(8)
         self.xrange_spin.setSingleStep(1.0)
         self.xrange_spin.valueChanged.connect(self._apply_axis_range)
-        tb2.addWidget(self.xrange_spin)
-
-        tb2.addWidget(QLabel(' y range: '))
         self.yrange_spin = QDoubleSpinBox()
         self.yrange_spin.setDecimals(1)
         self.yrange_spin.setRange(0.5, 100)
         self.yrange_spin.setValue(8)
         self.yrange_spin.setSingleStep(1.0)
         self.yrange_spin.valueChanged.connect(self._apply_axis_range)
-        tb2.addWidget(self.yrange_spin)
-        tb2.addSeparator()
+        field, self.xrange_label = self._field('x range ±', self.xrange_spin)
+        lay.addLayout(field)
+        field, self.yrange_label = self._field('y range ±', self.yrange_spin)
+        lay.addLayout(field)
+        self.fit_btn = ui.button('Fit to data', tip='Set both ranges so that the image fills '
+                                 'the axes.', clicked=self._fit_view)
+        lay.addLayout(ui.row(self.fit_btn))
+        self.grid_check = QCheckBox('Miller-index grid')
+        self.grid_check.setToolTip('Draw a line at each integer Miller index.')
+        self.grid_check.toggled.connect(self._toggle_grid)
+        lay.addWidget(self.grid_check)
+        self.cbar_check = QCheckBox('Colour bar')
+        self.cbar_check.setChecked(True)
+        self.cbar_check.setToolTip('Show the colour bar next to the image.')
+        self.cbar_check.toggled.connect(self._toggle_colorbar)
+        lay.addWidget(self.cbar_check)
 
-        tb2.addSeparator()
-        export_btn = QPushButton('Export...')
-        export_btn.clicked.connect(self._export)
-        tb2.addWidget(export_btn)
+        # 5. Tools
+        self._heading(lay, 'Tools')
+        self.line_btn = QPushButton('Line profile')
+        self.line_btn.setCheckable(True)
+        self.line_btn.setToolTip('Show the intensity along a line that you draw on the image.')
+        self.line_btn.toggled.connect(self._toggle_line_tool)
+        lay.addWidget(self.line_btn)
+        self.line_hint = ui.hint('Drag on the image to draw a line.')
+        self.line_hint.setVisible(False)             # shown while the tool is on
+        lay.addWidget(self.line_hint)
+        self.export_btn = ui.button('Export image...', tip='Save the image to a file or copy '
+                                    'it to the clipboard.', clicked=self._export)
+        lay.addWidget(self.export_btn)
+        self.iso_btn = ui.button('3D isosurface...', tip='Show the volume as surfaces of '
+                                 'equal intensity in 3D.', clicked=self._show_isosurface)
+        lay.addWidget(self.iso_btn)
+        self.info_btn = ui.button('File information...', tip='Show the size, the ranges, the '
+                                  'unit cell and the processing of the volume.',
+                                  clicked=self._show_info)
+        lay.addWidget(self.info_btn)
 
-        # ── Toolbar row 3: volume controls (hidden for single frames) ──
-        self.vol_toolbar = QToolBar('Volume')
-        self.vol_toolbar.setMovable(False)
-        self.addToolBar(self.vol_toolbar)
+        # 6. Help
+        lay.addStretch(1)
+        lay.addWidget(ui.button('Help (F1)', 'link', 'Open the help for this window.',
+                                lambda: ui.open_help(self, 'viewer')))
+        self._data_widgets = [self.auto_btn, self.fit_btn, self.line_btn, self.export_btn]
+        return panel
 
-        self.vol_toolbar.addWidget(QLabel(' Plane: '))
+    def _build_centre(self):
+        S = ui.SPACE
+        self.stack = QStackedWidget()
+
+        # Page 0: empty state
+        empty = QWidget()
+        el = QVBoxLayout(empty)
+        el.setContentsMargins(S[4], S[4], S[4], S[4])
+        el.addStretch(1)
+        # The texts have their own line breaks. A wrapped label in a centred column
+        # gets its height for the width of the window, and its lines are cut.
+        el.setSpacing(S[2])
+        msg = ui.label('Open a volume (.h5), a CrysAlisPro layer (.img)\nor a raw frame (.cbf).',
+                       'page-title')
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        el.addWidget(msg, 0, Qt.AlignmentFlag.AlignHCenter)
+        what = ui.label('A volume shows one plane at a time. You select the plane and the '
+                        'slice.\nA layer shows one plane in Miller indices. A raw frame shows '
+                        'the detector image in pixels.', 'hint')
+        what.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        el.addWidget(what, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.empty_open_btn = ui.button('Open file...', 'primary', 'Open a volume, a layer or '
+                                        'a raw frame. Shortcut: Ctrl+O.', self._open_file)
+        self.empty_open_btn.setMinimumWidth(160)
+        el.addWidget(self.empty_open_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        el.addStretch(1)
+        self.stack.addWidget(empty)
+
+        # Page 1: canvas, navigation tool bar and slice bar
+        page = QWidget()
+        pl = QVBoxLayout(page)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+        self.main_fig = Figure(tight_layout=True)
+        self.main_ax = self.main_fig.add_subplot(111)
+        self.main_canvas = FigureCanvasQTAgg(self.main_fig)
+        self.nav_toolbar = ViewToolbar(self.main_canvas, self)
+        pl.addWidget(self.main_canvas, 1)
+        pl.addWidget(self.nav_toolbar)
+        pl.addWidget(self._build_slice_bar())
+        self.stack.addWidget(page)
+        return self.stack
+
+    def _build_slice_bar(self):
+        S = ui.SPACE
+        self.vol_toolbar = QWidget()
+        lay = QHBoxLayout(self.vol_toolbar)
+        lay.setContentsMargins(S[2], S[1], S[3], S[2])
+        lay.setSpacing(S[1])
+
+        lay.addWidget(ui.label('Plane'))
         self.plane_combo = QComboBox()
-        self.plane_combo.addItems(['HK (fix L)', 'HL (fix K)', 'KL (fix H)'])
+        self.plane_combo.addItems(['hk plane (l fixed)', 'hl plane (k fixed)',
+                                   'kl plane (h fixed)'])
+        self.plane_combo.setToolTip('The plane of the volume that is shown. The third index '
+                                    'is fixed.')
         self.plane_combo.currentIndexChanged.connect(self._on_plane_changed)
-        self.vol_toolbar.addWidget(self.plane_combo)
+        lay.addWidget(self.plane_combo)
 
-        self.vol_toolbar.addWidget(QLabel(' Fixed value: '))
+        self.fixed_label = ui.label('l =')
+        lay.addWidget(self.fixed_label)
         self.slice_spin = QDoubleSpinBox()
         self.slice_spin.setDecimals(3)
         self.slice_spin.setSingleStep(0.02)
+        self.slice_spin.setMinimumWidth(96)
+        self.slice_spin.setToolTip('Value of the fixed index. It is the position of the slice.')
         self.slice_spin.valueChanged.connect(self._on_slice_changed)
-        self.vol_toolbar.addWidget(self.slice_spin)
+        lay.addWidget(self.slice_spin)
 
         self.slice_slider = QSlider(Qt.Orientation.Horizontal)
-        self.slice_slider.setMinimumWidth(300)
+        self.slice_slider.setMinimumWidth(120)
+        self.slice_slider.setToolTip('Move the slice through the volume.')
         self.slice_slider.valueChanged.connect(self._on_slider_moved)
-        self.vol_toolbar.addWidget(self.slice_slider)
+        lay.addWidget(self.slice_slider, 1)
 
-        self.slice_label = QLabel('')
-        self.vol_toolbar.addWidget(self.slice_label)
-        self.vol_toolbar.addSeparator()
-
-        self.vol_toolbar.addWidget(QLabel(' Integrate ±: '))
+        lay.addWidget(ui.label('Integrate over ±'))
         self.int_range_spin = QDoubleSpinBox()
         self.int_range_spin.setDecimals(2)
         self.int_range_spin.setRange(0, 5)
         self.int_range_spin.setValue(0)
         self.int_range_spin.setSingleStep(0.02)
+        self.int_range_spin.setMinimumWidth(92)
+        self.int_range_spin.setToolTip('Add the slices within this distance of the fixed '
+                                       'index. Zero shows one slice.')
         self.int_range_spin.valueChanged.connect(self._on_slice_changed)
-        self.vol_toolbar.addWidget(self.int_range_spin)
-        self.vol_toolbar.addSeparator()
+        lay.addWidget(self.int_range_spin)
 
-        self.iso_btn = QPushButton('3D Isosurface...')
-        self.iso_btn.clicked.connect(self._show_isosurface)
-        self.vol_toolbar.addWidget(self.iso_btn)
-
-        self.info_btn = QPushButton('Info...')
-        self.info_btn.clicked.connect(self._show_info)
-        self.vol_toolbar.addWidget(self.info_btn)
-
+        self.slice_label = ui.label('', 'caption')
+        lay.addWidget(self.slice_label)
         self.vol_toolbar.setVisible(False)
+        return self.vol_toolbar
 
-        # ── Main area ──
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        self.main_fig = Figure(tight_layout=True)
-        self.main_ax = self.main_fig.add_subplot(111)
-        self.main_canvas = FigureCanvasQTAgg(self.main_fig)
-        self.nav_toolbar = NavigationToolbar2QT(self.main_canvas, self)
-        ll.addWidget(self.main_canvas)
-        ll.addWidget(self.nav_toolbar)
-
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
+    def _build_profile(self):
+        S = ui.SPACE
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(S[1], S[2], S[2], S[1])
+        lay.setSpacing(S[1])
+        lay.addWidget(ui.label('Line profile', 'section-title'))
         self.profile_fig = Figure(tight_layout=True)
         self.profile_ax = self.profile_fig.add_subplot(111)
         self.profile_canvas = FigureCanvasQTAgg(self.profile_fig)
-        rl.addWidget(self.profile_canvas)
+        lay.addWidget(self.profile_canvas, 1)
+        return panel
 
-        self.splitter.addWidget(left)
-        self.splitter.addWidget(right)
-        self.splitter.setSizes([900, 400])
-        right.setVisible(False)
-        self.setCentralWidget(self.splitter)
+    def _sync_mode_widgets(self):
+        """Show the controls that fit the open file and the page of the centre."""
+        loaded = self._mode is not None
+        self.stack.setCurrentIndex(1 if loaded else 0)
+        for w in self._data_widgets:
+            w.setEnabled(loaded)
+        for w in (self.file_label, self.facts1, self.facts2):
+            w.setVisible(loaded and (w is not self.facts2 or bool(w.text())))
+        self.iso_btn.setVisible(self._mode == 'vol')
+        self.info_btn.setVisible(self._mode == 'vol')
+        self.vol_toolbar.setVisible(self._mode == 'vol')
+        for spin in (self.xrange_spin, self.yrange_spin):
+            spin.setEnabled(self._mode in ('img', 'vol'))
+        self.fit_btn.setEnabled(self._mode in ('img', 'vol'))
+        self._sync_range_labels()
 
-        # Status bar
-        self.status = QStatusBar()
-        self.setStatusBar(self.status)
-        self.status.showMessage('Open a .img, .cbf, or .h5 file')
+    def _sync_range_labels(self):
+        """Name the two range boxes after the axes of the shown plane."""
+        if self._mode in ('img', 'vol'):
+            xl, yl = self._current_x_label, self._current_y_label
+        else:
+            xl, yl = 'x', 'y'
+        self.xrange_label.setText(f'{xl} range ±' if self._mode != 'cbf' else 'x range')
+        self.yrange_label.setText(f'{yl} range ±' if self._mode != 'cbf' else 'y range')
+        self.xrange_spin.setToolTip(f'Half width of the view along {xl}, in Miller-index units.')
+        self.yrange_spin.setToolTip(f'Half width of the view along {yl}, in Miller-index units.')
 
-        # Mouse tracking
-        self.main_canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+    def _data_miller_extent(self):
+        """Largest absolute Miller indices of the two axes over the shown data, or None."""
+        M = self._current_M_inv
+        if M is None or self.extent is None or self._display_data is None:
+            return None
+        e = self.extent
+        ny, nx = self._display_data.shape
+        dx, dy = (e[1] - e[0]) / nx / 2, (e[3] - e[2]) / ny / 2     # first and last pixel centres
+        xs = np.array([e[0] + dx, e[1] - dx, e[0] + dx, e[1] - dx])
+        ys = np.array([e[2] + dy, e[2] + dy, e[3] - dy, e[3] - dy])
+        i1 = M[0, 0] * xs + M[0, 1] * ys
+        i2 = M[1, 0] * xs + M[1, 1] * ys
+        return float(np.abs(i1).max()), float(np.abs(i2).max())
+
+    def _fit_view(self):
+        """Set the two ranges to the data extent, rounded up to 0.1."""
+        ext = self._data_miller_extent()
+        if ext is None:
+            return
+        vals = [min(max(np.ceil(v * 10 - 1e-9) / 10, 0.5), 100.0) for v in ext]
+        for spin, v in zip((self.xrange_spin, self.yrange_spin), vals):
+            spin.blockSignals(True)
+            spin.setValue(float(v))
+            spin.blockSignals(False)
+        self._apply_axis_range()
+
+    def _set_summary(self, name, path, line1, line2=''):
+        """Fill the file name, the facts in the panel and the summary in the status bar."""
+        fm = QFontMetrics(self.file_label.font())
+        self.file_label.setText(fm.elidedText(name, Qt.TextElideMode.ElideMiddle, 216))
+        self.file_label.setToolTip(path)
+        self.facts1.setText(line1)
+        self.facts2.setText(line2)
+        self.facts2.setVisible(bool(line2))
+        self.file_label.setVisible(True)
+        self.facts1.setVisible(True)
+        self.summary_label.setText(f'{name}  |  {line1}')
 
     # ──────────────────────────────────────────────────────────
     # File I/O
@@ -286,6 +498,18 @@ class UnifiedViewer(QMainWindow):
         except Exception as e:
             self.status.showMessage(f'Error: {e}')
             import traceback; traceback.print_exc()
+            # No file is open now: show the empty window, not the image of the file before
+            self._mode = None
+            self._display_data = None
+            self.layer = self.vol = self._raw_data = None
+            self.summary_label.setText('')
+            self.setWindowTitle('Reciprocal Space Viewer')
+            self._sync_mode_widgets()
+            ui.show_error(
+                self, 'This file cannot be opened',
+                f'The file "{os.path.basename(path)}" could not be read. Check that it is a '
+                f'volume (.h5), a CrysAlisPro layer (.img) or a raw frame (.cbf).\n'
+                f'{type(e).__name__}: {e}')
 
     def _load_img(self, path):
         self.layer = read_rsp_layer(path)
@@ -293,10 +517,16 @@ class UnifiedViewer(QMainWindow):
         self._current_M_inv = self.layer.M_inv
         self._current_x_label = self.layer.x_label
         self._current_y_label = self.layer.y_label
-        self.vol_toolbar.setVisible(False)
-        self.setWindowTitle(f'RSP Viewer — {os.path.basename(path)}')
+        self.setWindowTitle(f'Viewer - {os.path.basename(path)}')
+        ny, nx = self.layer.intensity.shape
+        self._set_summary(os.path.basename(path), path, f'Layer, {nx} x {ny} pixels',
+                          f'{self.layer.fixed_label} = {self.layer.fixed_value:.4f}')
+        self._sync_mode_widgets()
         self._display_img()
         self._auto_range()
+        self._fit_view()
+        self.status.showMessage('Move the cursor over the image to read the indices and '
+                                'the intensity.')
 
     def _load_cbf(self, path):
         import fabio
@@ -304,10 +534,14 @@ class UnifiedViewer(QMainWindow):
         self._raw_data = cbf.data.astype(float)
         self._mode = 'cbf'
         self._current_M_inv = None
-        self.vol_toolbar.setVisible(False)
-        self.setWindowTitle(f'RSP Viewer — {os.path.basename(path)}')
+        self.setWindowTitle(f'Viewer - {os.path.basename(path)}')
+        ny, nx = self._raw_data.shape
+        self._set_summary(os.path.basename(path), path, f'Raw frame, {nx} x {ny} pixels')
+        self._sync_mode_widgets()
         self._display_cbf()
         self._auto_range()
+        self.status.showMessage('Move the cursor over the image to read the pixel and '
+                                'the intensity.')
 
     def _load_volume(self, path):
         ext = os.path.splitext(path)[1].lower()
@@ -324,19 +558,23 @@ class UnifiedViewer(QMainWindow):
 
         self._mode = 'vol'
         self._last_cut_value = None
-        self.vol_toolbar.setVisible(True)
-        self.setWindowTitle(f'RSP Viewer — {os.path.basename(path)}')
+        self.setWindowTitle(f'Viewer - {os.path.basename(path)}')
 
         nh, nk, nl = self.vol.intensity.shape
-        self.status.showMessage(
-            f'Volume: {nh}x{nk}x{nl}  '
-            f'H=[{self.vol.H[0]:.2f},{self.vol.H[-1]:.2f}]  '
-            f'K=[{self.vol.K[0]:.2f},{self.vol.K[-1]:.2f}]  '
-            f'L=[{self.vol.L[0]:.2f},{self.vol.L[-1]:.2f}]')
 
+        def rng(ax):
+            return f'{round(float(ax[0]), 2):g} to {round(float(ax[-1]), 2):g}'
+
+        self._set_summary(
+            os.path.basename(path), path, f'Volume, {nh} x {nk} x {nl} voxels',
+            f'h {rng(self.vol.H)}, k {rng(self.vol.K)}, l {rng(self.vol.L)}')
+        self._sync_mode_widgets()
         self._setup_vol_controls()
         self._update_vol_slice()
         self._auto_range()
+        self._fit_view()
+        self.status.showMessage('Move the cursor over the image to read the indices and '
+                                'the intensity.')
 
     # ──────────────────────────────────────────────────────────
     # Display — single .img
@@ -494,7 +732,9 @@ class UnifiedViewer(QMainWindow):
         if n_sl > 1:
             title += f'  (±{self.int_range_spin.value():.2f}, {n_sl} slices)'
         self.slice_label.setText(f'{fl}={fv:.3f}')
+        self.fixed_label.setText(f'{fl} =')
 
+        self._sync_range_labels()
         self._show_image(title=title, xlabel=xl, ylabel=yl)
 
     # ──────────────────────────────────────────────────────────
@@ -740,7 +980,12 @@ class UnifiedViewer(QMainWindow):
     # Line profile
     # ──────────────────────────────────────────────────────────
 
+    def closeEvent(self, event):
+        ui.release_help(self)
+        super().closeEvent(event)
+
     def _toggle_line_tool(self, active):
+        self.line_hint.setVisible(bool(active))
         right = self.splitter.widget(1)
         if active:
             self.nav_toolbar.mode = ''
@@ -750,6 +995,8 @@ class UnifiedViewer(QMainWindow):
             self._cid_press = self.main_canvas.mpl_connect('button_press_event', self._lp_press)
             self._cid_drag = self.main_canvas.mpl_connect('motion_notify_event', self._lp_drag)
             self._cid_release = self.main_canvas.mpl_connect('button_release_event', self._lp_release)
+            if not self.profile_ax.lines:
+                self._profile_placeholder()
             right.setVisible(True)
             self.splitter.setSizes([900, 400])
         else:
@@ -761,6 +1008,15 @@ class UnifiedViewer(QMainWindow):
                 self.line_artist = None
                 self.main_canvas.draw_idle()
             right.setVisible(False)
+
+    def _profile_placeholder(self):
+        """Tell the user what the empty profile panel will show."""
+        ax = self.profile_ax
+        ax.clear()
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, 'Drag on the image\nto draw a line.', ha='center', va='center',
+                transform=ax.transAxes, color=ui.COLORS['muted'])
+        self.profile_canvas.draw_idle()
 
     def _lp_press(self, e):
         if e.inaxes != self.main_ax or e.button != 1: return
@@ -821,6 +1077,7 @@ class UnifiedViewer(QMainWindow):
             cv, cl = 0, ''
 
         self.profile_ax.clear()
+        self.profile_ax.set_axis_on()
         self.profile_ax.plot(xd, profile, 'b-', lw=0.8)
         self.profile_ax.set_xlabel(xlab)
         self.profile_ax.set_ylabel('Intensity')
@@ -919,17 +1176,24 @@ class UnifiedViewer(QMainWindow):
         """Launch 3D isosurface viewer for the loaded volume."""
         if self.vol is None:
             return
-        rx = self.xrange_spin.value()
-        ry = self.yrange_spin.value()
+        # The two range boxes are the axes of the shown plane. The third axis is complete.
+        full = {'h': (float(self.vol.H[0]), float(self.vol.H[-1])),
+                'k': (float(self.vol.K[0]), float(self.vol.K[-1])),
+                'l': (float(self.vol.L[0]), float(self.vol.L[-1]))}
+        shown = {'HK': ('h', 'k'), 'HL': ('h', 'l'), 'KL': ('k', 'l')}[self._get_vol_plane_type()]
+        for axis, spin in zip(shown, (self.xrange_spin, self.yrange_spin)):
+            full[axis] = (-spin.value(), spin.value())
         try:
             from .volume_isosurface import plot_isosurface
             self.status.showMessage('Launching 3D isosurface...')
             plot_isosurface(
                 self.vol, method='pyvista',
-                h_range=(-rx, rx), k_range=(-ry, ry),
-                l_range=(float(self.vol.L[0]), float(self.vol.L[-1])))
+                h_range=full['h'], k_range=full['k'], l_range=full['l'])
         except Exception as e:
             self.status.showMessage(f'Isosurface error: {e}')
+            ui.show_error(self, 'The 3D view did not open',
+                          f'The 3D isosurface needs PyVista or Plotly (pip install pyvista).\n'
+                          f'{type(e).__name__}: {e}')
 
     def _show_info(self):
         """Show volume metadata in a dialog."""
@@ -1020,7 +1284,7 @@ class UnifiedViewer(QMainWindow):
 
         text = QTextEdit()
         text.setReadOnly(True)
-        text.setStyleSheet('font-family: Consolas, monospace; font-size: 12px;')
+        text.setProperty('role', 'log')
         text.setPlainText('\n'.join(lines))
         layout.addWidget(text)
 

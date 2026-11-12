@@ -541,8 +541,8 @@ def test_builder_gui_defaults_and_process_all_without_panel(qapp, monkeypatch, t
     assert (gui.laue_combo.currentData(), gui.avg_settings.spec()['name'],
             gui.bin_xy_spin.value(), gui.bin_z_spin.value(), gui.morph_combo.currentData(),
             gui.force_reload_chk.isChecked()) == ('m-3m', 'equal weights, spread limit (3 sigma)', 2, 1, 'auto', False)
-    assert [gui.tabs.tabText(i) for i in range(gui.tabs.count())] == [
-        'Process', 'Averaging', 'Advanced', 'dcunwarp file']
+    assert gui.page_names() == ['Layer list', 'Process', 'Averaging', 'Advanced', 'Help']
+    assert gui.current_page() == 'Process'
     assert "'equal weights, spread limit (3 sigma)' (standard)" in gui.avg_label.text()
     gui._process_all()
     _wait(qapp, gui)
@@ -621,7 +621,7 @@ def test_builder_gui_shows_that_the_option_replaces_sigma(qapp, monkeypatch, tmp
     gui.avg_panel.apply_combo.setCurrentText('pixel-count weights, spread limit (3 sigma)')
     gui.avg_panel._apply()
     assert not s.mode_combo.isEnabled() and "'pixel-count weights, spread limit (3 sigma)'" in s.note_label.text()
-    assert "'pixel-count weights, spread limit (3 sigma)', applied in the Averaging tab" in gui.avg_label.text()
+    assert "'pixel-count weights, spread limit (3 sigma)', applied on the Averaging page" in gui.avg_label.text()
     gui._process_all()
     _wait(qapp, gui)
     head = [ln for ln in logged if ln.startswith('Processing:')]
@@ -678,8 +678,8 @@ def test_reconstruct_gui_defaults_and_symmetrise_without_panel(qapp, monkeypatch
     gui, stub = _recon(qapp, monkeypatch, tmp_path, vol)
     assert (gui.avg_settings.spec()['name'], gui.bin_xy.value(), gui.bin_z.value()) == (
         'pixel-count weights, noise limit (4 sigma)', 1, 1)
-    assert [gui.tabs.tabText(i) for i in range(gui.tabs.count())] == [
-        'Reconstruct', 'Averaging', 'Advanced']
+    assert gui.page_names() == ['Reconstruct', 'Averaging', 'Frame tools', 'Advanced', 'Help']
+    assert gui.current_page() == 'Reconstruct'
     assert gui.frame_tools_group is gui.avg_panel.frame_group
     assert gui.avg_panel.selected_volume() is None and gui.source_note.isHidden()
     assert "'pixel-count weights, noise limit (4 sigma)' (standard)" in gui.avg_label.text()
@@ -808,7 +808,7 @@ def test_save_refuses_a_volume_of_other_grid_settings(qapp, monkeypatch, tmp_pat
     warned = []
     monkeypatch.setattr(rg.QMessageBox, 'warning', staticmethod(lambda *a: warned.append(a)))
     gui.dq.setValue(0.05)
-    gui.avg_panel.save_btn.click()                 # Symmetrise + Save of the Averaging tab
+    gui.avg_panel.save_btn.click()                 # Symmetrise and save of the Averaging page
     assert stub.sym == [] and len(warned) == 1 and gui._worker is None
     gui.dq.setValue(0.025)                         # the settings of the volume again
     gui.avg_panel.save_btn.click()

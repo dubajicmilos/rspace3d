@@ -1,15 +1,18 @@
 """
-volume_builder_gui.py — Simplified one-button 3D volume processing GUI.
+volume_builder_gui.py — One-button 3D volume processing GUI for unwarp layers.
 
-Select unwarp folder → Process All:
+Select unwarp folder → Process all:
   1. Load all .img files into 3D volume
   2. Save raw volume as .h5
   3. Bin 2x2 (HK), reject outliers, symmetrize
   4. Save processed volume as .h5 with Laue group suffix
 
-Tabs: Process (folder, Laue group, binning, Process All), Averaging (measure
-and compare the averaging options), Advanced (averaging settings, coverage
-mask, raw cache) and dcunwarp file (layer list for CrysAlisPro).
+Pages (the side bar of the window):
+  Layer list  the .dcunwarp layer list for CrysAlisPro (the step before this window)
+  Process     folder, Laue group, binning and the button Process all
+  Averaging   measure and compare the averaging options
+  Advanced    averaging settings, coverage mask, raw cache
+  Help        how to use the window and what the options do to the data
 
 Usage:
     python volume_builder_gui.py
@@ -24,13 +27,12 @@ from typing import Any, Callable
 import numpy as np
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QFormLayout, QPushButton, QLabel, QComboBox,
-    QCheckBox, QSpinBox, QDoubleSpinBox, QProgressBar, QFileDialog,
-    QTextEdit, QMessageBox, QTabWidget, QScrollArea, QSplitter,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QMessageBox,
+    QSpinBox,
 )
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
 
+from . import __version__, ui
 from .volume_builder import (
     load_unwarp_folder, bin_volume, symmetrize_volume,
     save_volume_h5, load_volume_h5, adaptive_morph_size, bin_native,
@@ -40,15 +42,16 @@ from .volume_builder import (
 )
 from .make_dcunwarp import generate_dcunwarp
 from .averaging import EQUAL_MAD
-from .averaging_panel import LOG_HEIGHT, AveragingPanel, AveragingSettings
+from .averaging_panel import AveragingPanel, AveragingSettings, engine_name
 
 STANDARD_WHY = (
-    "Standard for unwarp layers: 'equal weights, spread limit (3 sigma)', the default of the earlier versions. The "
-    'value is the plain mean of the orbit members. A member farther than 3 x the robust '
-    'spread (MAD, at least the Poisson value) from the orbit median is rejected. The layers '
-    'have no detector pixel counts: without a binning there are no counts, and with a '
-    'binning the counts are only the covered sub-pixels of each voxel. Thus the counts '
-    'weights give almost no gain here.')
+    f"Standard for unwarp layers: '{EQUAL_MAD['name']}', the default of the earlier versions. "
+    'The layers have no detector pixel counts, so the pixel-count weights give almost no gain '
+    'here.')
+STANDARD_EFFECT = ('The value is the plain mean of the symmetry-equivalent values. A value '
+                   'farther than 3 x the spread of these values from their median is rejected.')
+ENGINE_WORDS = {'GPU': 'GPU', 'numba': 'CPU (numba)', 'NumPy': 'CPU (NumPy, slow)'}
+LAYER_LIMIT = 500           # layers that CrysAlisPro accepts in one .dcunwarp file
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -85,77 +88,104 @@ class WorkerThread(QThread):
 # Main GUI
 # ──────────────────────────────────────────────────────────────────
 
-class SimpleVolumeGUI(QMainWindow):
+class SimpleVolumeGUI(ui.Shell):
 
     def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle('3D Volume Processor')
-        self.resize(1280, 920)
+        super().__init__('3D Volume Processor', 'Volume from unwarp layers')
+        ui.start_size(self, 1280, 920)
+        self._busy = False
         self._worker: WorkerThread | None = None
         self._folder_path: str | None = None
         self._dataset_valid = False
         # The binned volume of the Averaging panel: {'key', 'vol', 'raw_path', 'base'}
         self._prepared: dict[str, Any] | None = None
         self._recip: Any = None     # reciprocal basis of the .img header (columns a*, b*, c*)
+        self._prefix: str | None = None             # file prefix of the layers
+        self._dims: tuple[int, int, int] | None = None   # pixels x, pixels y, layers
+        self._last_saved: str | None = None         # the last symmetrised file
+        self._viewer: Any = None
+        self._viewers: list[Any] = []               # the viewer windows that this window opened
         self._build_ui()
 
+        engine = ENGINE_WORDS[engine_name()]
         if HAS_GPU:
             try:
                 import cupy as cp
                 name = cp.cuda.runtime.getDeviceProperties(0)['name'].decode()
                 self._log(f'GPU detected: {name}')
+                engine = f'GPU ({name})'
             except Exception:
                 self._log('GPU detected')
         else:
             self._log('No GPU — using CPU')
-
-        self.statusBar().showMessage('Select an unwarp folder to begin')  # type: ignore[union-attr]
+        self.sidebar.footer.setText(f'Engine: {engine}\nrspace3d {__version__}')
+        self.set_status('Select an unwarp folder to begin')
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        outer = QVBoxLayout(central)
-        # Tabs above, progress and log below. The user can move the border.
-        self.split = QSplitter(Qt.Orientation.Vertical)
-        outer.addWidget(self.split)
-        self.tabs = QTabWidget()
-        self.split.addWidget(self.tabs)
-        self.process_tab = QWidget()
-        layout = QVBoxLayout(self.process_tab)
-        # A scroll area: the tab does not push the log below its height
-        process_scroll = QScrollArea()
-        process_scroll.setWidgetResizable(True)
-        process_scroll.setWidget(self.process_tab)
-        self.tabs.addTab(process_scroll, 'Process')
+        self._build_dcunwarp_page()
+        self._build_process_page()
 
-        # ── Folder selection ──
-        g1 = QGroupBox('1. Unwarp folder  (CrysAlisPro unwarp .img layers)')
-        v1 = QVBoxLayout(g1)
-        h1 = QHBoxLayout()
-        self.folder_label = QLabel('No folder selected')
-        self.folder_label.setWordWrap(True)
-        h1.addWidget(self.folder_label, stretch=1)
-        self.browse_btn = QPushButton('Browse...')
-        self.browse_btn.clicked.connect(self._browse_folder)
-        self.browse_btn.setToolTip(
-            'Select the folder containing CrysAlisPro unwarp .img files.\n'
-            'These are HK reciprocal space reconstructions at different l values.')
-        h1.addWidget(self.browse_btn)
-        v1.addLayout(h1)
-        self.info_label = QLabel('')
-        self.info_label.setWordWrap(True)
-        self.info_label.setStyleSheet('color: #555; padding: 4px;')
-        self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        v1.addWidget(self.info_label)
-        layout.addWidget(g1)
+        # ── Averaging panel ──
+        self.avg_panel = AveragingPanel(self._averaging_request, log=self._log,
+                                        progress=self._update_progress)
+        self.avg_panel.busy_changed.connect(self._on_panel_busy)
+        self.avg_panel.applied_changed.connect(self._on_applied_changed)
+        self.avg_panel.set_save_action(
+            'Process all', self._process_all,
+            'Symmetrise with the applied option (or with the settings of the\n'
+            'Advanced page) and save. The same step as Process all on the\n'
+            'Process page.')
+        self.add_page('Averaging', 'Averaging',
+                      'Compare the averaging options on the volume, then apply one.',
+                      self.avg_panel, 'averaging-page', log=False)
 
-        # ── Processing settings + one button ──
-        g2 = QGroupBox('2. Process')
-        f2 = QFormLayout()
+        self._build_advanced_page()
+        self.add_help_page('unwarp')
 
+        self.laue_combo.currentIndexChanged.connect(self._on_laue_changed)
+        for w in (self.bin_xy_spin, self.bin_z_spin):
+            w.valueChanged.connect(self._invalidate_prepared)
+            w.valueChanged.connect(self._update_size_label)
+        self.morph_combo.currentIndexChanged.connect(self._invalidate_prepared)
+        self.force_reload_chk.toggled.connect(self._invalidate_prepared)
+        self.avg_settings.changed.connect(self._update_avg_label)
+        for w in (self.dc_lmin, self.dc_lmax, self.dc_step):
+            w.valueChanged.connect(self._update_dc_note)
+        ui.guard_wheel(self)
+        self._update_avg_label()
+        self._update_files_label()
+        self._update_size_label()
+        self._update_dc_note()
+        self._update_run_note()
+        self.show_page('Process')
+
+    def _build_process_page(self):
+        # ── 1. Folder selection ──
+        s1 = ui.Section('Unwarp folder', step=1, help_topic='unwarp')
+        self.folder_label = ui.label('No folder selected', 'strong', wrap=True, selectable=True)
+        self.browse_btn = ui.button(
+            'Browse...', clicked=self._browse_folder,
+            tip='Select the folder containing CrysAlisPro unwarp .img files.\n'
+                'These are HK reciprocal space reconstructions at different l values.')
+        ui.set_role(self.browse_btn, 'primary')      # the first action in a new window
+        top = QHBoxLayout()
+        top.addWidget(self.folder_label, 1)
+        top.addWidget(self.browse_btn, 0, Qt.AlignmentFlag.AlignTop)
+        s1.add(top)
+        self.dataset_hint = s1.add_hint(
+            'Select the folder that CrysAlisPro wrote with "dc unwarp" (numbered .img files). '
+            'If you have no layers, make the layer list on the Layer list page first.')
+        self.dataset_note = s1.add(ui.Banner('error'))
+        self.info_grid = ui.FactGrid(['Layers', 'Layer size', 'Fixed index', 'Wavelength',
+                                      'Unit cell'])
+        self.info_grid.setVisible(False)
+        s1.add(self.info_grid)
+
+        # ── 2. Laue group and binning ──
+        s2 = ui.Section('Symmetry and binning', step=2, help_topic='symmetry')
         self.laue_combo = QComboBox()
-        for key, label in LAUE_GROUP_NAMES.items():
-            self.laue_combo.addItem(label, key)
+        for key, name in LAUE_GROUP_NAMES.items():
+            self.laue_combo.addItem(name, key)
         self.laue_combo.setCurrentIndex(list(LAUE_GROUP_NAMES.keys()).index('m-3m'))
         self.laue_combo.setToolTip(
             'Laue group for symmetrization and outlier rejection.\n'
@@ -170,114 +200,79 @@ class SimpleVolumeGUI(QMainWindow):
             'The window checks only that the cell metric allows the group:\n'
             'the metric cannot tell a cubic cell from a cell with a small\n'
             'distortion.')
-        f2.addRow('Laue group:', self.laue_combo)
-        self.laue_note = QLabel('')
-        self.laue_note.setWordWrap(True)
-        self.laue_note.setVisible(False)
-        f2.addRow(self.laue_note)
-
-        bin_row = QHBoxLayout()
-        bin_row.addWidget(QLabel('H,K:'))
+        form = ui.form()
+        form.addRow('Laue group', self.laue_combo)
+        ui.form_hint(form, 'The average uses this symmetry. Select the group of the phase. An '
+                           'experiment that breaks the symmetry needs a lower group.')
+        self.laue_note = ui.Banner('warn')
+        form.addRow(self.laue_note)
         self.bin_xy_spin = QSpinBox()
         self.bin_xy_spin.setRange(1, 16); self.bin_xy_spin.setValue(2)
         self.bin_xy_spin.setToolTip(
             'Bin factor for H and K axes.\n'
             'Averages NxN pixels to reduce volume size and noise.\n'
             '1 = no binning, 2 = 2x2 (4x smaller), 4 = 4x4 (16x smaller)')
-        bin_row.addWidget(self.bin_xy_spin)
-        bin_row.addWidget(QLabel('L:'))
         self.bin_z_spin = QSpinBox()
         self.bin_z_spin.setRange(1, 16); self.bin_z_spin.setValue(1)
         self.bin_z_spin.setToolTip(
             'Bin factor for L axis (stacking direction).\n'
             '1 = keep all L slices, 2 = average pairs, etc.')
-        bin_row.addWidget(self.bin_z_spin)
-        bin_row.addStretch(1)
-        f2.addRow('Binning:', bin_row)
+        form.addRow('Bin factor h, k', self.bin_xy_spin)
+        form.addRow('Bin factor l', self.bin_z_spin)
+        self.size_label = ui.form_hint(form, '')
+        s2.add(form)
+        self._setup_group = s2
 
-        self.avg_label = QLabel('')
-        self.avg_label.setWordWrap(True)
-        f2.addRow('Averaging:', self.avg_label)
+        # ── 3. Averaging (the settings are on the Advanced page) ──
+        s3 = ui.Section('Averaging and outlier rejection', step=3, help_topic='averaging')
+        self.avg_label = ui.label('', 'strong', wrap=True)
+        s3.add(self.avg_label)
+        self.avg_hint = s3.add_hint('')
+        s3.add(ui.row(
+            ui.button('Change the option', 'link', clicked=lambda: self.show_page('Advanced'),
+                      tip='The averaging settings are on the Advanced page.'),
+            ui.button('Compare the options on this volume', 'link',
+                      clicked=lambda: self.show_page('Averaging'),
+                      tip='The Averaging page scores the options on your volume.'),
+            spacing=ui.SPACE[3]))
 
-        self.process_btn = QPushButton('Process All')
+        # ── 4. Output ──
+        s4 = ui.Section('Output', step=4, help_topic='files')
+        s4.add_hint('The files go into the unwarp folder. The raw volume is also a cache: the '
+                    'next run reads it and does not read the .img files again.')
+        self.files_label = ui.label('', 'mono', wrap=True, selectable=True)
+        s4.add(self.files_label)
+
+        # The main action, below the page (always visible)
+        self.run_bar, bar = ui.footer_bar()
+        self.run_note = ui.hint('')
+        bar.addWidget(self.run_note, 1)
+        self.view_btn = ui.button('Open in viewer', clicked=self._open_in_viewer,
+                                  tip='Open the last saved symmetrised volume in the viewer.')
+        self.view_btn.setEnabled(False)
+        bar.addWidget(self.view_btn)
+        self.process_btn = ui.button(
+            'Process all', 'primary', clicked=self._process_all,
+            tip='Run the full pipeline:\n'
+                '1. Load all .img files into 3D volume (with per-frame coverage mask)\n'
+                '2. Save raw volume as .h5\n'
+                '3. Bin the volume\n'
+                '4. Single-pass symmetrize + outlier rejection\n'
+                '5. Save processed volume as .h5  (Ctrl+Return)')
         self.process_btn.setEnabled(False)
-        self.process_btn.setMinimumHeight(40)
-        self.process_btn.setStyleSheet('font-weight: bold; font-size: 13px;')
-        self.process_btn.clicked.connect(self._process_all)
-        self.process_btn.setToolTip(
-            'Run the full pipeline:\n'
-            '1. Load all .img files into 3D volume (with per-frame coverage mask)\n'
-            '2. Save raw volume as .h5\n'
-            '3. Bin the volume\n'
-            '4. Single-pass symmetrize + outlier rejection (orbit MAD clip)\n'
-            '5. Save processed volume as .h5')
-        f2.addRow(self.process_btn)
+        self.process_btn.setShortcut('Ctrl+Return')
+        bar.addWidget(self.process_btn)
 
-        g2.setLayout(f2)
-        layout.addWidget(g2)
-        layout.addStretch(1)
+        self.process_tab = ui.two_columns([s1, s2], [s3, s4], ratio=(6, 5))
+        self.add_page('Process', 'Process',
+                      'From the unwarp layers to a symmetry-averaged volume in one step.',
+                      self.process_tab, 'unwarp', footer=self.run_bar)
 
-        # ── Averaging panel ──
-        self.avg_panel = AveragingPanel(self._averaging_request, log=self._log,
-                                        progress=self._update_progress)
-        self.avg_panel.busy_changed.connect(self._on_panel_busy)
-        self.avg_panel.applied_changed.connect(self._on_applied_changed)
-        self.avg_panel.set_save_action(
-            'Process All', self._process_all,
-            'Symmetrise with the applied option (or with the settings of the\n'
-            'Advanced tab) and save. The same step as Process All in the\n'
-            'Process tab.')
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.avg_panel)
-        self.tabs.addTab(scroll, 'Averaging')
-
-        self._build_advanced_tab()
-        self._build_dcunwarp_tab()
-
-        self.laue_combo.currentIndexChanged.connect(self._on_laue_changed)
-        for w in (self.bin_xy_spin, self.bin_z_spin):
-            w.valueChanged.connect(self._invalidate_prepared)
-        self.morph_combo.currentIndexChanged.connect(self._invalidate_prepared)
-        self.force_reload_chk.toggled.connect(self._invalidate_prepared)
-        self.avg_settings.changed.connect(self._update_avg_label)
-
-        # ── Progress + log ──
-        bottom = QWidget()
-        bl = QVBoxLayout(bottom)
-        bl.setContentsMargins(0, 0, 0, 0)
-        self.progress = QProgressBar()
-        self.progress.setTextVisible(True)
-        bl.addWidget(self.progress)
-
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
-        bl.addWidget(self.log)
-        self.split.addWidget(bottom)
-        self.split.setStretchFactor(0, 1)
-        self.split.setStretchFactor(1, 0)
-        # About 230 px for the progress bar and the log at the default window size
-        self.split.setSizes([LOG_HEIGHT * 3, LOG_HEIGHT])
-        self._update_avg_label()
-
-    def _build_advanced_tab(self):
-        self.adv_tab = QWidget()
-        layout = QVBoxLayout(self.adv_tab)
-        adv_scroll = QScrollArea()
-        adv_scroll.setWidgetResizable(True)
-        adv_scroll.setWidget(self.adv_tab)
-        self.tabs.addTab(adv_scroll, 'Advanced')
-        intro = QLabel('The defaults are the standard settings. Change them only if you need to.')
-        intro.setStyleSheet('color: #555;')
-        layout.addWidget(intro)
-
+    def _build_advanced_page(self):
         self.avg_settings = AveragingSettings(EQUAL_MAD, STANDARD_WHY)
-        layout.addWidget(self.avg_settings)
 
-        g = QGroupBox('Unwarp layers')
-        f = QFormLayout(g)
-        f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        g = ui.Section('Unwarp layers', help_topic='advanced')
+        f = ui.form()
         # Coverage-mask kernel (auto by default; allow odd integer override)
         self.morph_combo = QComboBox()
         self.morph_combo.addItem('auto', 'auto')
@@ -293,11 +288,14 @@ class SimpleVolumeGUI(QMainWindow):
             'Override with a fixed odd integer if needed (3 = original\n'
             'behaviour; larger = fewer false positives, may shave thin\n'
             'detector gaps).')
-        f.addRow('Mask kernel:', self.morph_combo)
+        f.addRow('Mask kernel (pixels)', self.morph_combo)
+        ui.form_hint(f, 'The size that separates real low counts from regions without a '
+                        'measurement (gaps, beam stop, edges). Keep "auto" unless the mask is '
+                        'wrong.')
 
         # Force-reload toggle (default: reuse _raw.h5 if it exists and
         # matches the requested morph_size).
-        self.force_reload_chk = QCheckBox('Force re-read .img files')
+        self.force_reload_chk = QCheckBox('Read the .img files again')
         self.force_reload_chk.setChecked(False)
         self.force_reload_chk.setToolTip(
             'When unchecked (default): if a {prefix}_raw.h5 already exists\n'
@@ -305,73 +303,76 @@ class SimpleVolumeGUI(QMainWindow):
             'load from there and skip the .img read + raw save steps.\n\n'
             'Check this to always re-read the .img files and overwrite\n'
             'the cached raw file (e.g. if frames changed on disk).')
-        f.addRow('', self.force_reload_chk)
-        layout.addWidget(g)
+        f.addRow(self.force_reload_chk)
+        ui.form_hint(f, 'Without a tick, the window uses the raw volume of an earlier run if it '
+                        'agrees with the folder.')
+        g.add(f)
 
-        self.reset_btn = QPushButton('Reset to the standard settings')
-        self.reset_btn.setToolTip('Set all settings of this tab to the standard values.')
-        self.reset_btn.clicked.connect(self._reset_advanced)
-        row = QHBoxLayout()
-        row.addWidget(self.reset_btn)
-        row.addStretch(1)
-        layout.addLayout(row)
-        layout.addStretch(1)
+        self.adv_bar, bar = ui.footer_bar()
+        bar.addWidget(ui.hint('The defaults are the standard settings. Change them only if you '
+                              'need to.'), 1)
+        self.reset_btn = ui.button('Reset to the standard settings', clicked=self._reset_advanced,
+                                   tip='Set all settings of this page to the standard values.')
+        bar.addWidget(self.reset_btn)
+        self.adv_tab = ui.two_columns([self.avg_settings], [g])
+        self.add_page('Advanced', 'Advanced', 'Settings that a standard run does not need.',
+                      self.adv_tab, 'advanced', footer=self.adv_bar)
 
-    def _build_dcunwarp_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        self.tabs.addTab(tab, 'dcunwarp file')
-        g_dc = QGroupBox('Generate dcunwarp file (for CrysAlisPro)')
-        g_dc.setToolTip(
-            'Generate a .dcunwarp layer list file for CrysAlisPro.\n'
-            'Use this BEFORE processing to create HK reconstructions\n'
-            'at each l value via the "dc unwarp" command in CrysAlisPro.')
-        v = QVBoxLayout(g_dc)
-        help_label = QLabel(
-            'Step 1 of route B. Make the layer list, then run "dc unwarp" in CrysAlisPro '
-            'with it. CrysAlisPro writes the .img layers into an unwarp folder. Select '
-            'that folder in the Process tab.')
-        help_label.setWordWrap(True)
-        help_label.setStyleSheet('color: #555;')
-        v.addWidget(help_label)
-        dc_layout = QHBoxLayout()
-
-        dc_layout.addWidget(QLabel('l min:'))
+    def _build_dcunwarp_page(self):
+        g_dc = ui.Section('Layer list for CrysAlisPro', help_topic='unwarp')
+        g_dc.add_hint(
+            'Use this page first if you have no unwarp layers.\n'
+            '1. Make the layer list here.\n'
+            '2. In CrysAlisPro, run "dc unwarp" and load the list. CrysAlisPro writes the .img '
+            'layers into an unwarp folder.\n'
+            '3. Select that folder on the Process page.')
+        f = ui.form()
         self.dc_lmin = QDoubleSpinBox()
         self.dc_lmin.setRange(-50, 50); self.dc_lmin.setValue(-6.0)
         self.dc_lmin.setDecimals(2); self.dc_lmin.setSingleStep(1.0)
         self.dc_lmin.setToolTip('Starting l value (most negative)')
-        dc_layout.addWidget(self.dc_lmin)
+        f.addRow('First l', self.dc_lmin)
 
-        dc_layout.addWidget(QLabel('l max:'))
         self.dc_lmax = QDoubleSpinBox()
         self.dc_lmax.setRange(-50, 50); self.dc_lmax.setValue(6.0)
         self.dc_lmax.setDecimals(2); self.dc_lmax.setSingleStep(1.0)
         self.dc_lmax.setToolTip('Ending l value (most positive)')
-        dc_layout.addWidget(self.dc_lmax)
+        f.addRow('Last l', self.dc_lmax)
 
-        dc_layout.addWidget(QLabel('step:'))
         self.dc_step = QDoubleSpinBox()
         self.dc_step.setRange(0.001, 1.0); self.dc_step.setValue(0.02)
         self.dc_step.setDecimals(3); self.dc_step.setSingleStep(0.01)
+        self.dc_step.setSuffix(' r.l.u.')
         self.dc_step.setToolTip('Step size in l (r.l.u.). Typical: 0.02-0.05')
-        dc_layout.addWidget(self.dc_step)
+        f.addRow('Step in l', self.dc_step)
 
-        dc_layout.addWidget(QLabel('res:'))
         self.dc_res = QDoubleSpinBox()
         self.dc_res.setRange(0.1, 5.0); self.dc_res.setValue(0.8)
         self.dc_res.setDecimals(1); self.dc_res.setSingleStep(0.1)
-        self.dc_res.setToolTip('Resolution limit d_min in Angstroms.\nSmaller = more data but larger files.')
-        dc_layout.addWidget(self.dc_res)
+        self.dc_res.setSuffix(' Å')
+        self.dc_res.setToolTip('Resolution limit d_min in Angstroms.\n'
+                               'Smaller = more data but larger files.')
+        f.addRow('Resolution limit', self.dc_res)
+        for w in (self.dc_lmin, self.dc_lmax, self.dc_step, self.dc_res):
+            w.setMinimumWidth(130)
+        ui.form_hint(f, 'A smaller resolution limit gives more data and larger layers.')
+        g_dc.add(f)
+        self.dc_note = ui.label('', wrap=True)
+        g_dc.add(self.dc_note)
+        self.dc_done = g_dc.add(ui.Banner('ok'))
 
-        self.dc_btn = QPushButton('Generate')
-        self.dc_btn.clicked.connect(self._generate_dcunwarp)
-        self.dc_btn.setToolTip('Create .dcunwarp file in the selected folder')
-        dc_layout.addWidget(self.dc_btn)
-        dc_layout.addStretch(1)
-        v.addLayout(dc_layout)
-        layout.addWidget(g_dc)
-        layout.addStretch(1)
+        self.dc_bar, bar = ui.footer_bar()
+        self.dc_target = ui.hint('')
+        bar.addWidget(self.dc_target, 1)
+        self.dc_btn = ui.button('Generate the layer list', 'primary',
+                                clicked=self._generate_dcunwarp,
+                                tip='Create the .dcunwarp file. It goes into the selected '
+                                    'unwarp folder,\nor into a folder that you select.')
+        bar.addWidget(self.dc_btn)
+        page = ui.two_columns([g_dc], [], ratio=(6, 5))
+        self.add_page('Layer list', 'Layer list',
+                      'The list of layers that CrysAlisPro needs for "dc unwarp".',
+                      page, 'unwarp', footer=self.dc_bar)
 
     def _reset_advanced(self) -> None:
         self.avg_settings.reset()
@@ -392,9 +393,13 @@ class SimpleVolumeGUI(QMainWindow):
         self._folder_path = folder
         self._dataset_valid = False
         self._recip = None
+        self._prefix = None
+        self._dims = None
         self._invalidate_prepared()
-        self.folder_label.setText(folder)
+        self.folder_label.setText(folder.replace('\\', '/'))    # a path with "/" can wrap
+        self.folder_label.setToolTip(folder)
         self._log(f'Folder: {folder}')
+        self._update_dc_note()
 
         img_files = _filter_numbered_imgs(folder)
         n = len(img_files)
@@ -433,7 +438,20 @@ class SimpleVolumeGUI(QMainWindow):
                  f'alpha={cell["alpha"]:.3f}  beta={cell["beta"]:.3f}  '
                  f'gamma={cell["gamma"]:.3f} deg')
 
-        self.info_label.setText(info)
+        self.info_grid.set_values({
+            'Layers': f'{n} files ({img_prefix}_*.img)',
+            'Layer size': f'{nx} x {ny} px, plane {hdr["plane_type"]}',
+            'Fixed index': f'{l_min:.3f} to {l_max:.3f}, step {l_step:.4f}',
+            'Wavelength': f'{hdr["wavelength"]:.5f} Å',
+            'Unit cell': (f'a = {cell["a"]:.5f}, b = {cell["b"]:.5f}, c = {cell["c"]:.5f} Å\n'
+                          f'alpha = {cell["alpha"]:.3f}, beta = {cell["beta"]:.3f}, '
+                          f'gamma = {cell["gamma"]:.3f} deg'
+                          + (f'\n(from {os.path.basename(par_path)})' if par_path else
+                             '\n(from the UB matrix of the .img header)'))})
+        self.info_grid.setVisible(True)
+        self.dataset_hint.setVisible(False)
+        self.dataset_note.clear()
+        ui.set_role(self.browse_btn, None)
         self._log(info)
 
         # Estimate sizes
@@ -444,6 +462,8 @@ class SimpleVolumeGUI(QMainWindow):
         self._log(f'Binned 2x2: {nx2} x {ny2} x {n} = {bin_mb:.0f} MB')
 
         self._dataset_valid = True
+        self._prefix = img_prefix
+        self._dims = (nx, ny, n)
         self.process_btn.setEnabled(True)
         try:
             self._recip = (np.asarray(hdr['ub'], np.float64).reshape(3, 3)
@@ -451,15 +471,75 @@ class SimpleVolumeGUI(QMainWindow):
         except Exception:
             self._recip = None
         self._check_laue(switch=True)
+        self._update_files_label()
+        self._update_size_label()
+        self._update_run_note()
+        self.set_status('Unwarp folder read. Check the settings, then click Process all.')
 
     def _fail_folder(self, msg):
         self._dataset_valid = False
-        self.info_label.setText(msg)
+        self.dataset_note.show_message(msg, 'error')
+        self.info_grid.setVisible(False)
+        self.dataset_hint.setVisible(False)
         self._log('  ERROR: ' + msg)
         self.process_btn.setEnabled(False)
         self._check_laue()
+        self._update_files_label()
+        self._update_size_label()
+        self._update_run_note()
+
+    def _update_files_label(self, *_: Any) -> None:
+        if not self._prefix:
+            self.files_label.setText('<sample>_raw.h5\n<sample>_sym_<laue>.h5')
+            return
+        suffix = self.laue_combo.currentData().replace('/', '').replace('-', 'bar')
+        self.files_label.setText(f'{self._prefix}_raw.h5\n{self._prefix}_sym_{suffix}.h5')
+
+    def _update_size_label(self, *_: Any) -> None:
+        """The size of the volume after the binning (4 bytes for each voxel)."""
+        bxy, bz = self.bin_xy_spin.value(), self.bin_z_spin.value()
+        text = ('A factor of 2 for h and k averages 2 x 2 pixels of each layer. This gives 4 x '
+                'fewer voxels and less noise.')
+        if self._dims is not None:
+            nx, ny, n = self._dims
+            mx, my, mz = max(nx // bxy, 1), max(ny // bxy, 1), max(n // bz, 1)
+            text = (f'Volume after the binning: about {mx} x {my} x {mz} voxels, '
+                    f'{mx * my * mz * 4 / 1e9:.1f} GB in memory.')
+        self.size_label.setText(text)
+
+    def _update_run_note(self, *_: Any) -> None:
+        """The line next to the main action: why it is off, or what a click does."""
+        if not self._dataset_valid:
+            text = 'Select an unwarp folder to start.'
+        else:
+            text = 'One click loads the layers, bins, symmetrises and saves.'
+        ui.set_role(self.run_note, 'hint')
+        self.run_note.setText(text)
 
     # ── Generate dcunwarp ──
+
+    def _dc_layers(self) -> tuple[int, int]:
+        """Number of layers and of .dcunwarp files for the values of the Layer list page."""
+        l_min, l_max, l_step = self.dc_lmin.value(), self.dc_lmax.value(), self.dc_step.value()
+        n_layers = len(np.arange(l_min, l_max + l_step * 0.5, l_step))
+        return n_layers, int(np.ceil(n_layers / LAYER_LIMIT))
+
+    def _update_dc_note(self, *_: Any) -> None:
+        n_layers, n_files = self._dc_layers()
+        if n_layers <= 0:
+            text = 'The last l must be larger than the first l.'
+        else:
+            text = f'{n_layers} layers in {n_files} file' + ('s' if n_files > 1 else '') + '.'
+            if n_files > 1:
+                text += (f' CrysAlisPro accepts {LAYER_LIMIT} layers in one file, so you run '
+                         f'"dc unwarp" {n_files} times.')
+        ui.set_role(self.dc_note, 'error' if n_layers <= 0 else None)
+        self.dc_note.setText(text)
+        self.dc_btn.setEnabled(n_layers > 0 and not self._busy)
+        self.dc_target.setText(
+            f'The file goes into the selected unwarp folder: {self._folder_path}'
+            if self._folder_path else
+            'The window asks for the folder of the file when you click the button.')
 
     def _generate_dcunwarp(self):
         if self._folder_path:
@@ -474,8 +554,7 @@ class SimpleVolumeGUI(QMainWindow):
         l_max = self.dc_lmax.value()
         l_step = self.dc_step.value()
         res = self.dc_res.value()
-        n_layers = len(np.arange(l_min, l_max + l_step * 0.5, l_step))
-        n_files = int(np.ceil(n_layers / 500))
+        n_layers, n_files = self._dc_layers()
 
         self._log(f'Generating dcunwarp: l=[{l_min}, {l_max}], step={l_step}, '
                   f'res={res}, {n_layers} layers')
@@ -489,6 +568,11 @@ class SimpleVolumeGUI(QMainWindow):
 
         for fn in filenames:
             self._log(f'  Created: {os.path.join(out_dir, fn)}')
+        self.dc_done.show_message(
+            f'Created {", ".join(filenames)} in {out_dir}. Now run "dc unwarp" in CrysAlisPro '
+            'and load the file.', 'ok')
+        self.set_status(f'Created {len(filenames)} layer list file'
+                        + ('s' if len(filenames) > 1 else ''))
 
         if n_files > 1:
             msg = (f'{n_files} files were created because CrysAlisPro can only '
@@ -498,13 +582,13 @@ class SimpleVolumeGUI(QMainWindow):
             self._log(f'  WARNING: {n_files} files — CrysAlisPro 500-layer limit')
             QMessageBox.warning(self, 'Multiple dcunwarp files', msg)
 
-    # ── Process All ──
+    # ── Process all ──
 
     def _process_all(self):
         if not self._dataset_valid or not self._folder_path:
-            msg = 'Select an unwarp folder with .img files first (Process tab).'
+            msg = 'Select an unwarp folder with .img files first (Process page).'
             self._log(msg)
-            self.statusBar().showMessage(msg)  # type: ignore[union-attr]
+            self.set_status(msg)
             return
         laue = self.laue_combo.currentData()
         morph = self.morph_combo.currentData()
@@ -521,7 +605,8 @@ class SimpleVolumeGUI(QMainWindow):
             sym_kw = self.avg_panel.symmetrize_kwargs(prepared['vol'], laue)
             choice = self.avg_panel.choice_metadata() if sym_kw else None
         if sym_kw:
-            rule = f"averaging option '{choice['name'] if choice else '?'}' from the Averaging tab"
+            rule = (f"averaging option '{choice['name'] if choice else '?'}' from the "
+                    'Averaging page')
         else:
             sym_kw = self.avg_settings.kwargs()
             rule = f'averaging {self.avg_settings.describe()}'
@@ -563,7 +648,7 @@ class SimpleVolumeGUI(QMainWindow):
     def _averaging_request(self) -> tuple[str, Callable[..., Any]]:
         """Laue group and volume function for the Averaging panel (GUI thread)."""
         if not self._dataset_valid or not self._folder_path:
-            raise ValueError('Select an unwarp folder with .img files first.')
+            raise ValueError('Select an unwarp folder with .img files first (Process page).')
         laue = self.laue_combo.currentData()
         key = self._volume_key()
         prepared = self._current_prepared()
@@ -576,46 +661,50 @@ class SimpleVolumeGUI(QMainWindow):
             vol, raw_path, base = self._load_binned(folder, morph, bin_xy, bin_z,
                                                     force_reload, log, progress)
             self._prepared = {'key': key, 'vol': vol, 'raw_path': raw_path, 'base': base}
-            log('The panel loaded and binned the volume. Process All uses this volume.')
+            log('The panel loaded and binned the volume. Process all uses this volume.')
             return vol
         return laue, volume_fn
 
     def _on_applied_changed(self) -> None:
-        """An applied averaging option replaces the settings of the Advanced tab."""
+        """An applied averaging option replaces the settings of the Advanced page."""
         self.avg_settings.set_override(self.avg_panel.applied_name())
         self._update_avg_label()
 
     def _update_avg_label(self, *_: Any) -> None:
         name = self.avg_panel.applied_name()
         if name is not None:
-            text = (f"'{name}', applied in the Averaging tab. Click Clear in that tab to use "
-                    'the settings of the Advanced tab again.')
-            self.avg_label.setStyleSheet('color: #070; font-weight: bold;')
+            text = f"'{name}', applied on the Averaging page"
+            note = ('Click Clear on the Averaging page to use the settings of the Advanced page '
+                    'again.')
+            role = 'ok'
         elif self.avg_settings.is_standard():
-            text = (f'{self.avg_settings.describe()}: equal weights and MAD outlier rejection '
-                    'at 3 sigma. Change it in the Advanced tab, or compare the options on your '
-                    'volume in the Averaging tab.')
-            self.avg_label.setStyleSheet('')
+            text = self.avg_settings.describe()
+            note = STANDARD_EFFECT
+            role = 'strong'
         else:
-            text = f'{self.avg_settings.describe()}, set in the Advanced tab.'
-            self.avg_label.setStyleSheet('color: #a05000; font-weight: bold;')
+            text = f'{self.avg_settings.describe()}, set on the Advanced page'
+            note = 'This is not the standard option for unwarp layers.'
+            role = 'warn'
+        ui.set_role(self.avg_label, role)
         self.avg_label.setText(text)
+        self.avg_hint.setText(note)
 
     def _on_laue_changed(self, *_: Any) -> None:
         self.avg_panel.reset('The Laue group changed. Click Measure again.')
         self._check_laue()
+        self._update_files_label()
 
     def _check_laue(self, switch: bool = False) -> None:
         """Show a note if the cell metric does not allow the Laue group.
 
         With `switch`, select the allowed group of highest order instead."""
         if self._recip is None:
-            self.laue_note.setVisible(False)
+            self.laue_note.clear()
             return
         laue = self.laue_combo.currentData()
         residual, fit = fitting_laue_group(self._recip, laue)
         if fit == laue:
-            self.laue_note.setVisible(False)
+            self.laue_note.clear()
             return
         if switch:
             self.laue_combo.setCurrentIndex(self.laue_combo.findData(fit))
@@ -623,23 +712,24 @@ class SimpleVolumeGUI(QMainWindow):
                     f'window selected {fit}: the group of highest order that the cell allows. '
                     'Check the Laue group.')
             self._log('Laue group: ' + text)
-            style = 'color: #a05000; font-weight: bold;'
+            kind = 'warn'
         else:
             text = (f'The cell metric does not allow {laue} (residual {residual:.2g}, limit '
                     f'{METRIC_TOLERANCE:g}). The group of highest order that the cell allows '
                     f'is {fit}.')
-            style = 'color: #a00; font-weight: bold;'
-        self.laue_note.setText(text)
-        self.laue_note.setStyleSheet(style)
-        self.laue_note.setVisible(True)
+            kind = 'error'
+        self.laue_note.show_message(text, kind)
 
     def _on_panel_busy(self, busy: bool) -> None:
-        self.process_tab.setEnabled(not busy)
-        self.adv_tab.setEnabled(not busy)
-        if busy:
-            self.statusBar().showMessage('Averaging panel is running...')  # type: ignore[union-attr]
+        for w in (self.process_tab, self.adv_tab, self.run_bar, self.adv_bar):
+            w.setEnabled(not busy)
+        self.set_status('The Averaging panel is running...' if busy else 'Ready')
+        if busy:                                    # say why the settings are off
+            ui.set_role(self.run_note, 'hint')
+            self.run_note.setText('The Averaging page is running. The settings are off until '
+                                  'it stops.')
         else:
-            self.statusBar().showMessage('Ready')  # type: ignore[union-attr]
+            self._update_run_note()
 
     def _do_process_all(
         self,
@@ -706,7 +796,7 @@ class SimpleVolumeGUI(QMainWindow):
         log: Callable[[str], None],
         cb: Callable[[int, int], None],
     ) -> tuple[Any, str, str]:
-        """Steps 1 to 3 of Process All: load (or the raw cache), save raw, bin.
+        """Steps 1 to 3 of Process all: load (or the raw cache), save raw, bin.
 
         Returns (binned volume, raw cache path, file prefix).
         """
@@ -770,8 +860,8 @@ class SimpleVolumeGUI(QMainWindow):
             log(f'  Cached mask: morph={ms}px ({mode})'
                 + (f', unmeasured/frame mean={nu_mean:,.0f} '
                    f'({nu_pct:.2f}%)' if nu_mean is not None else ''))
-            log(f'  (skipped .img read + raw save; check '
-                f'"Force re-read" to regenerate)')
+            log(f'  (skipped .img read + raw save; tick '
+                f'"Read the .img files again" to regenerate)')
         else:
             # ── Step 1: Load raw ──
             log(f'Step 1/4: Loading all .img files...')
@@ -827,33 +917,61 @@ class SimpleVolumeGUI(QMainWindow):
         self._log(f'\nDone!')
         self._log(f'  Raw: {result["raw_path"]}')
         self._log(f'  Sym: {result["sym_path"]}')
+        self._last_saved = result['sym_path']
         self._set_busy(False)
+        name = os.path.basename(result['sym_path'])
+        self.set_status(f'Saved {name}')
+        ui.set_role(self.run_note, 'ok')
+        self.run_note.setText(f'Saved {name}. Click Open in viewer to look at it.')
+
+    # ── open in viewer ──
+
+    def _open_in_viewer(self):
+        if self._last_saved is None or not os.path.exists(self._last_saved):
+            return
+        try:
+            from .rsp_viewer import UnifiedViewer
+            self._viewer = UnifiedViewer()
+            self._viewers.append(self._viewer)       # an earlier viewer window stays open
+            self._viewer._load_file(self._last_saved)
+            self._viewer.show()
+            self._log(f'  opened {os.path.basename(self._last_saved)} in the viewer')
+        except Exception as e:
+            QMessageBox.warning(self, 'Viewer', f'Could not open the viewer:\n{e}')
 
     # ── Helpers ──
 
-    def _update_progress(self, current, total):
-        if total > 0:
-            self.progress.setMaximum(total)
-            self.progress.setValue(current)
-        else:
-            self.progress.setMaximum(0)
+    def _log(self, msg):
+        """Write to the log. A step line also goes to the status line (visible with the log closed)."""
+        super()._log(msg)
+        if isinstance(msg, str) and msg.startswith('Step '):
+            self.set_status(msg.strip())
 
     def _set_busy(self, busy, message=''):
+        self._busy = busy
         self.browse_btn.setEnabled(not busy)
+        self._setup_group.setEnabled(not busy)
         self.process_btn.setEnabled(not busy and self._dataset_valid)
+        self.view_btn.setEnabled(not busy and self._last_saved is not None)
         self.dc_btn.setEnabled(not busy)
         self.adv_tab.setEnabled(not busy)
+        self.adv_bar.setEnabled(not busy)
         self.avg_panel.set_host_busy(busy)
-        self.statusBar().showMessage(message if message else ('Ready' if not busy else ''))
+        if not busy:
+            self._update_dc_note()          # the button is off for an empty range of l
+        self.set_status(message if message else ('Ready' if not busy else ''))
+        if busy:
+            ui.set_role(self.run_note, 'hint')
+            self.run_note.setText(message + ' The log shows the steps.')
+        else:
+            self._update_run_note()
 
     def _on_error(self, msg):
         self._log(f'ERROR: {msg}')
         self._set_busy(False)
-        QMessageBox.critical(self, 'Error', str(msg)[:500])
-
-    def _log(self, msg):
-        self.log.append(msg)
-        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+        ui.set_role(self.run_note, 'error')
+        self.run_note.setText('The run stopped. The log has the error text.')
+        ui.show_error(self, 'The run stopped', msg)
 
 
 def main() -> None:

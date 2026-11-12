@@ -43,12 +43,12 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import numpy as np
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QSize, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSpinBox,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QSpinBox, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 import matplotlib
@@ -59,15 +59,12 @@ from matplotlib.figure import Figure
 
 from . import averaging as av
 from . import orbit_engine as oe
-from .averaging import FRAME_MAP_DEFINITION
+from . import ui
 
 # Orbit members (voxels x operations) of the automatic crop. With the NumPy
 # engine, the slowest candidate ('noise weights, noise limit (4 sigma)') then takes less than
 # about one minute (measured: 5.3 s for 60 million members, m-3m).
 CROP_BUDGET = 500_000_000
-
-# Height (px) of the progress bar and the log below the tabs of the host GUIs
-LOG_HEIGHT = 230
 
 EXTRA_TIP ='Sum ratio at the extra positions. The last Compare had no extra positions.'
 OLD_ROWS = QColor('#999999')
@@ -87,30 +84,44 @@ NO_RING_HINT = ('The ring detector needs frames without the rings before or afte
                 'event in the selected frames. If all selected frames have the rings, it finds '
                 'no ring. The ring mask depends on the selected frames. Check the number of '
                 'ring frames after a change of the frame count.')
-FRAME_HELP = (
-    'Volume: the volume that Measure, Compare and the symmetrise step of this window use. '
-    'Ring mask: one pass finds powder rings in the frames. One more pass makes a volume '
-    'without the ring pixels. Frame model: the ring mask, then 3 iterations of a model of '
-    'the extra counts and the scale of each frame and 5-degree sector (6 more passes). '
-    'Frame map: one pass compares each frame with the leave-one-out orbit median of the '
-    'selected volume. The first use also needs the ring statistics pass. The frames are not '
-    'corrected with the frame model in this pass. ' + FRAME_MAP_DEFINITION + ' The colour '
-    'scale is logarithmic. White is 1, red is more counts and blue is fewer counts than in '
-    f'the other frames. The scale stops at 1/{FRAME_MAP_RANGE:g} and {FRAME_MAP_RANGE:g}. '
-    'Larger deviations get the end colour. Grey cells have no prediction. On a long scan, '
-    'one image row shows a block of frames. The row shows the value of the block that is '
-    'farthest from 1. ' + NO_RING_HINT + ' Split-half check: one pass '
-    'makes the '
-    'odd-frame and the even-frame halves of the selected volume. Each candidate is then '
-    'applied to each half. '
-    'Split-half difference: ' + av.SPLIT_HALF_DEFINITION + ' Lower is better. It does not '
-    'see contamination that is the same in the two halves. A new reconstruction, a new '
-    'folder, grid or frame count removes the results of the frame tools. A new Laue group '
-    'removes the frame model volume and the frame map. Validated scope: Laue group mmm and '
-    '0.2 degree frames (I15 and I19-2 data). Other Laue groups and frame widths work, but '
-    'they are not validated.')
-FRAME_TOOLS_PLACE = ('The Frame tools group is below Measure, Compare and Results. '
-                     'Scroll down to see it.')
+# The long text about the frame tools is in the help pages (topic 'frame-tools').
+FRAME_INTRO = (
+    'Validated scope: Laue group mmm and 0.2 degree frames (I15 and I19-2 data). Other Laue '
+    'groups and frame widths work, but they are not validated.')
+FRAME_TOOL_NOTES = {
+    'Frame map': 'Compares each frame with the other frames of the selected volume. It shows '
+                 'which frames are different. One pass (the first use also needs the ring '
+                 'pass). It does not change the data.',
+    'Ring mask': 'Finds powder rings in the frames and makes a volume without the ring pixels. '
+                 'Two passes.',
+    'Frame model': 'The ring mask, then a model of the extra counts and the scale of each '
+                   'frame and 5-degree sector. 3 iterations, 6 more passes.',
+    'Split-half check': 'Makes the odd-frame and the even-frame halves of the selected volume '
+                        'and compares them for each candidate. Click Measure first.',
+}
+SHELL_TIPS = (
+    'Shell of |q| = 1/d. The ten shells have the same width.',
+    'Scatter of the symmetry-equivalent values against their variance. Near 1: the values\n'
+    'agree within the noise. Much larger than 1: a scatter that the noise does not explain.',
+    'Sum of |value - mean| divided by the sum of |value|, over the members that remain.',
+    'Orbit members that the rejection removed.',
+    'Voxels where the Poisson floor sets the scale / voxels tested.',
+    'Sampled orbits with max/min member pixel count above 10.\n'
+    "A volume without pixel counts shows '-'.",
+    'Node sum with the spread limit (3 sigma) / node sum without rejection.',
+)
+SHELL_LEGEND = ('chi2/nu near 1: the symmetry-equivalent values agree within the noise. R_sym: '
+                'relative scatter of the values, lower is better. rejected %: members that the '
+                'rejection removed. node ratio: share of the sum near the Bragg nodes that the '
+                'rejection keeps.')
+COMPARE_LEGEND = ('score: lower is better. node: the sum near the Bragg nodes divided by the '
+                  'same sum without rejection. extra and diffuse: sums divided by the sums of '
+                  f"'{av.BIAS_REFERENCE}'. lost: voxels that are empty with this option only. "
+                  'Click a row to see its slice.')
+RESULTS_EMPTY = ('No comparison yet.\n1. Click Measure.  2. Click Compare.\n'
+                 'The table and the slices of the options show here.')
+LEFT_WIDTH = 400        # column with the three steps of the Averaging page
+ROW_HEIGHT = 26         # table rows
 FRAME_MAP_EMPTY = 'Frame map: click Frame map or Frame model. The map shows here.'
 
 
@@ -145,6 +156,11 @@ def parse_positions(text: str) -> list[tuple[float, float, float]]:
     return out
 
 
+def two_lines(name: str) -> str:
+    """An option name on two lines for a table: the weights, then the rejection."""
+    return name.replace(', ', ',\n', 1)
+
+
 def _slice_mesh(geo: dict[str, Any], shape: tuple[int, ...]) -> tuple[Any, Any, Any, Any]:
     """Pixel corners of a slice for pcolormesh (see `averaging.slice_geometry`).
 
@@ -174,6 +190,29 @@ def _miller_lines(ax: Any, M: Any, m1: Any, m2: Any, colour: str, max_lines: int
         for n in n2:
             p = M @ np.array([[lo1, hi1], [n, n]])
             ax.plot(p[0], p[1], **style)
+
+
+class PageCanvas(FigureCanvasQTAgg):
+    """A matplotlib canvas for a page in a scroll area: its size hint is constant.
+
+    The size hint of a matplotlib canvas is its current size. The scroll area
+    takes the hints as the smallest height of the page, so the page grows
+    after each resize and shows a scroll bar that it does not need.
+    """
+
+    def sizeHint(self) -> QSize:
+        return QSize(480, 300)
+
+
+class SliceCanvas(PageCanvas):
+    """A canvas for two square slices side by side: its height follows its width."""
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        # steps of 20 px: a small change of the width (a scroll bar) does not change the height
+        height = max(240, min(560, 20 * round((0.48 * event.size().width() + 60) / 20)))
+        if self.maximumHeight() != height:
+            self.setFixedHeight(height)
 
 
 class PanelWorker(QThread):
@@ -449,20 +488,21 @@ class AveragingPanel(QWidget):
     # ── UI ──
 
     def _build_ui(self) -> None:
-        page = QVBoxLayout(self)
-        outer = QHBoxLayout()
-        page.addLayout(outer, stretch=1)
+        page = QHBoxLayout(self)
+        page.setContentsMargins(0, 0, 0, 0)
+        page.setSpacing(ui.SPACE[3])
         left = QVBoxLayout()
-        right = QVBoxLayout()
-        outer.addLayout(left, stretch=4)
-        outer.addLayout(right, stretch=5)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(ui.SPACE[3])
+        holder = QWidget()
+        holder.setLayout(left)
+        holder.setFixedWidth(LEFT_WIDTH)
+        page.addWidget(holder)
 
-        # Measure
-        g1 = QGroupBox('Measure')
-        v1 = QVBoxLayout(g1)
+        # 1. Measure
+        g1 = ui.Section('Measure the noise', step=1, help_topic='averaging-page')
         eng = engine_name()
-        self.engine_label = QLabel()
-        self.engine_label.setWordWrap(True)
+        self.engine_label = ui.hint()
         if eng == 'NumPy':
             self.engine_label.setText(
                 'Engine: NumPy only. Measure and Compare use a centred crop. Each candidate '
@@ -470,65 +510,43 @@ class AveragingPanel(QWidget):
                 'full volume.')
         else:
             self.engine_label.setText(f'Engine: {eng}. Measure and Compare use the full volume.')
-        v1.addWidget(self.engine_label)
-        crop_row = QHBoxLayout()
+        g1.add_hint('Fits a noise model. Compare uses it to judge the options.')
+        g1.add(self.engine_label)
         self.crop_chk = QCheckBox('Use a centred crop')
         self.crop_chk.setChecked(eng == 'NumPy')
         self.crop_chk.setToolTip('Measure and compare on a box at the centre of the volume.\n'
                                  'The box has its centre at hkl = 0. If hkl = 0 is near the\n'
                                  'end of an axis, the box moves inward. On an axis without\n'
                                  'hkl = 0, the box uses the middle of the axis.')
-        crop_row.addWidget(self.crop_chk)
-        crop_row.addWidget(QLabel('voxels per axis:'))
         self.crop_spin = QSpinBox()
         self.crop_spin.setRange(0, 4096)
         self.crop_spin.setValue(0)
         self.crop_spin.setSpecialValueText('auto')
         self.crop_spin.setToolTip('Size of the crop on each axis. "auto" keeps each candidate\n'
                                   'under about one minute with the NumPy engine.')
-        crop_row.addWidget(self.crop_spin)
-        crop_row.addStretch(1)
-        v1.addLayout(crop_row)
-        self.measure_btn = QPushButton('Measure')
-        self.measure_btn.setToolTip('Fit the noise model and run the default options\n'
-                                    "('equal weights, spread limit (3 sigma)') once. Show the diagnostics per |q| shell.")
-        self.measure_btn.clicked.connect(self._measure)
-        self.measure_cancel_btn = QPushButton('Cancel')
-        self.measure_cancel_btn.setToolTip('Stop Measure after the current step.\n'
-                                           'The panel keeps the earlier results.')
-        self.measure_cancel_btn.clicked.connect(self.cancel)
+        g1.add(ui.row(self.crop_chk, ui.label('voxels per axis', 'caption'), self.crop_spin))
+        self.measure_btn = ui.button(
+            'Measure', clicked=self._measure,
+            tip='Fit the noise model and run the default options\n'
+                "('equal weights, spread limit (3 sigma)') once. Show the diagnostics per |q| "
+                'shell.')
+        self.measure_cancel_btn = ui.button('Cancel', clicked=self.cancel,
+                                            tip='Stop Measure after the current step.\n'
+                                                'The panel keeps the earlier results.')
         m_row = QHBoxLayout()
+        m_row.setSpacing(ui.SPACE[1])
         m_row.addWidget(self.measure_btn, stretch=1)
         m_row.addWidget(self.measure_cancel_btn)
-        v1.addLayout(m_row)
-        self.model_label = QLabel()
-        self.model_label.setWordWrap(True)
-        self.model_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        v1.addWidget(self.model_label)
-        self.shell_table = QTableWidget(oe.N_SHELLS, len(av.SHELL_HEADERS))
-        self.shell_table.setHorizontalHeaderLabels(av.SHELL_HEADERS)
-        self.shell_table.horizontalHeaderItem(4).setToolTip(
-            'Voxels where the Poisson floor sets the scale / voxels tested.')
-        self.shell_table.horizontalHeaderItem(5).setToolTip(
-            'Sampled orbits with max/min member pixel count above 10.\n'
-            "A volume without pixel counts shows '-'.")
-        self.shell_table.horizontalHeaderItem(6).setToolTip(
-            'Node sum with the spread limit (3 sigma) / node sum without rejection.')
-        self._setup_table(self.shell_table)
-        # all 10 shells without a vertical scroll bar
-        self.shell_table.setFixedHeight(20 * oe.N_SHELLS + 30)
-        v1.addWidget(self.shell_table)
+        g1.add(m_row)
+        self.model_label = ui.label('', 'hint', wrap=True, selectable=True)
+        g1.add(self.model_label)
         left.addWidget(g1)
 
-        # Compare
-        g2 = QGroupBox('Compare')
-        v2 = QVBoxLayout(g2)
-        v2.addWidget(QLabel('Candidates (Compare uses the ticked items. Measure ticks the '
-                            'automatic set.):'))
+        # 2. Compare
+        g2 = ui.Section('Compare the options', step=2, help_topic='averaging')
+        g2.add_hint('Compare uses the ticked options. Measure ticks the automatic set.')
         self.cand_list = QListWidget()
-        self.cand_list.setMaximumHeight(130)
-        v2.addWidget(self.cand_list)
-        add_row = QHBoxLayout()
+        g2.add(self.cand_list)
         self.add_weight = QComboBox()
         _fill(self.add_weight, av.WEIGHT_LABELS, oe.WEIGHTINGS)
         self.add_rej = QComboBox()
@@ -538,60 +556,109 @@ class AveragingPanel(QWidget):
         self.add_sigma.setValue(3.5)
         self.add_sigma.setSingleStep(0.5)
         self.add_sigma.setDecimals(1)
-        self.add_btn = QPushButton('Add')
-        self.add_btn.setToolTip('Add this option to the list of candidates.')
-        self.add_btn.clicked.connect(self._add_custom)
-        for w in (QLabel('Add:'), self.add_weight, self.add_rej, QLabel('sigma'),
-                  self.add_sigma, self.add_btn):
-            add_row.addWidget(w)
-        add_row.addStretch(1)
-        v2.addLayout(add_row)
-        pos_row = QHBoxLayout()
-        pos_row.addWidget(QLabel('Extra positions:'))
+        self.add_sigma.setToolTip('Rejection threshold of the option that you add.\n'
+                                  'A higher value rejects less.')
+        self.add_btn = ui.button('Add to the list', clicked=self._add_custom,
+                                 tip='Add this option to the list of candidates.')
+        # Settings that a standard comparison does not need: behind a link
+        self.more_btn = ui.button('More settings', 'link', clicked=self._toggle_more,
+                                  tip='Add another option to the list, check extra positions '
+                                      'or select the slice that Compare shows.')
+        g2.add(ui.row(self.more_btn))
+        self.more_box = QWidget()
+        more = QVBoxLayout(self.more_box)
+        more.setContentsMargins(0, 0, 0, 0)
+        more.setSpacing(ui.SPACE[1])
+        self.more_box.setVisible(False)
+        g2.add(self.more_box)
+        add = QGridLayout()
+        add.setHorizontalSpacing(ui.SPACE[1])
+        add.setVerticalSpacing(ui.SPACE[0])
+        add.addWidget(ui.label('Another option', 'caption'), 0, 0, 1, 4)
+        add.addWidget(self.add_weight, 1, 0, 1, 2)
+        add.addWidget(self.add_rej, 1, 2, 1, 2)
+        add.addWidget(ui.label('sigma', 'caption'), 2, 0)
+        add.addWidget(self.add_sigma, 2, 1)
+        add.addWidget(self.add_btn, 2, 2, 1, 2)
+        more.addLayout(add)
         self.extra_edit = QLineEdit()
         self.extra_edit.setPlaceholderText('for example 0.5 0.5 0.5; 0 0 0.5')
         self.extra_edit.setToolTip('Offsets from the integer nodes (h k l). Separate positions\n'
                                    'with ";". Compare checks the sums near these positions.')
-        pos_row.addWidget(self.extra_edit)
-        v2.addLayout(pos_row)
-        sl_row = QHBoxLayout()
-        sl_row.addWidget(QLabel('Slice:'))
+        more.addWidget(ui.label('Extra positions to check (offsets from the Bragg nodes)',
+                                'caption'))
+        more.addWidget(self.extra_edit)
         self.plane_combo = QComboBox()
         self.plane_combo.addItems(['HK (fix l)', 'HL (fix k)', 'KL (fix h)'])
-        sl_row.addWidget(self.plane_combo)
-        sl_row.addWidget(QLabel('value:'))
         self.slice_spin = QDoubleSpinBox()
         self.slice_spin.setRange(-100.0, 100.0)
         self.slice_spin.setDecimals(3)
         self.slice_spin.setSingleStep(0.5)
-        sl_row.addWidget(self.slice_spin)
-        sl_row.addStretch(1)
-        v2.addLayout(sl_row)
-        self.compare_btn = QPushButton('Compare')
-        self.compare_btn.setToolTip('Score the ticked candidates, compare their sums with\n'
-                                    "'equal weights, spread limit (3 sigma)' and make a suggestion.")
-        self.compare_btn.clicked.connect(self._compare)
-        self.compare_cancel_btn = QPushButton('Cancel')
-        self.compare_cancel_btn.setToolTip('Stop Compare after the current candidate.\n'
-                                           'The panel keeps the earlier results.')
-        self.compare_cancel_btn.clicked.connect(self.cancel)
+        for w in (self.plane_combo, self.slice_spin):
+            w.setToolTip('The slice that Compare shows for each option.')
+        more.addLayout(ui.row(ui.label('Slice to show', 'caption'), self.plane_combo,
+                              ui.label('at', 'caption'), self.slice_spin))
+        self.compare_btn = ui.button(
+            'Compare', clicked=self._compare,
+            tip='Score the ticked candidates, compare their sums with\n'
+                "'equal weights, spread limit (3 sigma)' and make a suggestion.")
+        self.compare_cancel_btn = ui.button('Cancel', clicked=self.cancel,
+                                            tip='Stop Compare after the current candidate.\n'
+                                                'The panel keeps the earlier results.')
         c_row = QHBoxLayout()
+        c_row.setSpacing(ui.SPACE[1])
         c_row.addWidget(self.compare_btn, stretch=1)
         c_row.addWidget(self.compare_cancel_btn)
-        v2.addLayout(c_row)
+        g2.add(c_row)
         left.addWidget(g2)
+
+        # 3. Apply
+        g4 = ui.Section('Use an option', step=3, help_topic='averaging-page')
+        self.apply_combo = QComboBox()
+        self.apply_combo.setToolTip('The option for the save step. Compare selects its '
+                                    'suggestion.')
+        g4.add(self.apply_combo)
+        self.apply_btn = ui.button('Apply', clicked=self._apply,
+                                   tip='The symmetrise step of this window uses this option.')
+        self.clear_btn = ui.button('Clear', clicked=self.clear_applied,
+                                   tip='Remove the applied option. The window uses its own '
+                                       'settings.')
+        a_row = QHBoxLayout()
+        a_row.setSpacing(ui.SPACE[1])
+        a_row.addWidget(self.apply_btn, stretch=1)
+        a_row.addWidget(self.clear_btn)
+        g4.add(a_row)
+        self.applied_label = ui.label('', 'hint', wrap=True)
+        g4.add(self.applied_label)
+        # The save step of the host (see set_save_action), hidden until the host sets it
+        self.save_btn = ui.button('')
+        self.save_btn.setVisible(False)
+        g4.add(self.save_btn)
+        left.addWidget(g4)
         left.addStretch(1)
 
-        # Results
-        g3 = QGroupBox('Results')
-        v3 = QVBoxLayout(g3)
+        # Results: the comparison and the diagnostics of Measure
+        g3 = ui.Section('Results')
+        # The state of Compare and the suggestion: above the two tabs, so always visible
+        self.suggest_label = ui.label('', 'strong', wrap=True, selectable=True)
+        g3.add(self.suggest_label)
+        self.result_tabs = QTabWidget()
+        g3.add(self.result_tabs, 1)
+        self.compare_page = QWidget()
+        v3 = QVBoxLayout(self.compare_page)
+        v3.setContentsMargins(0, ui.SPACE[2], 0, 0)
+        v3.setSpacing(ui.SPACE[1])
         self.result_table = QTableWidget(0, len(av.COMPARE_HEADERS))
         self.result_table.setHorizontalHeaderLabels(av.COMPARE_HEADERS)
+        self.result_table.horizontalHeaderItem(0).setToolTip(
+            'The averaging option. The bold row is the suggestion.')
         self.result_table.horizontalHeaderItem(1).setToolTip(
             'Leave-one-member-out score. Lower is better.')
         self.result_table.horizontalHeaderItem(2).setToolTip(
             'Sum near the Bragg nodes divided by the same sum without rejection.')
         self.result_table.horizontalHeaderItem(3).setToolTip(EXTRA_TIP)
+        self.result_table.horizontalHeaderItem(4).setToolTip(
+            f"Sum of the diffuse region divided by the same sum of '{av.BIAS_REFERENCE}'.")
         self.result_table.horizontalHeaderItem(5).setToolTip(
             "Voxels that are finite in 'equal weights, spread limit (3 sigma)' and NaN with this candidate.")
         self.result_table.horizontalHeaderItem(6).setToolTip(
@@ -599,147 +666,232 @@ class AveragingPanel(QWidget):
         self.result_table.horizontalHeaderItem(7).setToolTip(
             "Time of the symmetrisation. The time of 'equal weights, spread limit (3 sigma)' is from Measure.")
         self._setup_table(self.result_table)
+        self.result_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.result_table.itemSelectionChanged.connect(self._on_row_selected)
-        self.result_table.setMaximumHeight(170)
+        self.result_table.setWordWrap(False)         # the names have their own line break
+        ui.fit_rows(self.result_table, 4)
         v3.addWidget(self.result_table)
-        self.suggest_label = QLabel()
-        self.suggest_label.setWordWrap(True)
-        self.suggest_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        v3.addWidget(self.suggest_label)
-        self.limits_label = QLabel(av.LIMITS_TEXT)
-        self.limits_label.setWordWrap(True)
-        self.limits_label.setStyleSheet('color: #a05000;')
+        self.limits_label = ui.hint(av.LIMITS_TEXT)
         v3.addWidget(self.limits_label)
+        self.compare_legend = ui.hint(COMPARE_LEGEND)
+        v3.addWidget(self.compare_legend)
         # 'compressed' keeps the axis labels of the equal-aspect slices inside the
         # canvas after a resize ('constrained' can cut the left label).
         self.figure = Figure(figsize=(6.4, 2.8), layout='compressed')
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.canvas.setMinimumHeight(260)
-        v3.addWidget(self.canvas, stretch=1)
-        right.addWidget(g3, stretch=1)
+        self.canvas = SliceCanvas(self.figure)
+        self.canvas.setMinimumHeight(240)
+        v3.addWidget(self.canvas)
+        v3.addStretch(1)
+        self.result_tabs.addTab(self.compare_page, 'Comparison')
 
-        # Apply
-        g4 = QGroupBox('Apply')
-        v4 = QVBoxLayout(g4)
-        a_row = QHBoxLayout()
-        a_row.addWidget(QLabel('Use:'))
-        self.apply_combo = QComboBox()
-        self.apply_combo.setMinimumWidth(180)
-        a_row.addWidget(self.apply_combo, stretch=1)
-        self.apply_btn = QPushButton('Apply')
-        self.apply_btn.setToolTip('The symmetrise step of this window uses this option.')
-        self.apply_btn.clicked.connect(self._apply)
-        a_row.addWidget(self.apply_btn)
-        self.clear_btn = QPushButton('Clear')
-        self.clear_btn.setToolTip('Remove the applied option. The window uses its own settings.')
-        self.clear_btn.clicked.connect(self.clear_applied)
-        a_row.addWidget(self.clear_btn)
-        v4.addLayout(a_row)
-        self.applied_label = QLabel()
-        self.applied_label.setWordWrap(True)
-        v4.addWidget(self.applied_label)
-        # The save step of the host (see set_save_action), hidden until the host sets it
-        self.save_btn = QPushButton()
-        self.save_btn.setVisible(False)
-        v4.addWidget(self.save_btn)
-        right.addWidget(g4)
+        self.shell_page = QWidget()
+        v5 = QVBoxLayout(self.shell_page)
+        v5.setContentsMargins(0, ui.SPACE[2], 0, 0)
+        v5.setSpacing(ui.SPACE[1])
+        self.shell_table = QTableWidget(oe.N_SHELLS, len(av.SHELL_HEADERS))
+        self.shell_table.setHorizontalHeaderLabels(av.SHELL_HEADERS)
+        for j, tip in enumerate(SHELL_TIPS):
+            self.shell_table.horizontalHeaderItem(j).setToolTip(tip)
+        self._setup_table(self.shell_table)
+        self.shell_table.horizontalHeader().setStretchLastSection(True)
+        ui.fit_rows(self.shell_table)            # all 10 shells, no scroll bar
+        self.shell_empty = ui.big_hint('No diagnostics yet. Click Measure. The table shows the '
+                                       'agreement of the symmetry-equivalent values in ten '
+                                       'shells of |q|.')
+        v5.addWidget(self.shell_empty)
+        v5.addWidget(self.shell_table)
+        self.shell_legend = ui.hint(SHELL_LEGEND)
+        v5.addWidget(self.shell_legend)
+        v5.addStretch(1)
+        self.result_tabs.addTab(self.shell_page, 'Diagnostics per |q| shell')
+        page.addWidget(g3, 1)
 
-        # Frame tools (raw-frame data only, hidden until enable_frame_tools)
+        # Frame tools (raw-frame data only): a page of the host window.
+        # It stays hidden until enable_frame_tools.
         self.frame_group = self._build_frame_group()
+        self.frame_group.setParent(self)
         self.frame_group.setVisible(False)
-        page.addWidget(self.frame_group)
 
-    def _build_frame_group(self) -> QGroupBox:
-        g = QGroupBox('Frame tools')
-        row = QHBoxLayout(g)
-        v = QVBoxLayout()
-        row.addLayout(v, stretch=4)
-        self.frame_help = QLabel(FRAME_HELP)
-        self.frame_help.setWordWrap(True)
-        self.frame_help.setStyleSheet('color: #555;')
-        v.addWidget(self.frame_help)
-        sel_row = QHBoxLayout()
-        sel_row.addWidget(QLabel('Volume:'))
+    def _build_frame_group(self) -> QWidget:
+        g = QWidget()
+        page = QHBoxLayout(g)
+        page.setContentsMargins(0, 0, 0, 0)
+        page.setSpacing(ui.SPACE[3])
+        left = QVBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(ui.SPACE[3])
+        holder = QWidget()
+        holder.setLayout(left)
+        holder.setFixedWidth(LEFT_WIDTH + 40)
+        page.addWidget(holder)
+
+        gv = ui.Section('Volume in use', help_topic='frame-tools')
         self.volume_combo = QComboBox()
-        self.volume_combo.setMinimumWidth(200)
         self.volume_combo.setToolTip('The volume for Measure, Compare and the symmetrise step.\n'
                                      'A change removes the results of Measure and Compare.')
         self.volume_combo.currentIndexChanged.connect(self._on_volume_selected)
-        sel_row.addWidget(self.volume_combo, stretch=1)
-        v.addLayout(sel_row)
-        b_row = QHBoxLayout()
-        self.split_btn = QPushButton('Split-half check')
-        self.split_btn.setToolTip('Make the odd-frame and the even-frame halves of the selected\n'
-                                  'volume (one pass) and calculate the split-half difference of\n'
-                                  'each candidate. Click Measure first.\n'
-                                  'The halves pass needs about 120 bytes per voxel of host\n'
-                                  'memory at its peak (about 55 bytes for a plain pass).\n'
-                                  'On the GPU it needs 40 bytes per voxel (20 bytes for a\n'
-                                  'plain pass). If that is more than 70 % of the free GPU\n'
-                                  'memory, the halves pass uses the CPU.')
-        self.map_btn = QPushButton('Frame map')
-        self.map_btn.setToolTip('Compare each frame and 5-degree sector with the leave-one-out\n'
-                                'orbit median of the selected volume (one pass). The first use\n'
-                                'also runs the ring statistics pass. The frames are not\n'
-                                'corrected with the frame model in this pass.')
-        self.ring_btn = QPushButton('Ring mask')
-        self.ring_btn.setToolTip('Find powder rings and make a volume without the ring pixels.')
-        self.model_btn = QPushButton('Frame model')
-        self.model_btn.setToolTip('Ring mask and frame model (3 iterations). This makes the\n'
-                                  "volume 'ring mask + frame model'.\n"
-                                  'Host memory at the peak (measured): 6.0 GB more than before\n'
-                                  'the run for 1735 frames, 1785 radial bins and a grid of\n'
-                                  '297 x 297 x 241 voxels.')
-        self.frame_cancel_btn = QPushButton('Cancel')
-        self.frame_cancel_btn.setToolTip('Stop the frame tool after the current frame.\n'
-                                         'The panel keeps the earlier results and a finished\n'
-                                         'ring detection. A new Ring mask or Frame model run\n'
-                                         'removes the earlier volume of that step when it starts.')
-        self.split_btn.clicked.connect(self._split_check)
-        self.map_btn.clicked.connect(self._frame_map)
-        self.ring_btn.clicked.connect(self._ring_mask)
-        self.model_btn.clicked.connect(self._frame_model)
-        self.frame_cancel_btn.clicked.connect(self.cancel)
-        for w in (self.split_btn, self.map_btn, self.ring_btn, self.model_btn,
-                  self.frame_cancel_btn):
-            b_row.addWidget(w)
-        v.addLayout(b_row)
-        self.frame_label = QLabel()
-        self.frame_label.setWordWrap(True)
-        self.frame_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        v.addWidget(self.frame_label)
+        gv.add(self.volume_combo)
+        gv.add_hint('Measure, Compare and the save steps use this volume. Ring mask and Frame '
+                    'model add a corrected volume to this list.')
+        left.addWidget(gv)
+
+        gt = ui.Section('Tools', help_topic='frame-tools')
+        self.split_btn = ui.button(
+            'Split-half check', clicked=self._split_check,
+            tip='Make the odd-frame and the even-frame halves of the selected\n'
+                'volume (one pass) and calculate the split-half difference of\n'
+                'each candidate. Click Measure first.\n'
+                'The halves pass needs about 120 bytes per voxel of host\n'
+                'memory at its peak (about 55 bytes for a plain pass).\n'
+                'On the GPU it needs 40 bytes per voxel (20 bytes for a\n'
+                'plain pass). If that is more than 70 % of the free GPU\n'
+                'memory, the halves pass uses the CPU.')
+        self.map_btn = ui.button(
+            'Frame map', clicked=self._frame_map,
+            tip='Compare each frame and 5-degree sector with the leave-one-out\n'
+                'orbit median of the selected volume (one pass). The first use\n'
+                'also runs the ring statistics pass. The frames are not\n'
+                'corrected with the frame model in this pass.')
+        self.ring_btn = ui.button(
+            'Ring mask', clicked=self._ring_mask,
+            tip='Find powder rings and make a volume without the ring pixels.')
+        self.model_btn = ui.button(
+            'Frame model', clicked=self._frame_model,
+            tip='Ring mask and frame model (3 iterations). This makes the\n'
+                "volume 'ring mask + frame model'.\n"
+                'Host memory at the peak (measured): 6.0 GB more than before\n'
+                'the run for 1735 frames, 1785 radial bins and a grid of\n'
+                '297 x 297 x 241 voxels.')
+        self.frame_cancel_btn = ui.button(
+            'Cancel', clicked=self.cancel,
+            tip='Stop the frame tool after the current frame.\n'
+                'The panel keeps the earlier results and a finished\n'
+                'ring detection. A new Ring mask or Frame model run\n'
+                'removes the earlier volume of that step when it starts.')
+        tools = QGridLayout()
+        tools.setHorizontalSpacing(ui.SPACE[2])
+        tools.setVerticalSpacing(ui.SPACE[1])
+        tools.setColumnStretch(1, 1)
+        for i, btn in enumerate((self.map_btn, self.ring_btn, self.model_btn, self.split_btn)):
+            btn.setFixedWidth(140)
+            tools.addWidget(btn, i, 0, Qt.AlignmentFlag.AlignTop)
+            tools.addWidget(ui.hint(FRAME_TOOL_NOTES[btn.text()]), i, 1)
+        self.frame_cancel_btn.setFixedWidth(140)
+        tools.addWidget(self.frame_cancel_btn, 4, 0)
+        gt.add(tools)
+        self.frame_label = ui.label('', wrap=True, selectable=True)
+        gt.add(self.frame_label)
+        self.frame_help = gt.add_hint(FRAME_INTRO)
+        left.addWidget(gt)
+
+        left.addStretch(1)
+
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(ui.SPACE[3])
+        gr = ui.Section('Results')
+        self.frame_tabs = QTabWidget()
+        gr.add(self.frame_tabs, 1)
+        self.frame_figure = Figure(figsize=(6.4, 3.0), layout='constrained')
+        self.frame_canvas = PageCanvas(self.frame_figure)
+        self.frame_canvas.setMinimumHeight(300)
+        self.frame_tabs.addTab(self.frame_canvas, 'Frame map')
+        self.split_page = QWidget()
+        vs = QVBoxLayout(self.split_page)
+        vs.setContentsMargins(0, ui.SPACE[2], 0, 0)
+        vs.setSpacing(ui.SPACE[1])
+        self.split_empty = ui.big_hint('No split-half result yet. Click Measure on the '
+                                       'Averaging page, then Split-half check.')
+        vs.addWidget(self.split_empty)
+        self.split_table = QTableWidget(0, 0)
+        self.split_table.setToolTip(av.SPLIT_HALF_DEFINITION)
+        self._setup_table(self.split_table)
+        ui.fit_rows(self.split_table, 3 + oe.N_SHELLS, max_rows=3 + oe.N_SHELLS)
+        self.split_table.setVisible(False)       # shown when a split-half result exists
+        vs.addWidget(self.split_table)
+        self.split_note = ui.hint('Split-half difference: ' + av.SPLIT_HALF_DEFINITION
+                                  + ' Lower is better.')
+        self.split_note.setVisible(False)
+        vs.addWidget(self.split_note)
+        vs.addStretch(1)
+        self.frame_tabs.addTab(self.split_page, 'Split-half table')
+        right.addWidget(gr, 1)
+        gs = ui.Section('Volumes')
         self.volumes_table = QTableWidget(0, 5)
         self.volumes_table.setHorizontalHeaderLabels(
             ['volume', 'suggestion', 'score', SPLIT_HEADER, 'split diffuse'])
         ref = av.BIAS_REFERENCE
-        for j, tip in ((2, f"Score of '{ref}' in the last Compare of this volume."),
+        for j, tip in ((0, 'The uncorrected volume and the volumes of Ring mask and Frame model.'),
+                       (1, 'Suggestion of the last Compare of this volume.'),
+                       (2, f"Score of '{ref}' in the last Compare of this volume."),
                        (3, f"Split-half difference (total) of '{ref}'."),
                        (4, f"Split-half difference of '{ref}' outside the nodes.")):
             self.volumes_table.horizontalHeaderItem(j).setToolTip(tip)
         self._setup_table(self.volumes_table)
-        self.volumes_table.setFixedHeight(20 * 3 + 30)
-        v.addWidget(self.volumes_table)
-        self.split_table = QTableWidget(0, 0)
-        self.split_table.setToolTip(av.SPLIT_HALF_DEFINITION)
-        self._setup_table(self.split_table)
-        self.split_table.setFixedHeight(20 * (3 + oe.N_SHELLS) + 30)
-        self.split_table.setVisible(False)       # shown when a split-half result exists
-        v.addWidget(self.split_table)
-        self.frame_figure = Figure(figsize=(6.4, 3.0), layout='constrained')
-        self.frame_canvas = FigureCanvasQTAgg(self.frame_figure)
-        self.frame_canvas.setMinimumHeight(300)
-        row.addWidget(self.frame_canvas, stretch=5)
+        self.volumes_table.horizontalHeader().setStretchLastSection(True)
+        ui.fit_rows(self.volumes_table, 3)
+        gs.add(self.volumes_table)
+        right.addWidget(gs)
+        page.addLayout(right, 1)
         return g
 
     @staticmethod
     def _setup_table(t: QTableWidget) -> None:
         t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         t.verticalHeader().setVisible(False)
-        t.verticalHeader().setDefaultSectionSize(20)
+        t.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        t.setStyleSheet('font-size: 11px;')
+        t.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+    def _results_hint(self) -> None:
+        """Clear the slices figure and say how to get a comparison."""
+        self.figure.clear()
+        self.figure.text(0.5, 0.5, RESULTS_EMPTY, ha='center', va='center', fontsize=9,
+                         color=ui.COLORS['muted'], linespacing=1.6)
+        self.canvas.draw_idle()
+
+    def _fit_result_rows(self) -> None:
+        """Make the rows of the Comparison table as high as their text (names on two lines)."""
+        if self.result_table.rowCount():
+            self.result_table.resizeRowsToContents()
+            ui.fit_rows(self.result_table, max_rows=8)
+
+    def _toggle_more(self) -> None:
+        show = self.more_box.isHidden()
+        self.more_box.setVisible(show)
+        # Compare uses the hidden settings too: say so if they are not the defaults
+        used = bool(self.extra_edit.text().strip()) or self.plane_combo.currentIndex() != 0
+        self.more_btn.setText('Fewer settings' if show else
+                              'More settings (in use)' if used else 'More settings')
+
+    def _show_results(self) -> None:
+        """Show the tables and their notes only if they have values."""
+        compared = self._compared is not None or self.result_table.rowCount() > 0
+        for w in (self.result_table, self.limits_label, self.compare_legend):
+            w.setVisible(compared)
+        self.suggest_label.setVisible(bool(self.suggest_label.text()))
+        measured = self._state is not None
+        self.shell_empty.setVisible(not measured)
+        for w in (self.shell_table, self.shell_legend):
+            w.setVisible(measured)
+        self.cand_list.setVisible(self.cand_list.count() > 0)
+
+    def _update_next_step(self) -> None:
+        """Give the button of the next step the look of the main action."""
+        nxt = None
+        if self._state is None:
+            nxt = self.measure_btn
+        elif self._compared is None and self._state['measured']['model'] is not None:
+            nxt = self.compare_btn
+        elif self._applied is None and self.apply_combo.count():
+            nxt = self.apply_btn
+        elif self._applied is not None and not self.save_btn.isHidden():
+            nxt = self.save_btn
+        for btn in (self.measure_btn, self.compare_btn, self.apply_btn, self.save_btn):
+            ui.set_role(btn, 'primary' if btn is nxt else None)
 
     # ── state ──
 
@@ -759,8 +911,9 @@ class AveragingPanel(QWidget):
         self.result_table.horizontalHeaderItem(3).setToolTip(EXTRA_TIP)
         self.cand_list.clear()
         self.apply_combo.clear()
-        self.figure.clear()
-        self.canvas.draw_idle()
+        self._results_hint()
+        ui.fit_rows(self.result_table, 4)
+        ui.fit_rows(self.cand_list)
         self.suggest_label.setText('')
         self.model_label.setText(message if (message and self._measured_once)
                                  else 'Click Measure to start.')
@@ -801,6 +954,7 @@ class AveragingPanel(QWidget):
     def set_host_busy(self, busy: bool) -> None:
         """The host calls this while it works. The panel buttons are then off."""
         self.setEnabled(not busy)
+        self.frame_group.setEnabled(not busy)       # the frame tools are on another page
 
     def set_save_action(self, text: str, callback: Callable[[], None], tip: str = '') -> None:
         """Show a button in the Apply group that starts the save step of the host.
@@ -831,6 +985,8 @@ class AveragingPanel(QWidget):
             w.setEnabled(idle)
         self.split_btn.setEnabled(idle and measured)
         self.frame_cancel_btn.setEnabled(self._busy and self._step in FRAME_STEPS)
+        self._update_next_step()
+        self._show_results()
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -839,13 +995,17 @@ class AveragingPanel(QWidget):
 
     def _update_applied_label(self) -> None:
         if self._applied:
-            self.applied_label.setText(f"Applied: '{self._applied['name']}'. The symmetrise step "
-                                       'of this window uses this option.')
-            self.applied_label.setStyleSheet('color: #070; font-weight: bold;')
+            self.applied_label.setText(f"Applied: '{self._applied['name']}'. The save step of "
+                                       'this window uses this option.')
+            ui.set_role(self.applied_label, 'ok')
+        elif self.apply_combo.count():
+            self.applied_label.setText('Click Apply to use the selected option in the save '
+                                       'step.')
+            ui.set_role(self.applied_label, 'hint')
         else:
-            self.applied_label.setText('The panel has no applied option. The symmetrise step '
-                                       'uses the settings of this window.')
-            self.applied_label.setStyleSheet('color: #555;')
+            self.applied_label.setText('No option is applied. The save step uses the settings '
+                                       'of the Advanced page.')
+            ui.set_role(self.applied_label, 'hint')
 
     # ── jobs ──
 
@@ -1007,6 +1167,7 @@ class AveragingPanel(QWidget):
                 self.shell_table.setItem(i, j, item)
         unit = m['diagnostics'].get('q_unit', '')
         self.shell_table.horizontalHeaderItem(0).setText(f'|q| ({unit})')
+        self.result_tabs.setCurrentWidget(self.shell_page)
         self.cand_list.clear()
         auto = av.automatic_candidates(m['has_counts'])
         for c in auto:
@@ -1022,6 +1183,8 @@ class AveragingPanel(QWidget):
             self.apply_combo.addItem(name)
         else:
             self.suggest_label.setText('Click Compare to get a suggestion.')
+        ui.fit_rows(self.cand_list)
+        self._update_applied_label()
         self._update_enabled()
 
     # ── Compare ──
@@ -1055,6 +1218,7 @@ class AveragingPanel(QWidget):
                 item.setCheckState(Qt.CheckState.Checked)
                 return
         self._add_item(spec, checked=True)
+        ui.fit_rows(self.cand_list)
 
     def _compare(self) -> None:
         if self._state is None:
@@ -1063,6 +1227,7 @@ class AveragingPanel(QWidget):
             extra = parse_positions(self.extra_edit.text())
         except ValueError as e:
             self.suggest_label.setText(str(e))
+            self._show_results()
             return
         st = self._state
         from .volume_builder import HAS_GPU
@@ -1089,10 +1254,13 @@ class AveragingPanel(QWidget):
         self.result_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
             for j, cell in enumerate(row):
-                item = QTableWidgetItem(cell)
+                item = QTableWidgetItem(cell if j else two_lines(cell))
                 if j:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight
                                           | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item.setData(Qt.ItemDataRole.UserRole, cell)     # the full name
+                    item.setToolTip(cell)
                 if row[0] == compared['suggestion']:
                     font = item.font()
                     font.setBold(True)
@@ -1105,6 +1273,8 @@ class AveragingPanel(QWidget):
         else:
             self.result_table.horizontalHeaderItem(3).setToolTip(EXTRA_TIP)
         self.suggest_label.setText(f"Suggestion: {compared['suggestion']}. {compared['reason']}")
+        self._fit_result_rows()
+        self.result_tabs.setCurrentWidget(self.compare_page)
         self.apply_combo.clear()
         names = [r['name'] for r in compared['rows']]
         if compared['suggestion'] not in names:          # the preselection, not compared
@@ -1120,6 +1290,7 @@ class AveragingPanel(QWidget):
         ref = next((r for r in compared['rows'] if r['name'] == av.BIAS_REFERENCE), None)
         self._summarise(suggestion=compared['suggestion'],
                         score=None if ref is None else ref['score'])
+        self._update_applied_label()
         self._update_enabled()
 
     def _on_row_selected(self) -> None:
@@ -1143,14 +1314,15 @@ class AveragingPanel(QWidget):
         lo, hi = (np.percentile(fin, [1, 99.5]) if fin.size else (0.0, 1.0))
         im1 = ax1.pcolormesh(X, Y, np.ma.masked_invalid(img), cmap='viridis', shading='flat',
                              vmin=lo, vmax=hi if hi > lo else lo + 1)
-        ax1.set_title(f'{name}, {fl} = {info["value"]:g}', fontsize=9)
+        ax1.set_title(f'{two_lines(name)}\n{fl} = {info["value"]:g}', fontsize=8)
         dfin = np.abs(diff[np.isfinite(diff)])
         lim = float(np.percentile(dfin, 99.5)) if dfin.size else 1.0
         lim = lim if lim > 0 else 1.0
         im2 = ax2.pcolormesh(X, Y, np.ma.masked_invalid(diff), cmap='RdBu_r', shading='flat',
                              vmin=-lim, vmax=lim)
-        ax2.set_title(f'{name}\nminus {av.BIAS_REFERENCE}' if name != av.BIAS_REFERENCE
-                      else 'difference (this is the reference)', fontsize=9)
+        ax2.set_title(f'this option minus the reference\n({two_lines(av.BIAS_REFERENCE)})'
+                      if name != av.BIAS_REFERENCE else 'difference (this is the reference)',
+                      fontsize=8)
         M = np.asarray(geo['M'], np.float64)
         for ax, colour in ((ax1, 'w'), (ax2, 'k')):
             _miller_lines(ax, M, m1, m2, colour)
@@ -1212,8 +1384,6 @@ class AveragingPanel(QWidget):
         """Show the frame tools. `request` is the frame request of the host (module docstring)."""
         self._frame_request = request
         self.frame_group.setVisible(True)
-        if FRAME_TOOLS_PLACE not in self.engine_label.text():
-            self.engine_label.setText(f'{self.engine_label.text()} {FRAME_TOOLS_PLACE}')
         self._refresh_volumes()
         self.frame_label.setText('Reconstruct a volume, then use the frame tools.')
         self._frame_map_hint()
@@ -1222,7 +1392,7 @@ class AveragingPanel(QWidget):
         """Clear the frame map figure and show a short hint in it."""
         self.frame_figure.clear()
         self.frame_figure.text(0.5, 0.5, FRAME_MAP_EMPTY, ha='center', va='center',
-                               fontsize=9, color='#555555', wrap=True)
+                               fontsize=9, color=ui.COLORS['muted'], wrap=True)
         self.frame_canvas.draw_idle()
 
     def selected_slot(self) -> str:
@@ -1506,6 +1676,7 @@ class AveragingPanel(QWidget):
         self._halves = (self._slot, out['halves'])
         self._split = out['split']
         self._show_split()
+        self.frame_tabs.setCurrentWidget(self.split_page)
         ref = self._split['rows'].get(av.BIAS_REFERENCE) or {}
         self._summarise(split=ref.get('total'), split_diffuse=ref.get('diffuse'))
         lines = [f"Split-half difference of '{SLOT_NAMES[self._slot]}' ({HALVES_RULE}):"]
@@ -1531,6 +1702,8 @@ class AveragingPanel(QWidget):
             self.split_table.setRowCount(0)
             self.split_table.setColumnCount(0)
             self.split_table.setVisible(False)
+            self.split_note.setVisible(False)
+            self.split_empty.setVisible(True)
             return
         rows = split['rows']
         self.result_table.setColumnCount(n + 1)
@@ -1539,7 +1712,8 @@ class AveragingPanel(QWidget):
         self.result_table.setHorizontalHeaderItem(n, head)
         for i in range(self.result_table.rowCount()):
             name_item = self.result_table.item(i, 0)
-            r = rows.get(name_item.text()) if name_item is not None else None
+            r = (rows.get(name_item.data(Qt.ItemDataRole.UserRole))
+                 if name_item is not None else None)
             item = QTableWidgetItem(av._num(None if r is None else r['total']))
             item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.result_table.setItem(i, n, item)
@@ -1548,7 +1722,8 @@ class AveragingPanel(QWidget):
         labels = (['total', 'diffuse', 'node']
                   + [f"{edges[k]:.3f}-{edges[k + 1]:.3f}" for k in range(len(edges) - 1)])
         self.split_table.setColumnCount(len(names) + 1)
-        self.split_table.setHorizontalHeaderLabels([f"|q| ({split['q_unit']})"] + names)
+        self.split_table.setHorizontalHeaderLabels(
+            [f"|q| ({split['q_unit']})"] + [two_lines(n) for n in names])
         self.split_table.setRowCount(len(labels))
         for i, lab in enumerate(labels):
             self.split_table.setItem(i, 0, QTableWidgetItem(lab))
@@ -1563,7 +1738,9 @@ class AveragingPanel(QWidget):
                 item = QTableWidgetItem(av._num(val))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.split_table.setItem(i, j + 1, item)
+        self.split_empty.setVisible(False)
         self.split_table.setVisible(True)
+        self.split_note.setVisible(True)
 
     def _plot_frame_map(self) -> None:
         """The frame x sector image and the radial residual profile of the kept frame map."""
@@ -1609,6 +1786,7 @@ class AveragingPanel(QWidget):
             ax.tick_params(labelsize=8)
         self.frame_figure.suptitle(title, fontsize=8)
         self.frame_canvas.draw_idle()
+        self.frame_tabs.setCurrentWidget(self.frame_canvas)
 
 
 def _fill(combo: QComboBox, labels: dict[str, str], keys: Any) -> None:
@@ -1617,7 +1795,7 @@ def _fill(combo: QComboBox, labels: dict[str, str], keys: Any) -> None:
         combo.addItem(labels[key], key)
 
 
-class AveragingSettings(QGroupBox):
+class AveragingSettings(ui.Section):
     """The averaging of the symmetrise step of a host GUI: 'Standard' or 'Custom'.
 
     `standard` is a candidate dict (for example `averaging.COUNTS_MAD`).
@@ -1630,26 +1808,29 @@ class AveragingSettings(QGroupBox):
 
     def __init__(self, standard: dict[str, Any], why: str,
                  parent: QWidget | None = None) -> None:
-        super().__init__('Averaging and outlier rejection', parent)
+        super().__init__('Averaging and outlier rejection', help_topic='averaging',
+                         parent=parent)
         self.standard = dict(standard)
         self._override: str | None = None
         self._mode = 'standard'
         self._custom = dict(self.standard)       # the last custom values
-        form = QFormLayout(self)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        form = ui.form()
         self.mode_combo = QComboBox()
         self.mode_combo.addItem(f"Standard: {self.standard['name']}", 'standard')
         self.mode_combo.addItem('Custom', 'custom')
-        self.mode_combo.setToolTip('Standard: the option of the first tab (recommended for clean\n'
-                                   'data). Custom: set the weights, the rejection and sigma.')
-        form.addRow('Mode:', self.mode_combo)
+        self.mode_combo.setToolTip('Standard: the option of the first page (recommended for '
+                                   'clean\ndata). Custom: set the weights, the rejection and '
+                                   'sigma.')
+        form.addRow('Mode', self.mode_combo)
+        ui.form_hint(form, 'Select Custom to change the weights, the rejection and the '
+                           'threshold.')
         self.weight_combo = QComboBox()
         _fill(self.weight_combo, av.WEIGHT_LABELS, oe.WEIGHTINGS)
         self.weight_combo.setToolTip("Weights of the orbit members. 'equal weights': plain mean.\n"
                                      "'pixel-count weights': each member has the weight of its\n"
                                      "pixel count. 'noise weights': each member has the weight\n"
                                      '1 / variance of the noise model.')
-        form.addRow('Weights:', self.weight_combo)
+        form.addRow('Weights', self.weight_combo)
         self.rej_combo = QComboBox()
         _fill(self.rej_combo, av.REJECTION_LABELS, ('mad', 'model', 'none'))
         self.rej_combo.setToolTip("Outlier rule. 'spread limit': reject a member farther than\n"
@@ -1657,21 +1838,20 @@ class AveragingSettings(QGroupBox):
                                   "Poisson value) from the orbit median. 'noise limit': the limit\n"
                                   "is sigma x the noise that the noise model gives.\n"
                                   "'no rejection': spikes go into the mean.")
-        form.addRow('Outlier rejection:', self.rej_combo)
+        form.addRow('Outlier rejection', self.rej_combo)
         self.sigma_spin = QDoubleSpinBox()
         self.sigma_spin.setRange(1.0, 10.0)
         self.sigma_spin.setSingleStep(0.5)
         self.sigma_spin.setDecimals(1)
         self.sigma_spin.setToolTip('Rejection threshold: you can set any value from 1 to 10.\n'
                                    'A higher value rejects less.')
-        form.addRow('Sigma:', self.sigma_spin)
-        self.help_label = QLabel(why)
-        self.help_label.setWordWrap(True)
-        self.help_label.setStyleSheet('color: #555;')
-        form.addRow(self.help_label)
-        self.note_label = QLabel()
-        self.note_label.setWordWrap(True)
-        form.addRow(self.note_label)
+        form.addRow('Threshold (sigma)', self.sigma_spin)
+        ui.form_hint(form, 'A higher threshold rejects less.')
+        self.add(form)
+        self.help_label = self.add_hint(why)
+        self.note_label = ui.label('', 'hint', wrap=True)
+        self.note_label.setVisible(False)
+        self.add(self.note_label)
         self.mode_combo.currentIndexChanged.connect(self._on_change)
         self.weight_combo.currentIndexChanged.connect(self._on_change)
         self.rej_combo.currentIndexChanged.connect(self._on_change)
@@ -1742,18 +1922,17 @@ class AveragingSettings(QGroupBox):
         self.rej_combo.setEnabled(free and custom)
         self.sigma_spin.setEnabled(free and custom and self.rej_combo.currentData() != 'none')
         if not free:
-            self.note_label.setText(f"Not used now. The symmetrise step uses '{self._override}', "
-                                    'applied in the Averaging tab. Click Clear in that tab to '
-                                    'use these settings again.')
-            self.note_label.setStyleSheet('color: #070; font-weight: bold;')
+            text, role = (f"Not used now. The symmetrise step uses '{self._override}', applied "
+                          'on the Averaging page. Click Clear on that page to use these '
+                          'settings again.'), 'ok'
         elif (self.spec().get('weighting') == 'adaptive'
               or self.spec().get('rejection') == 'model'):
-            self.note_label.setText('This option needs a noise model. The symmetrise step fits it '
-                                    'to the volume first (about 30 s more with a GPU on a '
-                                    'large volume).')
-            self.note_label.setStyleSheet('color: #555;')
+            text, role = ('This option needs a noise model. The symmetrise step fits it to the '
+                          'volume first (about 30 s more with a GPU on a large volume).'), 'hint'
         elif custom and self.rej_combo.currentData() == 'none':
-            self.note_label.setText('No rejection: spikes and zingers go into the mean.')
-            self.note_label.setStyleSheet('color: #a05000;')
+            text, role = 'No rejection: spikes and zingers go into the mean.', 'warn'
         else:
-            self.note_label.setText('')
+            text, role = '', 'hint'
+        ui.set_role(self.note_label, role)
+        self.note_label.setText(text)
+        self.note_label.setVisible(bool(text))

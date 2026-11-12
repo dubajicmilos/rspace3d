@@ -79,7 +79,10 @@ def test_group_hidden_for_unwarp_data_and_shown_for_raw_frames(qapp, monkeypatch
     panel = gui.avg_panel
     assert gui.frame_tools_group is panel.frame_group and not panel.frame_group.isHidden()
     assert _slots(panel) == ['none'] and panel.selected_volume() is None
-    assert 'sum|A - B| / sum(|A| + |B|)' in panel.frame_help.text()
+    # the definition of the split-half difference: below its table and in the help pages
+    from rspace3d import help_content
+    assert 'sum|A - B| / sum(|A| + |B|)' in panel.split_note.text()
+    assert 'sum|A - B| / sum(|A| + |B|)' in help_content.topic_html('frame-tools')
     # no reconstruction yet: a message, no job
     panel.ring_btn.click()
     assert 'Reconstruct a volume first' in panel.frame_label.text()
@@ -164,7 +167,7 @@ def test_split_half_check_measure_compare_and_save(qapp, monkeypatch, tmp_path, 
     panel._progress_fn = lambda i, k: passes.append(k)
     panel._split_check()
     assert panel._halves[1] is halves and passes and max(passes) <= len(names)
-    # Apply and Symmetrise + Save: the selected volume and the frame-tool metadata
+    # Apply and Symmetrise and save: the selected volume and the frame-tool metadata
     panel.apply_combo.setCurrentText(av.BIAS_REFERENCE)
     panel._apply()
     gui._symmetrize_save()
@@ -210,7 +213,7 @@ def test_frame_figure_shows_a_hint_before_the_first_map(qapp, monkeypatch, tmp_p
     from rspace3d import averaging_panel as ap
     gui, panel = _gui(qapp, monkeypatch, tmp_path, scene)
     assert [t.get_text() for t in panel.frame_figure.texts] == [ap.FRAME_MAP_EMPTY]
-    assert ap.FRAME_TOOLS_PLACE in panel.engine_label.text()
+    assert 'Frame tools' in gui.page_names()            # the frame tools have their own page
     assert 'Laue group mmm and 0.2 degree frames' in panel.frame_help.text()
     panel.map_btn.click()
     assert ap.FRAME_MAP_EMPTY not in [t.get_text() for t in panel.frame_figure.texts]

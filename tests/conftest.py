@@ -6,6 +6,8 @@ variance rule of rspace3d 2.3. The orbit engine must give the same result.
 """
 from __future__ import annotations
 
+import os
+import sys
 import warnings
 
 import numpy as np
@@ -13,6 +15,12 @@ import pytest
 from scipy.ndimage import map_coordinates
 
 from rspace3d.volume_builder import _EDGE_SNAP_TOL, index_space_ops
+
+if sys.platform == 'win32':
+    # The offscreen Qt platform has no font directory on Windows. Without it, a text is
+    # about two times wider than on the screen, and the layout tests of the windows fail.
+    os.environ.setdefault('QT_QPA_FONTDIR',
+                          os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts'))
 
 
 def _coords(op, shape):
