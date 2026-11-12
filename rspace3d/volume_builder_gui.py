@@ -975,6 +975,7 @@ class SimpleVolumeGUI(ui.Shell):
 
 
 def main() -> None:
+    ui.prepare_opengl()                             # for the 3D view of "Open in viewer"
     app = QApplication(sys.argv)
     app.setApplicationName('3D Volume Processor')
     gui = SimpleVolumeGUI()

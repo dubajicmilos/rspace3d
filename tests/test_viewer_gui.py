@@ -57,7 +57,7 @@ def test_load_volume_file(viewer, qapp):
     qapp.processEvents()
     assert viewer.stack.currentIndex() == 1
     assert viewer.vol_toolbar.isVisible()
-    assert viewer.iso_btn.isVisible() and viewer.info_btn.isVisible()
+    assert viewer.view3d_btn.isVisible() and viewer.info_btn.isVisible()
     assert viewer.open_btn.property('role') is None
     lo, hi = viewer.min_spin.value(), viewer.max_spin.value()
     assert np.isfinite(lo) and np.isfinite(hi) and lo < hi
@@ -134,6 +134,6 @@ def test_every_control_has_a_tool_tip(viewer):
     for w in (viewer.cmap_combo, viewer.min_spin, viewer.max_spin, viewer.auto_btn,
               viewer.log_check, viewer.xrange_spin, viewer.yrange_spin, viewer.fit_btn,
               viewer.grid_check, viewer.cbar_check, viewer.line_btn, viewer.export_btn,
-              viewer.iso_btn, viewer.info_btn, viewer.plane_combo, viewer.slice_spin,
+              viewer.view3d_btn, viewer.info_btn, viewer.plane_combo, viewer.slice_spin,
               viewer.slice_slider, viewer.int_range_spin, viewer.open_btn):
         assert w.toolTip(), w

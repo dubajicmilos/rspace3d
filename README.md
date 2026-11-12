@@ -17,7 +17,7 @@ reconstructed in about half a minute, whereas assembling the same volume from
 CrysAlisPro's `dc unwarp` layers takes hours. Volumes built from `dc unwarp`
 layers are supported as well.
 
-<img width="1297" height="777" alt="image" src="docs/images/viewer_gui.png" />
+<img width="1297" alt="The viewer and the 3D view with the same volume" src="docs/images/viewer_gui.png" />
 
 ## Contents
 
@@ -71,6 +71,8 @@ Measured on one NVIDIA RTX 3090 for the dataset in the figure above: 1735 frames
 | The same accumulation on the CPU | about 1 s per frame, about 30 min in total |
 | Outlier rejection and mmm averaging of the 480³ volume on the GPU | about 3 s |
 | The same volume through CrysAlisPro `dc unwarp` (601 layers, route B) | hours |
+| 3D view of a 480³ volume: from the click to the first image | about 2 s |
+| 3D view: one image after a turn, a new level or a new box (1300 × 850 pixels) | 1 to 6 ms |
 
 ## Installation
 
@@ -102,8 +104,9 @@ CuPy:
 pip install cupy-cuda12x      # CUDA 12 driver; use cupy-cuda11x for CUDA 11
 ```
 
-CuPy is detected automatically; without it everything runs on the CPU. Optional
-3D isosurface backends: `pip install pyvista` or `pip install plotly`.
+CuPy is detected automatically. Without it everything runs on the CPU. The 3D
+view needs no extra package. It draws with OpenGL 4.1 through PyQt6, on any
+graphics card or processor graphics that has it, and it does not use CuPy.
 
 Without a GPU, install numba with the extra `cpu`:
 
@@ -114,7 +117,8 @@ pip install -e ".[cpu]"       # or: pip install numba
 rspace3d then does the symmetrisation on all CPU cores, about 20 to 30 times
 faster than without numba. numba is optional. Without it, a NumPy engine
 gives the same result. The extra `all` installs CuPy, numba, PyVista and
-Plotly.
+Plotly. PyVista and Plotly are only for the two older methods of
+`plot_isosurface` (see [3D view](#3d-view)).
 
 ### Updating
 
@@ -139,7 +143,7 @@ rspace3d-viewer example_data/example_monoclinic.h5
 
 In the viewer, switch between the hk, hl and kl planes, step through slices,
 tick *Miller-index grid* for the overlay, and try the line-profile tool and
-*3D isosurface...*.
+*3D view...*.
 
 ## Route A: reconstruction from the raw frames
 
@@ -809,13 +813,55 @@ hl, kl) and the slice, and integrates over a range. You can overlay the
 Miller-index grid (tilted where the cell requires it, correct for all crystal
 systems), draw line profiles, switch between linear and log colour scales, fit
 the view to the data (*Fit to data*), set the colour scale from the slice
-(*Auto*), export images, and open a 3D isosurface (*3D isosurface...*, which
-needs Plotly or PyVista). *Help (F1)* opens the help.
+(*Auto*), export images, and open the 3D view (*3D view...*). *Help (F1)* opens
+the help.
 
 <img width="640" alt="The viewer with a volume" src="docs/images/viewer_window.png" />
 
-The image at the top of this page shows an earlier version of the viewer
-together with the 3D isosurface window.
+### 3D view
+
+*3D view...* opens the volume in its own window. The two ranges of the 2D view
+are the start values of the box.
+
+<img width="640" alt="The 3D view with two surfaces of equal intensity" src="docs/images/view3d.png" />
+
+- **Surfaces of equal intensity.** Up to three levels, each with a colour and
+  an opacity. The histogram shows the intensities of the volume on a
+  logarithmic axis. Drag the line of a level on it, or type the value. The
+  first level is set so that 1 % of the voxels with a positive intensity are
+  above it. A grey part of a surface is where the measured data ends (a
+  detector gap, the beam stop, the limit of the measurement).
+- **Projection of the maximum.** The largest intensity along each line of
+  sight, with a colour map. It needs no level.
+- **Box.** Ranges of h, k and l that cut the volume, to look inside it.
+- **View.** Drag to turn, Shift + drag or the right button to move, the wheel
+  to zoom. The buttons *hk*, *hl* and *kl* look straight at that plane. The box
+  is drawn in reciprocal space with the unit cell, so a monoclinic or triclinic
+  cell has its true angles.
+- **Image.** *Save image...* and *Copy image* give the picture with its labels.
+
+The view is drawn on the graphics card. One fragment shader sends a ray
+through the volume for each pixel of the image, so a change of a level, of the
+box or of the direction is one new image and no mesh is calculated. The volume
+is not changed and not smoothed. The view needs OpenGL 4.1 and no extra
+package. Measured on one NVIDIA RTX 3090 at 1300 × 850 pixels, for volumes from
+161³ to 480³ voxels: 0.7 to 2.1 s from the volume in memory to the first
+image, and 1 to 6 ms for an image after a turn, a new level or a new box. On
+slow graphics the image has
+fewer pixels while you turn it and all pixels when you stop. A volume with
+more than about 500 million voxels is shown as the mean of blocks of voxels.
+
+From Python:
+
+```python
+from rspace3d.volume_isosurface import plot_isosurface
+plot_isosurface(vol)                          # the 3D view, automatic level
+plot_isosurface(vol, isovalue=[50, 500], l_range=(0, 6))
+```
+
+`method='pyvista'` and `method='plotly'` select the two older methods. They
+need PyVista or Plotly, and they are slow for a large volume. A call with
+`save_html` and no method uses Plotly, as before.
 
 ## Python API summary
 
@@ -947,7 +993,10 @@ rspace3d/
         volume_process.py       route B: command line
         rsp_reader.py           read a single .img layer, Miller-index grid
         rsp_viewer.py           viewer for .img / .cbf / .h5
-        volume_isosurface.py    3D isosurface (Plotly / PyVista)
+        view3d.py               3D view: geometry, camera, levels (NumPy only)
+        view3d_gl.py            3D view: ray caster on the graphics card (OpenGL classes of PyQt6)
+        view3d_window.py        3D view: the window
+        volume_isosurface.py    plot_isosurface: opens the 3D view (older methods: PyVista, Plotly)
         make_dcunwarp.py        write CrysAlisPro .dcunwarp layer lists
     tests/                      regression tests (python -m pytest tests)
     docs/                       .img header format, unwarp processing notes, figures

@@ -91,6 +91,8 @@ changes between frames)</li>
 <li><a href="topic:grid">Grid, voxel size, binning and memory</a></li>
 <li><a href="topic:advanced">Advanced settings</a></li>
 <li><a href="topic:viewer">Look at a volume</a> (the viewer)</li>
+<li><a href="topic:view3d">Look at a volume in 3D</a> (surfaces of equal intensity,
+projection)</li>
 <li><a href="topic:files">Output files</a></li>
 <li><a href="topic:glossary">Glossary</a></li>
 </ul>
@@ -626,11 +628,94 @@ on axes of h, k and l, with straight lines.</p>
 <li><b>Line profile.</b> Switch it on and drag a line on the image. The panel on the right
 shows the intensity along the line.</li>
 <li><b>Export image.</b> Saves the image as a file or copies it to the clipboard.</li>
-<li><b>3D isosurface.</b> Opens a 3D view of the volume (needs PyVista or Plotly).</li>
+<li><b>3D view.</b> Opens the volume in 3D in its own window: surfaces of equal intensity
+or a projection. See <a href="topic:view3d">Look at a volume in 3D</a>.</li>
 <li><b>File information.</b> Shows the size, the ranges, the unit cell and the processing
 data of the volume.</li>
 </ul>
 <p>The status bar shows the indices and the intensity below the cursor.</p>
+'''
+
+VIEW3D = f'''
+<h1>Look at a volume in 3D</h1>
+<p><b>3D view</b> in the viewer opens the volume in its own window. The window draws on the
+graphics card. A change of a level, of the box or of the direction shows at once, also for
+a large volume.</p>
+
+<h2>What you see</h2>
+<p>The box has the axes h, k and l. It is drawn in reciprocal space with the unit cell of
+the volume, so the box of a monoclinic or triclinic cell does not have right angles. The
+lines on the far faces of the box are at the whole Miller indices. The small arrows at the
+lower left show the directions of a*, b* and c*.</p>
+
+<h2>Surfaces of equal intensity</h2>
+<p>A surface is where the intensity has the value of a level. Each point inside the surface
+is stronger than the level. A sharp Bragg peak gives a small closed surface. A diffuse rod
+gives a tube, and a diffuse plane gives a sheet.</p>
+<ul>
+<li><b>The histogram</b> shows how many voxels have each intensity, on a logarithmic axis.
+Each level is a line on it. Drag the line, or type the intensity in the field below it.
+Hold Shift during the drag for small steps.</li>
+<li><b>The first level</b> is set so that 1 % of the voxels with a positive intensity are
+above it. These voxels are the Bragg peaks and the strongest diffuse scattering. <b>Reset
+levels</b> removes the other levels and sets this level again.</li>
+<li><b>Add level</b> adds a second and a third surface, each with its colour and opacity. A
+good use is one surface with an opacity of 100 for the strong features, and one surface with
+a low opacity at a lower level for the weak scattering around them. A level near the large
+peak at the left of the histogram is in the noise and shows a rough cloud.</li>
+<li><b>Grey parts</b> of a surface are where the measured data ends: a gap of the detector,
+the beam stop or the limit of the measurement. The intensity does not decrease there. There
+is no data on the other side.</li>
+<li><b>Flat faces</b> are where the box cuts a region that is above the level.</li>
+</ul>
+{_note('The 3D view does not change the data. It finds a surface between the voxel centres '
+       'on a logarithmic scale and applies no smoothing.')}
+
+<h2>Projection of the maximum</h2>
+<p>Each point of the image shows the largest intensity along the line of sight, in the
+colours of the colour map. You do not select a level, so this is a good first look at weak
+features in all of the volume. A strong feature hides the weak features in front of it and
+behind it. The two lines on the histogram are the ends of the colour scale (<b>Min</b> and
+<b>Max</b>). On a light background the colour map is reversed, so that weak intensity is
+light.</p>
+
+<h2>The box</h2>
+<p>The three ranges cut the volume along h, k and l. Use them to look inside. For example,
+set l from 0 to its largest value: the cut face is then the plane l = 0. <b>Show all</b>
+shows the complete volume again. If you open the window from the viewer, the two ranges of
+the 2D view are the start values.</p>
+
+<h2>The view</h2>
+{_table(['Mouse', 'Effect'], [
+    ['Drag', 'Turn the box. The direction at right angles to the hk plane stays upright.'],
+    ['Shift + drag, or drag with the right button', 'Move the box.'],
+    ['Wheel', 'Zoom. The point below the mouse stays in its place.'],
+], [42, 58])}
+<p><b>3D</b> sets the start direction again. <b>hk</b>, <b>hl</b> and <b>kl</b> look straight
+at that plane, with the first index to the right and the second index up, as in the 2D
+view. Without <b>Perspective</b>, equal lengths are equal on the screen at each depth. This
+is the usual way to draw a lattice.</p>
+<p>The line below the image shows h, k, l and the intensity of the surface point below the
+mouse. In the projection it shows the strongest point along the line of sight.</p>
+
+<h2>Image</h2>
+<p><b>Save image...</b> writes a PNG file with the labels. The file has two image pixels for
+each screen pixel, and not more than 4096 pixels along its longer side. <b>Copy image</b>
+puts the same image on the clipboard.</p>
+
+<h2>Speed and size</h2>
+<ul>
+<li>The view needs graphics with OpenGL 4.1. It needs no extra Python package.</li>
+<li>If a frame takes longer than 1/30 s, the image has fewer pixels while you turn it and
+all pixels when you stop.</li>
+<li>A volume with more than about 500 million voxels, or with an axis of more than 2048
+voxels, is shown as the mean of blocks of voxels. The panel then says "Shown with 1 of
+each ...".</li>
+<li>From Python, <code>rspace3d.volume_isosurface.plot_isosurface(volume)</code> opens the
+same window. The older methods <code>method='pyvista'</code> and
+<code>method='plotly'</code> are still there. They are slow for a large volume. A call with
+<code>save_html</code> and no method uses Plotly, as before.</li>
+</ul>
 '''
 
 FILES = f'''
@@ -720,6 +805,7 @@ TOPICS: list[tuple[str, str, str]] = [
     ('grid', 'Grid, voxel size, binning and memory', GRID),
     ('advanced', 'Advanced settings', ADVANCED),
     ('viewer', 'Look at a volume', VIEWER),
+    ('view3d', 'Look at a volume in 3D', VIEW3D),
     ('files', 'Output files', FILES),
     ('glossary', 'Glossary', GLOSSARY),
 ]

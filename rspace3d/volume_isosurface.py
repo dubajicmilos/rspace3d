@@ -1,19 +1,23 @@
 """
-volume_isosurface.py — 3D isosurface visualization for reciprocal space volumes.
+volume_isosurface.py - 3D isosurface visualization for reciprocal space volumes.
 
-Uses Plotly (available) for interactive browser-based 3D rendering.
-Optionally uses PyVista (if installed) for higher-quality VTK rendering.
+The default method ('gl') opens the 3D view of rspace3d (view3d_window.py). It
+draws on the graphics card and needs no extra package. The two older methods
+are slow for a large volume: 'pyvista' makes a mesh with VTK for each level,
+and 'plotly' sends the volume to a browser.
 
 Usage:
-    from .volume_isosurface import plot_isosurface, plot_isosurface_pyvista
-    from volume_builder import load_volume_h5
+    from rspace3d.volume_isosurface import plot_isosurface
+    from rspace3d.volume_builder import load_volume_h5
 
     vol = load_volume_h5('sample_sym_mbar3m.h5')
-    plot_isosurface(vol, isovalue=50)                    # Plotly (browser)
+    plot_isosurface(vol)                                 # 3D view, automatic level
+    plot_isosurface(vol, isovalue=[50, 500])             # two surfaces
     plot_isosurface(vol, isovalue=50, method='pyvista')  # PyVista (VTK)
+    plot_isosurface(vol, isovalue=50, method='plotly')   # Plotly (browser)
 
     # Or from command line:
-    python volume_isosurface.py sample.h5 --iso 50
+    python -m rspace3d.volume_isosurface sample.h5 --iso 50
 """
 
 from __future__ import annotations
@@ -28,9 +32,9 @@ from .volume_builder import VolumeData, load_volume_h5
 def plot_isosurface(
     vol: VolumeData | str,
     isovalue: float | list[float] | None = None,
-    method: str = 'plotly',
+    method: str | None = None,
     colormap: str = 'plasma',
-    opacity: float = 0.6,
+    opacity: float | None = None,
     h_range: tuple[float, float] | None = None,
     k_range: tuple[float, float] | None = None,
     l_range: tuple[float, float] | None = None,
@@ -44,20 +48,37 @@ def plot_isosurface(
     vol : VolumeData or str
         Volume data or path to .h5 file.
     isovalue : float or list of float
-        Isosurface level(s). If None, uses 50th percentile of nonzero data.
+        Isosurface level(s). If None, 'gl' uses the level that 1 % of the
+        measured voxels are above, and the two older methods use the 50th
+        percentile of the nonzero data.
     method : str
-        'plotly' (default, browser-based) or 'pyvista' (VTK, higher quality).
+        'gl': the 3D view of rspace3d, drawn on the graphics card.
+        'pyvista' (VTK mesh) and 'plotly' (browser) are the older methods.
+        None (default) is 'gl', or 'plotly' if `save_html` is given (as before
+        rspace3d 2.10, when 'plotly' was the default).
     colormap : str
-        Colormap name.
+        Colormap name ('pyvista' and 'plotly').
     opacity : float
-        Surface opacity (0-1).
+        Surface opacity (0-1) of 'pyvista' and 'plotly'. None is 0.6. In the
+        3D view you set the opacity of each surface in the window.
     h_range, k_range, l_range : tuple (min, max)
-        Crop to subvolume before plotting.
+        Show this part of the volume only.
     title : str
         Plot title.
     save_html : str
         Save Plotly figure as HTML file (Plotly only).
     """
+    if method is None:
+        method = 'plotly' if save_html else 'gl'
+    if method not in ('gl', 'pyvista', 'plotly'):
+        raise ValueError(f"method must be 'gl', 'pyvista' or 'plotly', not {method!r}")
+    if method == 'gl':
+        from .view3d_window import show_volume
+        levels = None if isovalue is None else list(np.atleast_1d(isovalue).astype(float))
+        show_volume(vol, levels=levels, box=(h_range, k_range, l_range), title=title or '')
+        return
+    if opacity is None:
+        opacity = 0.6
     if isinstance(vol, str):
         vol = load_volume_h5(vol)
 
@@ -429,8 +450,9 @@ if __name__ == '__main__':
     parser.add_argument('--hrange', type=float, nargs=2, default=None, metavar=('MIN', 'MAX'))
     parser.add_argument('--krange', type=float, nargs=2, default=None, metavar=('MIN', 'MAX'))
     parser.add_argument('--lrange', type=float, nargs=2, default=None, metavar=('MIN', 'MAX'))
-    parser.add_argument('--method', choices=['plotly', 'pyvista'], default='plotly')
-    parser.add_argument('--opacity', type=float, default=0.6)
+    parser.add_argument('--method', choices=['gl', 'pyvista', 'plotly'], default=None,
+                        help="default: gl (the 3D view), or plotly with --save")
+    parser.add_argument('--opacity', type=float, default=None)
     parser.add_argument('--cmap', default='plasma')
     parser.add_argument('--save', default=None, help='Save as HTML (Plotly only)')
 

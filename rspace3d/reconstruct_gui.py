@@ -1114,6 +1114,7 @@ class ReconstructGUI(ui.Shell):
 
 
 def main() -> None:
+    ui.prepare_opengl()                             # for the 3D view of "Open in viewer"
     app = QApplication(sys.argv)
     app.setApplicationName('Raw-frame 3D Reconstruction')
     gui = ReconstructGUI()

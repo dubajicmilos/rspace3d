@@ -87,6 +87,8 @@ class UnifiedViewer(QMainWindow):
         # Last fixed-axis value used across all planes. Carried over when
         # switching plane so the viewer doesn't reset the cut to 0.
         self._last_cut_value: float | None = None
+        self._file_name: str = ''                   # name of the open file, not shortened
+        self._views3d: list = []                    # open 3D windows
 
         self._build_ui()
 
@@ -280,9 +282,9 @@ class UnifiedViewer(QMainWindow):
         self.export_btn = ui.button('Export image...', tip='Save the image to a file or copy '
                                     'it to the clipboard.', clicked=self._export)
         lay.addWidget(self.export_btn)
-        self.iso_btn = ui.button('3D isosurface...', tip='Show the volume as surfaces of '
-                                 'equal intensity in 3D.', clicked=self._show_isosurface)
-        lay.addWidget(self.iso_btn)
+        self.view3d_btn = ui.button('3D view...', tip='Show the volume in 3D: surfaces of equal '
+                                    'intensity or a projection.', clicked=self._show_3d)
+        lay.addWidget(self.view3d_btn)
         self.info_btn = ui.button('File information...', tip='Show the size, the ranges, the '
                                   'unit cell and the processing of the volume.',
                                   clicked=self._show_info)
@@ -408,7 +410,7 @@ class UnifiedViewer(QMainWindow):
             w.setEnabled(loaded)
         for w in (self.file_label, self.facts1, self.facts2):
             w.setVisible(loaded and (w is not self.facts2 or bool(w.text())))
-        self.iso_btn.setVisible(self._mode == 'vol')
+        self.view3d_btn.setVisible(self._mode == 'vol')
         self.info_btn.setVisible(self._mode == 'vol')
         self.vol_toolbar.setVisible(self._mode == 'vol')
         for spin in (self.xrange_spin, self.yrange_spin):
@@ -456,6 +458,7 @@ class UnifiedViewer(QMainWindow):
     def _set_summary(self, name, path, line1, line2=''):
         """Fill the file name, the facts in the panel and the summary in the status bar."""
         fm = QFontMetrics(self.file_label.font())
+        self._file_name = name
         self.file_label.setText(fm.elidedText(name, Qt.TextElideMode.ElideMiddle, 216))
         self.file_label.setToolTip(path)
         self.facts1.setText(line1)
@@ -1172,28 +1175,34 @@ class UnifiedViewer(QMainWindow):
                 self.cbar.ax.set_visible(True)
             self.main_canvas.draw_idle()
 
-    def _show_isosurface(self):
-        """Launch 3D isosurface viewer for the loaded volume."""
-        if self.vol is None:
-            return
-        # The two range boxes are the axes of the shown plane. The third axis is complete.
-        full = {'h': (float(self.vol.H[0]), float(self.vol.H[-1])),
-                'k': (float(self.vol.K[0]), float(self.vol.K[-1])),
-                'l': (float(self.vol.L[0]), float(self.vol.L[-1]))}
+    def _box_3d(self):
+        """The ranges (h, k, l) of the 3D box: the two range boxes for the axes of the shown
+        plane, and the complete third axis (None)."""
+        box = {'h': None, 'k': None, 'l': None}
         shown = {'HK': ('h', 'k'), 'HL': ('h', 'l'), 'KL': ('k', 'l')}[self._get_vol_plane_type()]
         for axis, spin in zip(shown, (self.xrange_spin, self.yrange_spin)):
-            full[axis] = (-spin.value(), spin.value())
+            box[axis] = (-spin.value(), spin.value())
+        return box['h'], box['k'], box['l']
+
+    def _show_3d(self):
+        """Open the 3D view of the loaded volume in its own window."""
+        if self.vol is None:
+            return
         try:
-            from .volume_isosurface import plot_isosurface
-            self.status.showMessage('Launching 3D isosurface...')
-            plot_isosurface(
-                self.vol, method='pyvista',
-                h_range=full['h'], k_range=full['k'], l_range=full['l'])
+            from .view3d_window import View3DWindow
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                win = View3DWindow(self.vol, title=self._file_name, box=self._box_3d())
+            finally:
+                QApplication.restoreOverrideCursor()
+            self._views3d.append(win)            # keep the window alive until it is closed
+            win.destroyed.connect(lambda _=None, w=win: self._views3d.remove(w)
+                                  if w in self._views3d else None)
+            win.show()
+            self.status.showMessage('The 3D view is open in its own window.')
         except Exception as e:
-            self.status.showMessage(f'Isosurface error: {e}')
-            ui.show_error(self, 'The 3D view did not open',
-                          f'The 3D isosurface needs PyVista or Plotly (pip install pyvista).\n'
-                          f'{type(e).__name__}: {e}')
+            self.status.showMessage(f'3D view error: {e}')
+            ui.show_error(self, 'The 3D view did not open', f'{type(e).__name__}: {e}')
 
     def _show_info(self):
         """Show volume metadata in a dialog."""
@@ -1296,6 +1305,7 @@ class UnifiedViewer(QMainWindow):
 
 
 def main() -> None:
+    ui.prepare_opengl()                             # for the 3D view
     app = QApplication(sys.argv)
     app.setApplicationName('RSP Viewer')
     fname = sys.argv[1] if len(sys.argv) > 1 else None

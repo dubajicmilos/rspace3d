@@ -25,6 +25,7 @@ from typing import Any, Callable
 from PyQt6.QtCore import QEvent, QObject, QPointF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QKeySequence, QPainter, QPalette, QPen, QPixmap, QPolygonF, QShortcut,
+    QSurfaceFormat,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QButtonGroup, QComboBox, QFormLayout,
@@ -204,6 +205,15 @@ QToolButton[role="help"] {
 QToolButton[role="help"]:hover, QToolButton[role="help"]:focus {
     color: @accent; border-color: @accent;
 }
+QToolButton[role="mini"] {
+    background: @surface; color: @muted; border: 1px solid @line2; border-radius: 12px;
+    font-weight: 600;
+    min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px;
+}
+QToolButton[role="mini"]:hover, QToolButton[role="mini"]:focus {
+    color: @accent; border-color: @accent;
+}
+QToolButton[role="mini"]:disabled { color: @disabled; border-color: @line; background: transparent; }
 QToolBar { background: transparent; border: 0; spacing: 2px; }
 QToolBar QToolButton { border: 0; border-radius: 4px; padding: 4px; }
 QToolBar QToolButton:hover { background: @pressed; }
@@ -370,6 +380,18 @@ def _palette() -> QPalette:
                  QPalette.ColorRole.ButtonText):
         pal.setColor(QPalette.ColorGroup.Disabled, role, color('disabled'))
     return pal
+
+
+def prepare_opengl() -> None:
+    """Ask for OpenGL 4.1 (core profile) for the 3D view. Call it before the QApplication is made.
+
+    Qt on macOS gives a core profile only if it is the format of the whole
+    application. On the other systems the 3D view also works without this call.
+    """
+    fmt = QSurfaceFormat()
+    fmt.setVersion(4, 1)
+    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+    QSurfaceFormat.setDefaultFormat(fmt)
 
 
 def ensure_theme() -> None:
