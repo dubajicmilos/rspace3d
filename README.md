@@ -265,6 +265,13 @@ standard settings* sets them again):
   full geometry from the peak table. Unticking it falls back to indexing
   frame 1 with the header geometry, which works only for clean datasets with a
   correct header and a vertical rotation axis.
+- *Correct the rotation axis*: leave this ticked. A second fit uses the
+  sub-pixel peak positions and selects the strong peaks again in each pass. It
+  finds a small tilt of the rotation axis that the first fit can miss, for
+  example for a crystal with split peaks at low temperature. The program uses
+  the correction only if the strong peaks are then nearer to integer hkl. The
+  log and the status line say if the axis was corrected, and by how much
+  (§4.2 of `rspace3d/rawrecon/README.md`).
 - *Use the GPU (CuPy)*: untick to force the CPU path.
 - *Solid-angle and polarisation corrections* (on by default), with the
   polarisation fraction (0.95 for a synchrotron, 0.5 for an unpolarised
@@ -344,6 +351,15 @@ In the log:
 
 - *best fit rms* is the residual of the geometry fit over the peak table, in
   Å⁻¹. Values around 0.001 to 0.002 Å⁻¹ are typical of a good fit.
+- *second fit* tells if the program used the second fit of the geometry. It
+  gives the intensity-weighted mean distance of the check peaks (strong peaks
+  that the second fit did not use) from integer hkl before and after the second
+  fit, and the angle by which the
+  rotation axis moved. The program uses the second fit only if the distance is
+  smaller in at least 95 % of the bootstrap resamples. The attribute
+  `geometry_method` of the volume file records the parts of the fit that were
+  used: `tabbin`, `tabbin_centroids`, `tabbin_second_fit` or
+  `tabbin_centroids_second_fit`.
 - *validation: fitted peaks -> integer hkl, median dev* should be a few
   hundredths of an r.l.u. The same line gives the value for the held-out peaks
   (the peaks that the fit did not use). If one of the two values is above

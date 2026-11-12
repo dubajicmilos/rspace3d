@@ -111,13 +111,16 @@ thousands of these correspondences by least squares:
    `r_lab(pixel; detector) − R_osc(Δφ; osc_axis, sense)·R0·(UB·hkl)`. The fit is
    tried for the 8 in-plane detector orientations × 2 senses × oscillation-axis
    seeds {Y, X, Z}, and the solution with the lowest residual is kept.
-5. Self-validate: map the tabbin peaks back to hkl through the fitted detector and
+5. Second fit (`refine=True`, the default; §4.2): use the sub-pixel centroids of the
+   tabbin, and fit the same parameters again. Each pass selects the peaks again, from
+   the strong peaks of the table that are not held out.
+6. Self-validate: map the tabbin peaks back to hkl through the fitted detector and
    check that they land on integers. The median deviation is reported, and the
    function raises an error if it exceeds 0.1 rlu.
 
 The function returns a
 `FittedGeometry(detector, UB, R0, osc_axis, sense, phi0, increment, rms,
-n_peaks, median_hkl_dev)`.
+n_peaks, median_hkl_dev, ..., centroids, refined, n_peaks_refined, axis_change_deg)`.
 
 ### 4.1 The pixel-mapping ambiguity and how it is resolved
 
@@ -136,6 +139,85 @@ peaks, it tests all 8 transpose/flip options against the actual CBF-frame intens
 and keeps the mapping under which the peaks land on bright pixels of the frame. On
 both test datasets (§7) the grounding selects the mapping `TXY` (transpose + x-flip +
 y-flip) relative to fabio's `(row,col)`.
+
+### 4.2 The second fit
+
+The first fit (step 4) selects its peaks one time, with the reciprocal vectors of the
+tabbin and the UB of the par. The par UB or the instrument model of CrysAlisPro can be
+wrong for a dataset. Then this selection keeps only the peaks that agree with the wrong
+model, and the fit cannot find the full error of the oscillation axis. On a crystal
+with split peaks below a phase transition, the first fit found only one third to one
+half of an axis error of about 0.2°. The peaks of the reconstruction were then wider
+and not at integer hkl.
+
+The second fit removes this limit. It has four parts.
+
+1. **Centroids.** The tabbin stores each peak as an integer pixel and a sub-pixel
+   centroid. The first fit is done again with `px + cenx`, `py + ceny`. A centroid that
+   is not a finite number gives the integer pixel. The function uses the centroids only
+   if the held-out clean peaks then have a smaller residual. A table with another
+   centroid convention thus cannot make the fit worse.
+2. **Selection again in each pass** (`_refine_reselect`). Each pass calculates the hkl
+   of each peak through the geometry of the pass before. It gives the peak the nearest
+   integer hkl and fits the peaks nearer than a limit. The limits are 0.25, 0.15, 0.10,
+   0.07 and 0.05 rlu (`REFINE_SCHEDULE`). The parameters are those of the first fit.
+   The UB of the par does not change.
+3. **Strong peaks only.** The passes use the 30 % strongest peaks of the table, by rank
+   (`REFINE_STRONG_FRACTION`, `_strongest`). The weak entries of a table are tails of
+   peaks and diffuse maxima. A fit with them moved the strong peaks away from integer
+   hkl on one of five test datasets.
+4. **Check** (`_second_fit_is_better`). The second fit does not use the held-out clean
+   peaks of the first fit and each 5th peak of the table in scan order. The check peaks
+   are the strong peaks among them that are within 0.1 rlu of an integer hkl after the
+   fit before the second fit. Some check peaks were fitted by the first fit, so the check
+   favours the first fit a little. For each geometry, the function calculates the distance of
+   each check peak from its integer hkl in Å⁻¹, and the mean of these distances with
+   the peak intensity as the weight. The reconstruction adds the intensity of each pixel
+   to its voxel, so a strong peak far from its node blurs the volume more than a weak
+   peak. The function uses the second fit only if this weighted mean is smaller in at
+   least 95 % of 1000 bootstrap resamples of the check peaks (`REFINE_CONFIDENCE`). The
+   seed is fixed, so the result is the same in each run.
+
+If the second fit makes the clean peaks fail the self-check of step 6 and the fit
+before passes, the fit before the second fit stays. In all other cases that do not use
+the second fit, the result is the fit before the second fit: the first fit, with the
+centroids if they were used. `FittedGeometry.centroids`, `FittedGeometry.refined` and
+the log lines `sub-pixel centroids: ...` and `second fit: ...` tell you which fit was
+used. The attribute `geometry_method` of the volume file records it: `tabbin`,
+`tabbin_centroids`, `tabbin_second_fit` or `tabbin_centroids_second_fit`. If the second
+fit was used, `FittedGeometry.rms` and `n_peaks` are those of its last pass.
+`refine=False` gives the first fit only.
+
+**Why a weighted mean and a bootstrap.** The rule was chosen with reconstructions of 16
+datasets (I15 PILATUS3 2M and I19-2 Eiger 2X 4M). Each dataset was reconstructed with
+the first fit only and with the second fit. The peak height, the peak width and the
+distance of the peak centroid from the node were compared at about 400 to 1100 integer
+nodes per dataset. A rule with the median distance in rlu, without weights, used the
+second fit for two datasets whose volume became worse. The rule above used it for no
+such dataset. It did not use the second fit for one dataset with a small gain (peaks
+6 % higher).
+
+Result on five scans of one MAPbIBr2 crystal (I15, PILATUS3 2M, 270 to 120 K). The
+crystal has a superstructure and split peaks below 230 K. The distance is the
+intensity-weighted mean distance of the check peaks from integer hkl.
+
+| T (K) | peaks, first fit → last pass | axis moved (deg) | distance (Å⁻¹) | resamples with a smaller distance |
+|---|---|---|---|---|
+| 270 | 2867 → 723 | 0.0029 | 0.00081 → 0.00075 | 100.0 % |
+| 230 | 3024 → 2629 | 0.0063 | 0.00113 → 0.00110 | 99.9 % |
+| 180 | 1961 → 4150 | 0.1068 | 0.00203 → 0.00160 | 100.0 % |
+| 150 | 1371 → 4999 | 0.1659 | 0.00246 → 0.00180 | 100.0 % |
+| 120 | 1480 → 5967 | 0.1721 | 0.00269 → 0.00208 | 100.0 % |
+
+At 150 K the reconstruction with the second fit has, at 984 integer nodes, peaks that
+are 1.25 times higher and 4 % narrower (median). The peak centroids are 0.0073 rlu
+from the nodes, against 0.0109 rlu with the first fit only. The second fit does not
+make one lattice from a split crystal: the peaks of such a crystal stay wide.
+
+In the reconstruction window the second fit is the option *Correct the rotation axis*
+(Advanced page, on by default). In Python it is `reconstruct_dataset(...,
+refine_geometry=True)` (the default). `info['axis_correction_deg']` gives the angle of
+the correction, 0.0 if the second fit was not used.
 
 ---
 
@@ -218,8 +300,8 @@ agrees with the independent route.
 
 | Symbol | Module | Purpose |
 |--------|--------|---------|
-| `reconstruct_dataset(folder, *, ranges, step, bins, use_tabbin, corrections, hot, use_gpu, nframes, ...)` | `engine` | one-call: geometry + reconstruction → `(Volume, info)`. Voxel centres are multiples of `step` × `bins`, so hkl = 0 is a voxel centre after `bin_volume(vd, *bins)` and all Laue groups stay exact |
-| `geometry_from_tabbin(folder) -> FittedGeometry` | `calibrate` | instrument-agnostic geometry fit from the tabbin |
+| `reconstruct_dataset(folder, *, ranges, step, bins, use_tabbin, refine_geometry, corrections, hot, use_gpu, nframes, ...)` | `engine` | one-call: geometry + reconstruction → `(Volume, info)`. Voxel centres are multiples of `step` × `bins`, so hkl = 0 is a voxel centre after `bin_volume(vd, *bins)` and all Laue groups stay exact |
+| `geometry_from_tabbin(folder, *, par_path, tab_path, clean_tol, rms_ok, refine=True, log) -> FittedGeometry` | `calibrate` | instrument-agnostic geometry fit from the tabbin; `refine=True` adds the second fit (§4.2) |
 | `orient_from_frame(par, frame1) -> (det, UB, R0, phi0, idx)` | `geometry` | per-frame auto-index (with quality gate) |
 | `reconstruct_volume_gpu / reconstruct_volume(frames, phis, UB, R0, det, *, phi0, osc_axis, sense, ranges, step, bins, hot, corrections, ...)` | `engine` | the core GPU / CPU histogram engine |
 | `reconstruct_to_volumedata(vol) -> VolumeData` | `engine` | wrap as an rspace3d `VolumeData` (NaN = unmeasured) |

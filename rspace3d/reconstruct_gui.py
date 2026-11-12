@@ -171,7 +171,7 @@ class ReconstructGUI(ui.Shell):
         for w in (self.hmin, self.hmax, self.kmin, self.kmax, self.lmin, self.lmax, self.dq,
                   self.nframes, self.hot, self.pol_frac):
             w.valueChanged.connect(self._on_setup_changed)
-        for w in (self.corr_chk, self.tabbin_chk):
+        for w in (self.corr_chk, self.tabbin_chk, self.axis_chk):
             w.toggled.connect(self._on_setup_changed)
         self.save_raw_chk.toggled.connect(self._update_files_label)
         self.avg_settings.changed.connect(self._update_avg_label)
@@ -381,6 +381,16 @@ class ReconstructGUI(ui.Shell):
         fa.addRow(self.tabbin_chk)
         ui.form_hint(fa, 'The fit uses the peaks of *_peakhunt.tabbin. Untick it only for a '
                          'clean dataset with a correct frame header.')
+        self.axis_chk = QCheckBox('Correct the rotation axis (recommended)')
+        self.axis_chk.setChecked(True)
+        self.axis_chk.setToolTip(
+            'A second fit to the strong peaks of the peak table. It finds a small\n'
+            'tilt of the rotation axis that the first fit can miss, for example\n'
+            'for a crystal with split peaks at low temperature.')
+        self.tabbin_chk.toggled.connect(self.axis_chk.setEnabled)
+        fa.addRow(self.axis_chk)
+        ui.form_hint(fa, 'The program corrects the axis only if the peaks are then nearer to '
+                         'integer hkl. The log says if it did.')
         self.gpu_chk = QCheckBox('Use the GPU (CuPy)'); self.gpu_chk.setChecked(True)
         self.gpu_chk.setToolTip('Reconstruct on the GPU via CuPy (tens of seconds for\n'
                                 'a full scan). Uncheck to force the CPU path.')
@@ -447,6 +457,7 @@ class ReconstructGUI(ui.Shell):
     def _reset_advanced(self):
         self.nframes.setValue(0)
         self.tabbin_chk.setChecked(True)
+        self.axis_chk.setChecked(True)
         self.gpu_chk.setChecked(bool(HAS_GPU))
         self.corr_chk.setChecked(True)
         self.pol_frac.setValue(0.95)
@@ -728,7 +739,8 @@ class ReconstructGUI(ui.Shell):
         """The settings that change the reconstruction (not the GPU switch)."""
         return repr((self._folder, self._par, self._ranges(), self.dq.value(), self._bins(),
                      self.nframes.value(), self._corrections(), self.hot.value(),
-                     self.tabbin_chk.isChecked()))
+                     self.tabbin_chk.isChecked(),
+                     self.tabbin_chk.isChecked() and self.axis_chk.isChecked()))
 
     def _grid_ok(self):
         if any(hi <= lo for lo, hi in self._ranges()):
@@ -768,7 +780,8 @@ class ReconstructGUI(ui.Shell):
         self._retire_worker()
         self._worker = WorkerThread(self._do_reconstruct, self._folder, r,
                                     self.dq.value(), self._bins(), nframes, corr, hot,
-                                    use_gpu, self._par, self.tabbin_chk.isChecked())
+                                    use_gpu, self._par, self.tabbin_chk.isChecked(),
+                                    self.axis_chk.isChecked())
         self._worker.progress.connect(self._update_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_recon_done)
@@ -777,19 +790,34 @@ class ReconstructGUI(ui.Shell):
         self._worker.start()
 
     def _do_reconstruct(self, folder, ranges, step, bins, nframes, corr, hot, use_gpu,
-                        par_path, use_tabbin):
+                        par_path, use_tabbin, correct_axis=True):
         log = lambda m: QThread.currentThread()._emit_log(m)     # type: ignore[union-attr]
         cb = QThread.currentThread()._emit_progress             # type: ignore[union-attr]
         vol, info = rawrecon.reconstruct_dataset(
             folder, ranges=ranges, step=step, bins=bins, nframes=nframes, corrections=corr,
             hot=hot, use_gpu=use_gpu, par_path=par_path, use_tabbin=use_tabbin,
-            progress_callback=cb, log=log, keep_setup=True, cancelled=lambda: self._cancel)
+            refine_geometry=correct_axis, progress_callback=cb, log=log, keep_setup=True,
+            cancelled=lambda: self._cancel)
         info['bragg_rms'] = rawrecon.bragg_registration_rms(vol)
+        info['axis_off'] = bool(use_tabbin and not correct_axis)
         provenance = {k: info[k] for k in ('polarization_axis', 'hot_pixel_cutoff',
                                            'geometry_method') if info.get(k) is not None}
         vd = rawrecon.reconstruct_to_volumedata(vol, source_folder=folder,
                                                 extra_meta=provenance)
         return vol, vd, info
+
+    @staticmethod
+    def _axis_text(info):
+        """One sentence about the correction of the rotation axis, or '' if the
+        geometry did not come from the peak table."""
+        if info.get('axis_off'):
+            return 'The correction of the rotation axis is off.'
+        deg = info.get('axis_correction_deg')
+        if deg is None:
+            return ''
+        if deg > 0:
+            return f'The rotation axis was corrected by {deg:.3f} deg.'
+        return 'The rotation axis was not corrected.'
 
     def _cancel_run(self):
         if self._busy:
@@ -821,8 +849,12 @@ class ReconstructGUI(ui.Shell):
         rms = i.get('bragg_rms', float('nan'))
         self._log(f'  Bragg registration RMS {rms:.4f} rlu (voxel {self.dq.value()}) '
                   f'- {"OK, sub-voxel" if rms < self.dq.value() else "check orientation"}')
+        axis = self._axis_text(i)
+        if axis:
+            self._log(f'  {axis}')
         self._set_busy(False)
-        self.set_status(f'Reconstructed {self._vd.intensity.shape} in {i["time_s"]:.0f} s')
+        self.set_status(f'Reconstructed {self._vd.intensity.shape} in {i["time_s"]:.0f} s.'
+                        + (f' {axis}' if axis else ''))
         if self._pending_save:
             self._pending_save = False
             self._symmetrize_save(confirmed=True)

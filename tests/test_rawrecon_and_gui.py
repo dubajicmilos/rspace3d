@@ -255,6 +255,26 @@ def test_reconstruct_gui_clears_previous_volume_on_folder_change(qapp, tmp_path)
     assert gui.hot.value() == 0                           # no hot-pixel clip by default
 
 
+def test_reconstruct_gui_axis_correction_option(qapp, tmp_path):
+    from rspace3d.reconstruct_gui import ReconstructGUI
+    gui = ReconstructGUI()
+    assert gui.axis_chk.isChecked() and gui.axis_chk.isEnabled()      # on by default
+    key = gui._settings_key()
+    gui.axis_chk.setChecked(False)
+    assert gui._settings_key() != key                     # a change reconstructs again
+    gui.tabbin_chk.setChecked(False)
+    assert not gui.axis_chk.isEnabled()                   # it needs the peak table
+    gui._reset_advanced()
+    assert gui.axis_chk.isChecked() and gui.axis_chk.isEnabled()
+    # the sentence of the result
+    text = ReconstructGUI._axis_text
+    assert text({'axis_correction_deg': 0.1659}) == 'The rotation axis was corrected by 0.166 deg.'
+    assert text({'axis_correction_deg': 0.0}) == 'The rotation axis was not corrected.'
+    assert text({'axis_correction_deg': 0.0, 'axis_off': True}) == (
+        'The correction of the rotation axis is off.')
+    assert text({'axis_correction_deg': None}) == '' and text({}) == ''
+
+
 def test_reconstruct_gui_builds_the_grid_for_its_bin_factors(qapp):
     from rspace3d.reconstruct_gui import ReconstructGUI
     gui = ReconstructGUI()

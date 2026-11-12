@@ -744,7 +744,7 @@ def test_reconstruct_gui_standard_falls_back_when_the_fit_fails(qapp, monkeypatc
 
 def _fake_recon(calls, vol):
     """A stand-in for ReconstructGUI._do_reconstruct: records the call, returns `vol`."""
-    def run(folder, ranges, step, bins, nframes, corr, hot, use_gpu, par, tabbin):
+    def run(folder, ranges, step, bins, nframes, corr, hot, use_gpu, par, tabbin, axis=True):
         calls.append((ranges, step, bins))
         info = {'name': 'x', 'time_s': 1.0, 'ms_per_frame': 1.0, 'gpu': False,
                 'index_rms': 0.0, 'index_inliers': 0, 'measured_voxels': 1,

@@ -546,7 +546,7 @@ def gpu_memory_bytes(n_voxels: int, halves: bool = False) -> int:
 def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
                   step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
                   hot=None, device=0, prefetch=4, par_path=None, use_tabbin=False,
-                  log=None) -> ReconSetup:
+                  refine_geometry=True, log=None) -> ReconSetup:
     """Find the frames and the par file of `folder`, get the geometry and make a `ReconSetup`.
 
     The arguments are those of `reconstruct_dataset`. The function does not
@@ -572,12 +572,19 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
         raise ValueError(f"nframes must be between 1 and {n_total}, got {nframes}")
     frames, nums = all_frames[:n], all_nums[:n]
 
+    geometry_method, axis_correction = "indexed_first_frame", None
     if use_tabbin:
         from .calibrate import geometry_from_tabbin
-        fg = geometry_from_tabbin(folder, par_path=par_path, log=say)
+        fg = geometry_from_tabbin(folder, par_path=par_path, refine=refine_geometry, log=say)
         det, UB, R0 = fg.detector, fg.UB, fg.R0
         osc_axis, sense, phi0, incr = fg.osc_axis, fg.sense, fg.phi0, fg.increment
         geom_rms, geom_inl, geom_dev = fg.rms, fg.n_peaks, fg.median_hkl_dev
+        # The volume file records the parts of the geometry fit that were used:
+        # "tabbin", "tabbin_centroids", "tabbin_second_fit" or
+        # "tabbin_centroids_second_fit".
+        geometry_method = ("tabbin" + ("_centroids" if fg.centroids else "")
+                           + ("_second_fit" if fg.refined else ""))
+        axis_correction = float(fg.axis_change_deg) if fg.refined else 0.0
         say(f"tabbin geometry: beam ({det.beam_center[0]:.1f},{det.beam_center[1]:.1f}) "
             f"dist {det.distance:.1f}mm, osc {tuple(round(x,3) for x in osc_axis)} "
             f"sense {sense:+d}, rms {geom_rms:.4f} 1/A on {geom_inl} peaks")
@@ -624,8 +631,9 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
         "par": par_path, "name": name, "folder": folder, "n_total": n_total,
         "index_rms": geom_rms, "index_inliers": geom_inl, "geom_hkl_dev": geom_dev,
         "cell": cell, "polarization_axis": polarization_axis,
-        "geometry_method": "tabbin" if use_tabbin else "indexed_first_frame",
+        "geometry_method": geometry_method,
         "missing_frame_numbers": missing,
+        "axis_correction_deg": axis_correction,
     }
     return ReconSetup(frames=list(frames), numbers=[int(v) for v in nums], phis=phis,
                       detector=det, UB=UB, R0=R0, phi0=phi0, osc_axis=osc_axis,
@@ -637,8 +645,8 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
 def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
                         step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
                         hot=None, use_gpu=True, device=0, prefetch=4, par_path=None,
-                        use_tabbin=False, progress_callback=None, log=None,
-                        halves=False, cancelled=None, keep_setup=False):
+                        use_tabbin=False, refine_geometry=True, progress_callback=None,
+                        log=None, halves=False, cancelled=None, keep_setup=False):
     """One call: locate the cracker par + CBF frames, read the UB, get the
     orientation, and reconstruct. Returns (Volume, info_dict).
 
@@ -647,6 +655,11 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
         instrument-agnostic and robust to a wrong header or powder contamination.
         If False, index frame 1 (orient_from_frame) assuming the header geometry and
         a lab-Y oscillation axis (works for clean, correctly-headered datasets).
+    refine_geometry : with use_tabbin, True (default) lets the geometry fit
+        correct the rotation axis with the second fit (calibrate.geometry_from_tabbin,
+        refine). The fit uses the correction only if it puts the strong peaks nearer
+        to integer hkl. info['axis_correction_deg'] is the angle of the correction
+        (0.0 if the fit did not use it).
     par_path : explicit .par to use (e.g. in a subfolder); else searched in `folder`.
         It is also the par the tabbin calibration uses.
     bins : (bh, bk, bl) factors that you will give to `bin_volume` before
@@ -678,7 +691,7 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
     setup = prepare_setup(folder, ranges=ranges, step=step, bins=bins, nframes=nframes,
                           corrections=corrections, hot=hot, device=device,
                           prefetch=prefetch, par_path=par_path, use_tabbin=use_tabbin,
-                          log=log)
+                          refine_geometry=refine_geometry, log=log)
     n, n_total = setup.n_frames, setup.meta["n_total"]
     gpu = use_gpu and has_cupy(device)
     say(f"reconstructing {n}/{n_total} frames on {'GPU' if gpu else 'CPU'}, "
@@ -701,6 +714,7 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
         "polarization_axis": m["polarization_axis"],
         "hot_pixel_cutoff": hot,
         "geometry_method": m["geometry_method"],
+        "axis_correction_deg": m.get("axis_correction_deg"),
         "missing_frame_numbers": m["missing_frame_numbers"],
     }
     if keep_setup:

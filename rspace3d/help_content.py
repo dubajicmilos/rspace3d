@@ -155,6 +155,10 @@ reconstruction. <b>Open in viewer</b> opens the last saved symmetrised volume.</
 <ul>
 <li><i>best fit rms</i> is the residual of the geometry fit, in 1/&Aring;. Values near 0.001
 to 0.002 are typical of a good fit.</li>
+<li><i>second fit</i> tells if the program used the second fit of the geometry. It gives the
+intensity-weighted mean distance of the check peaks (strong peaks that the second fit did
+not use) from integer hkl before and after the second fit, and the angle by which the rotation axis moved. The program uses the
+second fit only if the distance is smaller in at least 95 % of the bootstrap resamples.</li>
 <li><i>validation: fitted peaks -&gt; integer hkl, median dev</i> is a few hundredths of an
 r.l.u. for a good fit. The same line gives the value for the peaks that the fit did not use
 (<i>held-out</i>). If one of the two values is above 0.1 r.l.u., the run stops.</li>
@@ -568,6 +572,14 @@ the position of the detector, the rotation axis and the orientation to the peak 
 works with a wrong distance or beam centre in the frame header, and with powder rings.
 Without it, the program uses the frame header, which works only for a clean dataset with a
 correct header.</td></tr>
+<tr><td>Correct the rotation axis</td><td>Keep it ticked. After the first fit, a second fit
+uses the sub-pixel positions of the strong peaks and selects them again in each pass. It
+finds a small tilt of the rotation axis that the first fit can miss, for example for a
+crystal with split peaks at low temperature. The program uses the correction only if it
+puts the check peaks nearer to integer hkl. If it does not, the result is the
+same as without the correction. The log and the status line say if the axis was
+corrected, and by how much. Untick it to compare with a reconstruction without the
+correction.</td></tr>
 <tr><td>Use the GPU</td><td>Untick it to use the CPU. The result is the same. The CPU needs
 about 1 s for each frame on a 481 x 481 x 481 grid.</td></tr>
 <tr><td>Solid-angle and polarisation corrections</td><td>Each pixel is multiplied by the
