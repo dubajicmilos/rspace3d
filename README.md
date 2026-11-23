@@ -215,6 +215,10 @@ the help for the page that you see.
    the window shows a note. When you load a folder, it then selects the group
    of highest order that the cell allows. The metric cannot tell a cubic cell
    from a cell with a small distortion, so the choice of the group stays yours.
+   For 4/m and 4/mmm a second choice, *4-fold axis*, shows: c (the standard),
+   a or b. A pseudo-cubic cell metric cannot tell which axis is the 4-fold
+   axis. Select the axis of the tetragonal phase. The file name then gets the
+   axis, for example `<name>_recon_sym_4mmm_a.h5`.
 
 4. **Averaging and outlier rejection.** The line shows the option that the
    symmetrise step uses. The standard for raw frames is
@@ -259,7 +263,16 @@ saved symmetrised volume.
 **Advanced page** (the defaults are the standard settings; *Reset to the
 standard settings* sets them again):
 
-- *Frames to use* (0 = all): use fewer frames for a quick test.
+- *Frames to use*: empty or `all` uses all frames. One number n uses the
+  first n frames, for a quick test. Frame numbers and ranges select frames,
+  for example `1-369, 901-1289` to omit frames with contamination. A range
+  includes its two ends, and the numbers are those of the file names. Each
+  frame keeps its own angle. The geometry fit uses the full peak table. A note
+  under the field shows a wrong text, and the window does not start a run with
+  it. The dataset facts show the count of selected frames. The frame tools and
+  the split-half check use only the selected frames. The log and the volume
+  files record the selection (attributes `frame_selection`, `n_frames_used`,
+  `n_frames_total`).
 - *Search subfolders for the .par file*.
 - *Geometry from the CrysAlisPro peak table*: leave this ticked. It fits the
   full geometry from the peak table. Unticking it falls back to indexing
@@ -324,10 +337,13 @@ vol, info = rawrecon.reconstruct_dataset(
     log=print)                            # progress lines
 
 print(info["index_rms"], info["geom_hkl_dev"], info["measured_voxels"])
+# Only some frames: frames="1-369, 901-1289" (frame numbers of the file names).
+# info["frame_selection"] is the normalised text, info["n_frames"] the count.
 print("Bragg registration RMS (rlu):", rawrecon.bragg_registration_rms(vol))
 
 # vol.data is (nh, nk, nl) float32 with NaN where unmeasured; vol.H/K/L are the axes.
-vd = rawrecon.reconstruct_to_volumedata(vol, source_folder=folder)
+vd = rawrecon.reconstruct_to_volumedata(vol, source_folder=folder,
+                                        extra_meta=rawrecon.frame_metadata(info))
 save_volume_h5("sample_recon_raw.h5", vd)
 
 vd2 = bin_volume(vd, 2, 2, 2)                       # optional
@@ -967,6 +983,17 @@ its `counts` (1 if there are no counts) and propagates the variance as
 | 6/mmm | hexagonal | 24 |
 | m-3 | cubic | 24 |
 | m-3m | cubic | 48 |
+| 4/m_a, 4/m_b | tetragonal, 4-fold axis along a or b | 8 |
+| 4/mmm_a, 4/mmm_b | tetragonal, 4-fold axis along a or b | 16 |
+
+The keys `4/m` and `4/mmm` have the 4-fold axis along c. The 4-fold rotation
+about a maps (h, k, l) to (h, -l, k); about b it maps (h, k, l) to (l, k, -h).
+An operation that exchanges two axes needs the same voxel step on them, as for
+m-3m. If the steps differ (for example bin factors of 2 for h, k and 1 for l), the
+operations that exchange these axes use the nearest voxel, with an error up to half a
+voxel, and the log says so. Use the same bin factor on all axes for exact results. On a grid with unequal ranges (for example h, k from -7.4 to 7.4 and l
+from -6 to 6), a member that is outside the grid is not used; the voxel gets
+the mean of its members inside the grid.
 
 ## How the hkl grid is computed for .img layers
 

@@ -26,7 +26,7 @@ import sys
 from typing import Any
 import numpy as np
 import numpy.typing as npt
-from .volume_builder import VolumeData, load_volume_h5
+from .volume_builder import VolumeData, load_volume_h5, laue_display_name
 
 
 def plot_isosurface(
@@ -92,7 +92,7 @@ def plot_isosurface(
         laue = vol.metadata.get('laue_group', '')
         title = f'Isosurface at I={isovalue:.0f}'
         if laue:
-            title += f' ({laue})'
+            title += f' ({laue_display_name(laue)})'
 
     if method == 'pyvista':
         _plot_pyvista(data, H, K, L, isovalue, colormap, opacity, title)

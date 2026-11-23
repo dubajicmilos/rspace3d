@@ -275,6 +275,10 @@ residual must not be more than {METRIC_TOLERANCE:g}). If the metric does not all
 selected group when you load a folder, the window selects the allowed group of highest
 order. It also shows a note. The metric cannot tell a cubic cell from a cell with a small
 distortion, so the choice of the group stays yours.</p>
+<p>For 4/m and 4/mmm the raw-frame window shows a second choice, <b>4-fold axis</b>: c (the
+standard), a or b. A pseudo-cubic cell metric cannot tell which axis is the 4-fold axis.
+Select the axis of the tetragonal phase. The key then gets the axis, for example
+<code>4/mmm_a</code>, and the file name too (<code>_recon_sym_4mmm_a.h5</code>).</p>
 {_table(['Laue group', 'Name in the list', 'Operations'], _laue_rows(), [20, 55, 25])}
 <p>The number of operations is the largest number of members of an orbit. A voxel on a mirror
 plane or on a rotation axis has fewer different members.</p>
@@ -485,6 +489,13 @@ first.</p>
      '1', 'no'],
 ], [18, 46, 20, 16])}
 
+<h2>A frame selection</h2>
+<p>If <i>Frames to use</i> on the Advanced page selects frames, the frame tools use only
+these frames, in scan order. The rows of the frame map are the selected frames, without the
+omitted frames. The ring detection compares each frame with its neighbours in the selection,
+so it runs over the joins between the groups of frames. The split-half check divides the
+selected frames by the parity of the frame number.</p>
+
 <h2>The volume in use</h2>
 <p>The list in the section <b>Volume in use</b> selects the volume that Measure, Compare and
 the save steps use. It has the uncorrected volume and the volumes that Ring mask and Frame
@@ -563,8 +574,12 @@ again.</p>
 <table class="grid" cellspacing="0" cellpadding="6" width="100%">
 <col width="30%"><col width="70%">
 <tr><th align="left">Setting</th><th align="left">What it does and when to change it</th></tr>
-<tr><td>Frames to use</td><td>The number of frames. 0 uses all frames. Use fewer frames for
-a quick test.</td></tr>
+<tr><td>Frames to use</td><td>Empty or <i>all</i> uses all frames. One number n uses the
+first n frames, for a quick test. Frame numbers and ranges select frames, for example
+<code>1-369, 901-1289</code> to omit frames with contamination. A range includes its two
+ends. Only frame 5: <code>5-5</code> (the text <code>5</code> is the first 5 frames). The numbers are those of the file names. Each frame keeps its own angle, and the
+geometry fit uses the full peak table. The frame tools and the split-half check use only the
+selected frames. The log and the files record the selection.</td></tr>
 <tr><td>Search subfolders for the .par file</td><td>Tick it if the
 <code>*_cracker.par</code> is in a subfolder of the dataset folder.</td></tr>
 <tr><td>Geometry from the CrysAlisPro peak table</td><td>Keep it ticked. The program fits

@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from typing import Any, Callable
@@ -31,7 +32,7 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout,
-    QLabel, QMessageBox, QSpinBox,
+    QLabel, QLineEdit, QMessageBox, QSpinBox,
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
@@ -41,6 +42,7 @@ from .averaging_panel import AveragingPanel, AveragingSettings, engine_name
 from .volume_builder import (
     bin_volume, symmetrize_volume, save_volume_h5, format_symmetry_diagnostics,
     fitting_laue_group, LAUE_GROUP_NAMES, METRIC_TOLERANCE, _EXPECTED_ORDERS, HAS_GPU,
+    AXIS_GROUPS, laue_key, split_laue_key, laue_display_name, inexact_mapping_note,
 )
 
 STANDARD_WHY = (
@@ -113,6 +115,8 @@ class ReconstructGUI(ui.Shell):
         self._folder: str | None = None
         self._par: str | None = None
         self._n_total: int = 0
+        self._numbers: list[int] = []     # frame numbers of the scan
+        self._facts: dict[str, str] = {}  # the dataset facts
         self._vol = None        # rawrecon.Volume
         self._vd = None         # VolumeData (raw, NaN = unmeasured)
         self._info: dict | None = None
@@ -121,6 +125,7 @@ class ReconstructGUI(ui.Shell):
         self._grid_note: tuple[str, str] | None = None     # a problem of the grid, for the run note
         self._binned: dict | None = None   # binned volume of the Averaging panel: key, vol
         self._gpu_free_gb = 0.0
+        self._frames_applied = None  # the frames of the last applied text of 'Frames to use'
         self._frame_stale = False   # True: the grid or the frames changed after the reconstruction
         self._recip = None          # reciprocal basis of the .par (columns a*, b*, c*)
         self._recon_key: str | None = None     # settings of the reconstruction in memory
@@ -160,6 +165,7 @@ class ReconstructGUI(ui.Shell):
         self.add_help_page('raw-frames')
 
         self.laue_combo.currentIndexChanged.connect(self._on_laue_changed)
+        self.axis_combo.currentIndexChanged.connect(self._on_laue_changed)
         for w in (self.hmin, self.hmax, self.kmin, self.kmax, self.lmin, self.lmax, self.dq,
                   self.bin_xy, self.bin_z):
             w.valueChanged.connect(self._update_estimate)
@@ -169,8 +175,10 @@ class ReconstructGUI(ui.Shell):
         # A change of the grid, the frames or the pixel options makes the frame
         # tools results of the last reconstruction stale
         for w in (self.hmin, self.hmax, self.kmin, self.kmax, self.lmin, self.lmax, self.dq,
-                  self.nframes, self.hot, self.pol_frac):
+                  self.hot, self.pol_frac):
             w.valueChanged.connect(self._on_setup_changed)
+        self.nframes.textChanged.connect(self._on_frames_changed)
+        self.nframes.editingFinished.connect(self._apply_frames_change)
         for w in (self.corr_chk, self.tabbin_chk, self.axis_chk):
             w.toggled.connect(self._on_setup_changed)
         self.save_raw_chk.toggled.connect(self._update_files_label)
@@ -259,7 +267,21 @@ class ReconstructGUI(ui.Shell):
             'needs a lower group. The window checks only that the cell metric\n'
             'allows the group: the metric cannot tell a cubic cell from a cell\n'
             'with a small distortion.')
-        s3.add(ui.row('Laue group', self.laue_combo))
+        # The 4-fold axis: a second row, only for 4/m and 4/mmm
+        self.axis_combo = QComboBox()
+        for text, axis in (('c (standard)', 'c'), ('a', 'a'), ('b', 'b')):
+            self.axis_combo.addItem(text, axis)
+        self.axis_combo.setToolTip(
+            'The crystal axis of the 4-fold rotation of 4/m and 4/mmm.\n'
+            'A pseudo-cubic cell metric cannot tell which axis it is.\n'
+            'Select the axis of the tetragonal phase.')
+        self.axis_hint = ui.hint('Axis of the tetragonal phase. A pseudo-cubic cell metric cannot show it.')
+        self._axis_row = ui.row(self.axis_combo, self.axis_hint)
+        self.laue_form = ui.form()
+        self.laue_form.addRow('Laue group', self.laue_combo)
+        self.laue_form.addRow('4-fold axis', self._axis_row)
+        self._show_axis_rows(False)
+        s3.add(self.laue_form)
         s3.add_hint('The average uses this symmetry. Select the group of the phase. An '
                     'experiment that breaks the symmetry needs a lower group.')
         self.laue_note = s3.add(ui.Banner('warn'))
@@ -357,13 +379,18 @@ class ReconstructGUI(ui.Shell):
     def _build_advanced_page(self):
         ga = ui.Section('Frames and geometry', help_topic='advanced')
         fa = ui.form()
-        self.nframes = QSpinBox(); self.nframes.setRange(0, 100000); self.nframes.setValue(0)
-        self.nframes.setSpecialValueText('all')
-        self.nframes.setToolTip('Number of rotation frames to use. 0 = all frames in\n'
-                                'the folder (recommended for full coverage). Use fewer\n'
-                                'frames for a quick test.')
+        self.nframes = QLineEdit()
+        self.nframes.setPlaceholderText('all')
+        self.nframes.setMinimumWidth(220)
+        self.nframes.setToolTip('Empty or "all": all frames (recommended for full coverage).\n'
+                                'One number n: the first n frames, for a quick test.\n'
+                                'Frame numbers and ranges: only these frames, for example\n'
+                                '1-369, 901-1289 to omit contaminated frames. A range\n'
+                                'includes its two ends. The numbers are those of the file names.')
         fa.addRow('Frames to use', self.nframes)
-        ui.form_hint(fa, 'Use fewer frames for a quick test. 0 means all frames.')
+        self.frames_note = ui.Banner('error')
+        fa.addRow(self.frames_note)
+        ui.form_hint(fa, 'Empty: all frames. n: the first n frames. Ranges: 1-369, 901-1289.')
         self.subfolder_par_chk = QCheckBox('Search subfolders for the .par file')
         self.subfolder_par_chk.setToolTip(
             'If the *_cracker.par is not in the selected folder itself but in a\n'
@@ -455,7 +482,7 @@ class ReconstructGUI(ui.Shell):
         s.setDecimals(2); s.setSingleStep(1.0); return s
 
     def _reset_advanced(self):
-        self.nframes.setValue(0)
+        self.nframes.setText('')
         self.tabbin_chk.setChecked(True)
         self.axis_chk.setChecked(True)
         self.gpu_chk.setChecked(bool(HAS_GPU))
@@ -542,6 +569,12 @@ class ReconstructGUI(ui.Shell):
         # Discover frames (stem is NOT assumed to match the folder name) and the par
         frames, nums = rawrecon.find_cbf_frames(folder)
         self._n_total = len(frames)
+        old_numbers = self._numbers
+        self._numbers = [int(v) for v in nums]
+        self._facts = {}
+        if old_numbers and old_numbers != self._numbers and self._frame_choice_text():
+            self.nframes.setText('')
+            self._log('  Frames to use was reset for the new folder.')
         par = rawrecon.find_crysalis_par(folder)
         if par is None:                                  # optionally search subfolders
             par = self._find_par_maybe_subfolders(folder)
@@ -597,7 +630,9 @@ class ReconstructGUI(ui.Shell):
                 self.reach_labels[axis].setText(f'data to ±{value:.2f}')
         except Exception:
             pass
-        self.info_grid.set_values(facts)
+        self._facts = facts
+        self._update_frames_note()
+        self._frames_applied = self._frames_key()
         self.info_grid.setVisible(True)
         self.dataset_hint.setVisible(False)
         self.dataset_note.clear()
@@ -605,7 +640,6 @@ class ReconstructGUI(ui.Shell):
         self._log(f'  par: {os.path.relpath(par, folder)}')
         for line in info.split('\n'):
             self._log('  ' + line)
-        self.nframes.setMaximum(max(self._n_total, 1))
         self.run_btn.setEnabled(True)
         self._check_laue(switch=True)
         self._update_files_label()
@@ -643,24 +677,139 @@ class ReconstructGUI(ui.Shell):
         if self._recip is None:
             self.laue_note.clear()
             return
-        laue = self.laue_combo.currentData()
+        laue = self._laue()
         residual, fit = fitting_laue_group(self._recip, laue)
         if fit == laue:
             self.laue_note.clear()
             return
+        name, fit_name = laue_display_name(laue), laue_display_name(fit)
         if switch:
-            self.laue_combo.setCurrentIndex(self.laue_combo.findData(fit))
-            text = (f'The cell metric does not allow {laue} (residual {residual:.2g}). The '
-                    f'window selected {fit}: the group of highest order that the cell allows. '
-                    'Check the Laue group.')
+            self._set_laue(fit)
+            text = (f'The cell metric does not allow {name} (residual {residual:.2g}). The '
+                    f'window selected {fit_name}: the group of highest order that the cell '
+                    'allows. Check the Laue group.')
             self._log('  Laue group: ' + text)
             kind = 'warn'
         else:
-            text = (f'The cell metric does not allow {laue} (residual {residual:.2g}, limit '
+            text = (f'The cell metric does not allow {name} (residual {residual:.2g}, limit '
                     f'{METRIC_TOLERANCE:g}). The group of highest order that the cell allows '
-                    f'is {fit}.')
+                    f'is {fit_name}.')
             kind = 'error'
         self.laue_note.show_message(text, kind)
+
+    def _show_axis_rows(self, visible):
+        """Show or hide the row of the 4-fold axis (the box and its hint)."""
+        self.laue_form.setRowVisible(self._axis_row, visible)
+
+    def _laue(self):
+        """The Laue key of the two choices, for example '4/mmm_a'."""
+        return laue_key(self.laue_combo.currentData(), self.axis_combo.currentData())
+
+    def _set_laue(self, key):
+        """Select the group and the 4-fold axis of the Laue key `key`."""
+        group, axis = split_laue_key(key)
+        # One change, not two: the handler must not see the new axis with the old group.
+        boxes = (self.axis_combo, self.laue_combo)
+        old = [b.blockSignals(True) for b in boxes]
+        try:
+            for box, data in ((self.axis_combo, axis), (self.laue_combo, group)):
+                index = box.findData(data)
+                if index != -1:
+                    box.setCurrentIndex(index)
+        finally:
+            for box, flag in zip(boxes, old):
+                box.blockSignals(flag)
+        self._on_laue_changed()
+
+    # ── frames to use ──
+    def _frame_choice(self):
+        """The text of 'Frames to use' as (nframes, selection, error).
+
+        Empty or 'all': (None, None, None). One number n: the first n frames,
+        (n, None, None). Else a selection by frame number: (None, normalised
+        text, None). A text that is not valid gives (None, None, error text)."""
+        text = self.nframes.text().strip()
+        if text.lower() in ('', 'all'):
+            return None, None, None
+        if re.fullmatch(r'[0-9]+', text):
+            n = int(text)
+            if n == 0:
+                return None, None, None
+            if self._n_total and n > self._n_total:
+                return None, None, (f'The folder has {self._n_total} frames. Use a number '
+                                    f'from 1 to {self._n_total}.')
+            return n, None, None
+        if not self._numbers:
+            return None, text, None              # no folder yet: check it on folder load
+        try:
+            _, norm = rawrecon.parse_frame_selection(text, self._numbers)
+        except ValueError as exc:
+            return None, None, str(exc)
+        return None, norm, None
+
+    def _frame_choice_text(self):
+        """True if 'Frames to use' has a text that selects frames."""
+        return self.nframes.text().strip().lower() not in ('', 'all')
+
+    def _frames_count(self):
+        """The count of the selected frames, or None if the text is not valid."""
+        n, sel, err = self._frame_choice()
+        if err:
+            return None
+        if sel is not None:
+            return len(rawrecon.parse_frame_selection(sel, self._numbers)[0])
+        return n or self._n_total
+
+    def _update_frames_note(self):
+        """The validation note under the field and the frame count in the dataset facts."""
+        err = self._frame_choice()[2]
+        if err:
+            self.frames_note.show_message(err, 'error')
+        else:
+            self.frames_note.clear()
+        if self._facts:
+            facts = dict(self._facts)
+            count = self._frames_count() if self._numbers else None
+            if count is not None and count != self._n_total:
+                facts['Frames'] += f', {count} selected'
+            elif count is None:
+                facts['Frames'] += ', the selection is not valid'
+            self.info_grid.set_values(facts)
+
+    def _frames_key(self):
+        """The selected frames as a tuple of positions, or None if the text is not valid.
+        Two texts with the same frames (for example '5-8' and '5, 6, 7, 8') have the same key."""
+        n, sel, err = self._frame_choice()
+        if err:
+            return None
+        if not self._numbers:
+            return (n, sel)
+        if sel is not None:
+            return tuple(rawrecon.parse_frame_selection(sel, self._numbers)[0])
+        return tuple(range(n or self._n_total))
+
+    def _frames_setting(self):
+        """The frames as a part of the settings key: equal selections ('60' and '1-60')
+        are equal; a text that is not valid stays a distinct text."""
+        key = self._frames_key()
+        return key if key is not None else ('not valid', self.nframes.text().strip())
+
+    def _on_frames_changed(self, *_):
+        """The text changed: update the note at once. While the user types, wait for the end
+        of the edit before the set-up change removes the frame tools results."""
+        self._update_frames_note()
+        self._update_run_note()
+        if not self.nframes.hasFocus():
+            self._apply_frames_change()
+
+    def _apply_frames_change(self):
+        """The edit of the frame text is finished: apply the change if the selected frames
+        are not those of the last applied text."""
+        key = self._frames_key()
+        if key is None or key == self._frames_applied:
+            return
+        self._frames_applied = key
+        self._on_setup_changed()
 
     # ── output ──
     def _browse_out_dir(self):
@@ -695,7 +844,7 @@ class ReconstructGUI(ui.Shell):
         if not self._folder:
             self.files_label.setText('')
             return
-        sym, raw = self._output_paths(self.laue_combo.currentData(), self._source()[1])
+        sym, raw = self._output_paths(self._laue(), self._source()[1])
         names = [os.path.basename(sym)] + ([os.path.basename(raw)] if raw else [])
         self.files_label.setText('\n'.join(names))
 
@@ -721,6 +870,10 @@ class ReconstructGUI(ui.Shell):
             text = 'Select a dataset folder to start.'
         elif self._grid_note is not None:
             role, text = self._grid_note
+        elif self._frame_choice()[2]:
+            role = 'error'
+            text = ('The frame selection is not valid (Advanced page): '
+                    f'{self._frame_choice()[2]}')
         elif self._vd is not None and self._recon_key == self._settings_key():
             text = ('The reconstruction is in memory. A click symmetrises and saves without a '
                     'new reconstruction.')
@@ -738,7 +891,7 @@ class ReconstructGUI(ui.Shell):
     def _settings_key(self):
         """The settings that change the reconstruction (not the GPU switch)."""
         return repr((self._folder, self._par, self._ranges(), self.dq.value(), self._bins(),
-                     self.nframes.value(), self._corrections(), self.hot.value(),
+                     self._frames_setting(), self._corrections(), self.hot.value(),
                      self.tabbin_chk.isChecked(),
                      self.tabbin_chk.isChecked() and self.axis_chk.isChecked()))
 
@@ -756,12 +909,18 @@ class ReconstructGUI(ui.Shell):
         """Reconstruct and save. Use the reconstruction in memory if its settings are the same."""
         if self._folder is None or self._par is None or not self._grid_ok():
             return
+        err = self._frame_choice()[2]
+        if err:
+            self._log(f'The frame selection is not valid: {err}')
+            self.set_status('The frame selection is not valid. Correct it on the Advanced page.')
+            self._update_run_note()
+            return
         if self._vd is not None and self._recon_key == self._settings_key():
             self._log('\nThe reconstruction settings did not change. The window uses the '
                       'reconstruction in memory.')
             self._symmetrize_save()
             return
-        sym, raw = self._output_paths(self.laue_combo.currentData(), '')
+        sym, raw = self._output_paths(self._laue(), '')
         if not self._confirm_overwrite([sym, raw]):
             return
         self._pending_save = True
@@ -771,7 +930,8 @@ class ReconstructGUI(ui.Shell):
         r = self._ranges()
         corr = self._corrections()
         hot = self.hot.value() or None
-        nframes = self.nframes.value() or None
+        n, selection = self._frame_choice()[:2]
+        nframes = selection if selection is not None else n     # see _do_reconstruct
         use_gpu = self.gpu_chk.isChecked()
         self._cancel = False
         self._running_key = self._settings_key()
@@ -791,10 +951,16 @@ class ReconstructGUI(ui.Shell):
 
     def _do_reconstruct(self, folder, ranges, step, bins, nframes, corr, hot, use_gpu,
                         par_path, use_tabbin, correct_axis=True):
+        """`nframes` is the frame choice: None (all), n (the first n frames) or a
+        selection text by frame number ('1-369, 901-1289')."""
         log = lambda m: QThread.currentThread()._emit_log(m)     # type: ignore[union-attr]
         cb = QThread.currentThread()._emit_progress             # type: ignore[union-attr]
+        frames = nframes if isinstance(nframes, str) else None
+        if frames is not None:
+            nframes = None
         vol, info = rawrecon.reconstruct_dataset(
-            folder, ranges=ranges, step=step, bins=bins, nframes=nframes, corrections=corr,
+            folder, ranges=ranges, step=step, bins=bins, nframes=nframes, frames=frames,
+            corrections=corr,
             hot=hot, use_gpu=use_gpu, par_path=par_path, use_tabbin=use_tabbin,
             refine_geometry=correct_axis, progress_callback=cb, log=log, keep_setup=True,
             cancelled=lambda: self._cancel)
@@ -802,8 +968,9 @@ class ReconstructGUI(ui.Shell):
         info['axis_off'] = bool(use_tabbin and not correct_axis)
         provenance = {k: info[k] for k in ('polarization_axis', 'hot_pixel_cutoff',
                                            'geometry_method') if info.get(k) is not None}
+        provenance.update(rawrecon.frame_metadata(info))
         vd = rawrecon.reconstruct_to_volumedata(vol, source_folder=folder,
-                                                extra_meta=provenance)
+                                            extra_meta=provenance)
         return vol, vd, info
 
     @staticmethod
@@ -877,7 +1044,7 @@ class ReconstructGUI(ui.Shell):
             self._log(msg)
             QMessageBox.warning(self, 'Settings changed', msg)
             return
-        laue = self.laue_combo.currentData()
+        laue = self._laue()
         vd, tag = self._source()
         sym_path, raw_path = self._output_paths(laue, tag)
         if raw_path is not None and raw_path == self._raw_saved:
@@ -927,7 +1094,7 @@ class ReconstructGUI(ui.Shell):
             log(f'  -> {vd.intensity.shape}')
         n_ops = _EXPECTED_ORDERS[laue]
         t = time.time()
-        log(f'  symmetrising {laue} ({n_ops} ops), {rule} ...')
+        log(f'  symmetrising {laue_display_name(laue)} ({n_ops} ops), {rule} ...')
         try:
             sym = symmetrize_volume(vd, laue, progress_callback=cb, **sym_kw)
         except ValueError as exc:
@@ -944,7 +1111,9 @@ class ReconstructGUI(ui.Shell):
             f'range [{np.nanmin(sym.intensity):.2f}, {np.nanmax(sym.intensity):.2f}]')
         mapping = sym.metadata.get('symmetry_mapping')
         log(f'  symmetry operations applied as: {mapping} maps')
-        if mapping != 'exact':
+        if inexact_mapping_note(mapping):
+            log('  ' + inexact_mapping_note(mapping))
+        elif mapping != 'exact':
             log('  Not all operations are exact index maps. If you changed the bin\n'
                 '  factors after the reconstruction, reconstruct again with them.')
         log('  symmetry diagnostics per |q| shell:')
@@ -999,7 +1168,7 @@ class ReconstructGUI(ui.Shell):
         """Laue group and volume function for the Averaging panel (GUI thread)."""
         if self._vd is None:
             raise ValueError('Reconstruct a volume first (Reconstruct page).')
-        laue = self.laue_combo.currentData()
+        laue = self._laue()
         vd, key = self._source()[0], self._binned_key()
         bin_xy, bin_z = key[1], key[2]
         ready = self._current_binned()
@@ -1030,7 +1199,7 @@ class ReconstructGUI(ui.Shell):
             if bin_xy > 1 or bin_z > 1:
                 return bin_volume(vd, bin_xy, bin_xy, bin_z)
             return vd
-        return {'setup': setup, 'raw': self._vd, 'laue': self.laue_combo.currentData(),
+        return {'setup': setup, 'raw': self._vd, 'laue': self._laue(),
                 'use_gpu': bool(self.gpu_chk.isChecked() and HAS_GPU), 'bin': bin_fn}
 
     def _on_volume_changed(self):
@@ -1045,7 +1214,9 @@ class ReconstructGUI(ui.Shell):
         self._update_files_label()
 
     def _on_laue_changed(self, *_):
-        """The Laue group changed: reset the panel and remove the frame-model results."""
+        """The Laue group or the 4-fold axis changed: reset the panel and remove the
+        frame-model results."""
+        self._show_axis_rows(self.laue_combo.currentData() in AXIS_GROUPS)
         self.avg_panel.reset('The Laue group changed. Click Measure again.')
         self.avg_panel.drop_laue_results(
             "The Laue group changed. The panel removed the 'ring mask + frame model' volume "

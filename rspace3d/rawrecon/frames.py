@@ -594,7 +594,7 @@ def run_frame_chain(setup: ReconSetup, laue_group: str, *, rings: Any = "auto",
     volume, the accumulators of one pass and the arrays of one frame.
     """
     import dataclasses
-    from ..volume_builder import symmetrize_volume
+    from ..volume_builder import symmetrize_volume, laue_display_name
     say = log or (lambda *_: None)
     t_all = time.time()
     nf = setup.n_frames
@@ -645,6 +645,8 @@ def run_frame_chain(setup: ReconSetup, laue_group: str, *, rings: Any = "auto",
                  if setup.meta.get(k) is not None}
     if setup.hot is not None:
         base_meta["hot_pixel_cutoff"] = float(setup.hot)
+    from .engine import frame_metadata
+    base_meta.update(frame_metadata(setup.meta))
 
     def to_vd(vol, corr_name):
         meta = dict(base_meta, frame_correction=corr_name)
@@ -681,7 +683,8 @@ def run_frame_chain(setup: ReconSetup, laue_group: str, *, rings: Any = "auto",
             pred_vol = leave_one_out_median(cur, laue_group)
             if not np.isfinite(pred_vol).any():
                 raise ValueError(
-                    f"The prediction has no finite voxel. In Laue group {laue_group}, no voxel "
+                    f"The prediction has no finite voxel. In Laue group "
+                    f"{laue_display_name(laue_group)}, no voxel "
                     f"of the grid has a symmetry equivalent with data in the grid. Use a grid "
                     f"that contains the symmetry equivalents.")
             pv = _with_intensity(cur, pred_vol)

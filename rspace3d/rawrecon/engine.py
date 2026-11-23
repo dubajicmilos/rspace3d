@@ -542,15 +542,127 @@ def gpu_memory_bytes(n_voxels: int, halves: bool = False) -> int:
     return int(n_voxels) * 20 * (2 if halves else 1)
 
 
+# ---------------------------------------------------------------- frame selection
+def selection_text(positions, numbers) -> str:
+    """The normalised text of a frame selection, for example '1-369, 901-1289'.
+
+    `positions` are indices into `numbers` (the frame numbers of the scan).
+    Frames that are next to each other in the scan make one range."""
+    pos = sorted(int(p) for p in positions)
+    parts = []
+    start = prev = None
+    for p in pos + [None]:
+        if start is not None and (p is None or p != prev + 1):
+            a, b = numbers[start], numbers[prev]
+            parts.append(str(a) if a == b else f"{a}-{b}")
+            start = None
+        if p is not None and start is None:
+            start = p
+        prev = p
+    return ", ".join(parts)
+
+
+def parse_frame_selection(selection, numbers) -> tuple[list[int], str]:
+    """Select frames by their frame numbers. Returns (positions, normalised text).
+
+    numbers : the frame numbers of the scan, in scan order (`ReconSetup.numbers`).
+    selection : None, '' or 'all' (all frames); a text such as '1-369, 901-1289'
+        (ranges include both ends; parts are separated by commas or spaces);
+        or an iterable of frame numbers.
+    positions : the indices into `numbers` of the selected frames, in scan order.
+        A range selects all frames of the scan with a number in the range, so
+        a gap in the frame numbers is not an error.
+    Raises ValueError with a plain text for a character that is not allowed, a
+    part that is not a number or a range, a reversed range, a number that is
+    not in the scan and an empty selection.
+    """
+    import re
+
+    nums = [int(v) for v in numbers]
+    if not nums:
+        raise ValueError("The scan has no frames.")
+    first, last = nums[0], nums[-1]
+    index = {v: i for i, v in enumerate(nums)}
+    scan = f"The scan has the frames {first} to {last}."
+
+    def check(v):
+        if v not in index:
+            raise ValueError(f"Frame {v} is not in the scan. {scan}")
+
+    if selection is None or (isinstance(selection, str)
+                             and selection.strip().lower() in ("", "all")):
+        pos = list(range(len(nums)))
+        return pos, selection_text(pos, nums)
+    chosen = set()
+    if isinstance(selection, (int, float, np.integer, np.floating)):
+        raise ValueError("Give the frames as a text such as '1-369, 901-1289' or as a list of "
+                         "frame numbers. For the first n frames, use nframes.")
+    if isinstance(selection, str):
+        bad = sorted(set(re.sub(r"[0-9,\-\s]", "", selection)))
+        if bad:
+            raise ValueError(f"The frame selection has a character that is not allowed: "
+                             f"'{bad[0]}'. Use frame numbers, '-' for a range and ',' "
+                             "between the parts.")
+        text = re.sub(r"\s*-\s*", "-", selection.strip())
+        for part in re.split(r"[,\s]+", text):
+            if not part:
+                continue
+            m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+            if m is None:
+                raise ValueError(f"The part '{part}' is not a frame number or a range such "
+                                 "as 1-369.")
+            a = int(m.group(1))
+            b = a if m.group(2) is None else int(m.group(2))
+            if b < a:
+                raise ValueError(f"The range {a}-{b} is reversed. Write the smaller number "
+                                 "first.")
+            if a == b:
+                check(a)
+                chosen.add(index[a])
+                continue
+            for v in (a, b):
+                if v < first or v > last:
+                    raise ValueError(f"Frame {v} is not in the scan. {scan}")
+            chosen.update(i for i, v in enumerate(nums) if a <= v <= b)
+    else:
+        try:
+            items = list(selection)
+        except TypeError:
+            raise ValueError("Give the frames as a text such as '1-369, 901-1289' or as a "
+                             "list of frame numbers.") from None
+        for v in items:
+            if isinstance(v, (bool, np.bool_)) or int(v) != v:
+                raise ValueError(f"The frame number {v!r} is not an integer.")
+            check(int(v))
+            chosen.add(index[int(v)])
+    if not chosen:
+        raise ValueError("The frame selection is empty.")
+    pos = sorted(chosen)
+    return pos, selection_text(pos, nums)
+
+
+def frame_metadata(meta: dict) -> dict:
+    """The volume metadata of the frame selection: frame_selection (text),
+    n_frames_used and n_frames_total. `meta` is `ReconSetup.meta` or the info
+    dict of `reconstruct_dataset`. Give the result to
+    `reconstruct_to_volumedata(..., extra_meta=...)`; `save_volume_h5` writes it."""
+    out = {"frame_selection": meta.get("frame_selection"),
+           "n_frames_used": meta.get("n_frames_used", meta.get("n_frames")),
+           "n_frames_total": meta.get("n_total")}
+    return {k: v for k, v in out.items() if v is not None}
+
+
 # ---------------------------------------------------------------- high level
 def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
-                  step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
+                  step=0.025, bins=(1, 1, 1), nframes=None, frames=None, corrections=True,
                   hot=None, device=0, prefetch=4, par_path=None, use_tabbin=False,
                   refine_geometry=True, log=None) -> ReconSetup:
     """Find the frames and the par file of `folder`, get the geometry and make a `ReconSetup`.
 
     The arguments are those of `reconstruct_dataset`. The function does not
-    read the frames for the volume."""
+    read the frames for the volume. The setup holds only the selected frames
+    (`nframes` or `frames`). The geometry fit from the peak table uses the
+    full peak table. The angle of each frame comes from its frame number."""
     import os
 
     say = log or (lambda *_: None)
@@ -567,10 +679,21 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
     if np.any(np.diff(all_nums) <= 0):
         raise ValueError("discovered CBF frame numbers must be strictly increasing")
     n_total = len(all_frames)
-    n = int(nframes) if nframes else n_total
-    if n <= 0 or n > n_total:
-        raise ValueError(f"nframes must be between 1 and {n_total}, got {nframes}")
-    frames, nums = all_frames[:n], all_nums[:n]
+    no_selection = frames is None or (isinstance(frames, str)
+                                      and frames.strip().lower() in ("", "all"))
+    if nframes and not no_selection:
+        raise ValueError("Give nframes (the first n frames) or frames (a selection), "
+                         "not both.")
+    if not no_selection:
+        positions, selection = parse_frame_selection(frames, all_nums)
+    else:
+        n = int(nframes) if nframes else n_total
+        if n <= 0 or n > n_total:
+            raise ValueError(f"nframes must be between 1 and {n_total}, got {nframes}")
+        positions = list(range(n))
+        selection = selection_text(positions, all_nums)
+    nums = [all_nums[i] for i in positions]
+    frames = [all_frames[i] for i in positions]
 
     geometry_method, axis_correction = "indexed_first_frame", None
     if use_tabbin:
@@ -589,9 +712,10 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
             f"dist {det.distance:.1f}mm, osc {tuple(round(x,3) for x in osc_axis)} "
             f"sense {sense:+d}, rms {geom_rms:.4f} 1/A on {geom_inl} peaks")
     else:
-        det, ang0, _ = FlatDetector.from_eiger_cbf(frames[0])
+        # The first frame of the scan is the reference, also with a selection
+        det, ang0, _ = FlatDetector.from_eiger_cbf(all_frames[0])
         incr = ang0["Angle_increment"]
-        det, UB, R0, phi0, idx = orient_from_frame(par_path, frames[0])
+        det, UB, R0, phi0, idx = orient_from_frame(par_path, all_frames[0])
         osc_axis, sense = (0, 1, 0), 1
         geom_rms, geom_inl, geom_dev = idx.rms, int(idx.inliers.sum()), None
         say(f"par: {os.path.basename(par_path)}")
@@ -600,9 +724,11 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
     say(f"cell a,b,c = {cell['a']:.3f},{cell['b']:.3f},{cell['c']:.3f} A  "
         f"ang {cell['alpha']:.2f},{cell['beta']:.2f},{cell['gamma']:.2f}")
 
-    # phi tied to the frame NUMBER (robust to gaps): phi = phi0 + (num - num0)*incr
-    phis = [phi0 + (num - nums[0]) * incr for num in nums]
-    missing = sorted(set(range(nums[0], nums[-1] + 1)) - set(nums))
+    # phi tied to the frame NUMBER (robust to gaps): phi = phi0 + (num - num0)*incr.
+    # num0 is the first frame of the scan, so each selected frame keeps its angle.
+    phis = [phi0 + (num - all_nums[0]) * incr for num in nums]
+    # Gaps in the frame numbers of the scan (not the frames that the selection omits)
+    missing = sorted(set(range(nums[0], nums[-1] + 1)) - set(all_nums))
     if missing:
         say(f"frame-number gaps kept in the angle mapping: {missing[:10]}"
             f"{' ...' if len(missing) > 10 else ''}")
@@ -634,6 +760,7 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
         "geometry_method": geometry_method,
         "missing_frame_numbers": missing,
         "axis_correction_deg": axis_correction,
+        "frame_selection": selection, "n_frames_used": len(nums),
     }
     return ReconSetup(frames=list(frames), numbers=[int(v) for v in nums], phis=phis,
                       detector=det, UB=UB, R0=R0, phi0=phi0, osc_axis=osc_axis,
@@ -643,7 +770,8 @@ def prepare_setup(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
 
 
 def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)),
-                        step=0.025, bins=(1, 1, 1), nframes=None, corrections=True,
+                        step=0.025, bins=(1, 1, 1), nframes=None, frames=None,
+                        corrections=True,
                         hot=None, use_gpu=True, device=0, prefetch=4, par_path=None,
                         use_tabbin=False, refine_geometry=True, progress_callback=None,
                         log=None, halves=False, cancelled=None, keep_setup=False):
@@ -660,6 +788,15 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
         refine). The fit uses the correction only if it puts the strong peaks nearer
         to integer hkl. info['axis_correction_deg'] is the angle of the correction
         (0.0 if the fit did not use it).
+    nframes : use the first n frames only. None or 0 uses all frames.
+    frames : select frames by their frame numbers (the numbers in the file
+        names): None (all frames), a text such as '1-369, 901-1289' (ranges
+        include both ends) or an iterable of numbers (`parse_frame_selection`).
+        Give nframes or frames, not both. An empty text or 'all' is no selection.
+        Each frame keeps its own angle. The
+        geometry fit from the peak table uses the full peak table.
+        info['frame_selection'] is the normalised text and info['n_frames']
+        the count of frames used.
     par_path : explicit .par to use (e.g. in a subfolder); else searched in `folder`.
         It is also the par the tabbin calibration uses.
     bins : (bh, bk, bl) factors that you will give to `bin_volume` before
@@ -689,11 +826,13 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
     """
     say = log or (lambda *_: None)
     setup = prepare_setup(folder, ranges=ranges, step=step, bins=bins, nframes=nframes,
-                          corrections=corrections, hot=hot, device=device,
+                          frames=frames, corrections=corrections, hot=hot, device=device,
                           prefetch=prefetch, par_path=par_path, use_tabbin=use_tabbin,
                           refine_geometry=refine_geometry, log=log)
     n, n_total = setup.n_frames, setup.meta["n_total"]
     gpu = use_gpu and has_cupy(device)
+    selection = setup.meta.get("frame_selection")     # None for a setup made by hand
+    say(f"Frames: {n} of {n_total}" + (f" ({selection})." if selection else "."))
     say(f"reconstructing {n}/{n_total} frames on {'GPU' if gpu else 'CPU'}, "
         f"grid {[list(r) for r in ranges]} dq={step} ...")
     t0 = time.time()
@@ -716,6 +855,7 @@ def reconstruct_dataset(folder, *, ranges=((-6.0, 6.0), (-6.0, 6.0), (-6.0, 6.0)
         "geometry_method": m["geometry_method"],
         "axis_correction_deg": m.get("axis_correction_deg"),
         "missing_frame_numbers": m["missing_frame_numbers"],
+        "frame_selection": selection,
     }
     if keep_setup:
         info["setup"] = setup

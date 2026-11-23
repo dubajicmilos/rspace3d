@@ -34,7 +34,7 @@ from PyQt6.QtCore import QThread, Qt, pyqtSignal
 
 from . import __version__, ui
 from .volume_builder import (
-    load_unwarp_folder, bin_volume, symmetrize_volume,
+    load_unwarp_folder, bin_volume, symmetrize_volume, inexact_mapping_note,
     save_volume_h5, load_volume_h5, adaptive_morph_size, bin_native,
     raw_cache_mismatch, _read_header_fast, resolve_unit_cell, format_symmetry_diagnostics,
     _filter_numbered_imgs, _img_number, fitting_laue_group,
@@ -702,7 +702,7 @@ class SimpleVolumeGUI(ui.Shell):
             self.laue_note.clear()
             return
         laue = self.laue_combo.currentData()
-        residual, fit = fitting_laue_group(self._recip, laue)
+        residual, fit = fitting_laue_group(self._recip, laue, allowed=LAUE_GROUP_NAMES)
         if fit == laue:
             self.laue_note.clear()
             return
@@ -771,6 +771,9 @@ class SimpleVolumeGUI(ui.Shell):
             f'({n_removed:,} orbit members flagged as outliers)')
         log(f'  Range: [{np.nanmin(vol.intensity):.3f}, '
             f'{np.nanmax(vol.intensity):.3f}]')
+        note = inexact_mapping_note(vol.metadata.get('symmetry_mapping'))
+        if note:
+            log('  ' + note)
         log('  Symmetry diagnostics per |q| shell:')
         log(format_symmetry_diagnostics(vol.metadata.get('symmetry_diagnostics')))
 

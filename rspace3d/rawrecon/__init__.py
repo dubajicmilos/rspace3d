@@ -20,7 +20,7 @@ from .corrections import pixel_corrections, pixel_directions
 from .engine import (Volume, reconstruct_volume, reconstruct_volume_gpu,
                      reconstruct_dataset, reconstruct_to_volumedata,
                      bragg_registration_rms, has_cupy, ReconSetup, prepare_setup,
-                     gpu_memory_bytes)
+                     gpu_memory_bytes, parse_frame_selection, frame_metadata)
 from .tabbin import read_tabbin, find_tabbin
 from .calibrate import geometry_from_tabbin, FittedGeometry
 from .rings import (PixelPolar, RingStats, RingDetection, RingMask, ring_statistics,
@@ -36,7 +36,8 @@ __all__ = [
     "pixel_corrections", "pixel_directions",
     "Volume", "reconstruct_volume", "reconstruct_volume_gpu", "reconstruct_dataset",
     "reconstruct_to_volumedata", "bragg_registration_rms", "has_cupy",
-    "ReconSetup", "prepare_setup", "gpu_memory_bytes",
+    "ReconSetup", "prepare_setup", "gpu_memory_bytes", "parse_frame_selection",
+    "frame_metadata",
     "read_tabbin", "find_tabbin", "geometry_from_tabbin", "FittedGeometry",
     "PixelPolar", "RingStats", "RingDetection", "RingMask", "ring_statistics", "detect_rings",
     "FrameModel", "ModelOptions", "fit_frame_model",

@@ -295,7 +295,7 @@ def test_new_grid_frames_or_folder_remove_the_kept_results(qapp, monkeypatch, tm
     gui._frame_stale = False
     panel.ring_btn.click()
     assert _slots(panel) == ['none', 'mask']
-    gui.nframes.setValue(5)
+    gui.nframes.setText('5')
     assert panel._fvols == {}
     gui._frame_stale = False
     panel.ring_btn.click()

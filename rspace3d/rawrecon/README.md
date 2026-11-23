@@ -310,6 +310,9 @@ agrees with the independent route.
 | `pixel_corrections(det, r_lab, *, solid_angle, polarization, polarization_fraction, horizontal)` | `corrections` | per-pixel geometric corrections |
 | `bragg_registration_rms(vol)` | `engine` | reference-free integer-registration check (see caveat §6) |
 | `prepare_setup(folder, ...) -> ReconSetup` | `engine` | finds the frames and the geometry without a pass over the frames. `reconstruct_dataset(..., keep_setup=True)` puts the setup in `info['setup']` |
+| `reconstruct_dataset(..., frames='1-369, 901-1289')`, `prepare_setup(..., frames=...)` | `engine` | select frames by their frame numbers (the numbers of the file names): None (all), a text with numbers and ranges (both ends included), or an iterable of numbers. `nframes=n` (the first n frames) stays; give one of the two. Each frame keeps its own angle, and the geometry fit uses the full peak table. The setup holds only the selected frames, so the frame tools and the split into halves use only them. `info['frame_selection']` is the normalised text, `info['n_frames']` the count |
+| `parse_frame_selection(selection, numbers) -> (positions, text)` | `engine` | the parser of `frames`. A wrong character, a part that is not a number or a range, a reversed range, a number that is not in the scan and an empty selection give a ValueError with a plain text |
+| `frame_metadata(info_or_setup_meta) -> dict` | `engine` | `frame_selection`, `n_frames_used`, `n_frames_total` for `reconstruct_to_volumedata(..., extra_meta=...)`. `save_volume_h5` writes them as attributes |
 | `ReconSetup.reconstruct(*, positions, groups, frame_fn, use_gpu, progress_callback, cancelled)` | `engine` | one more engine pass with the same geometry |
 | `reconstruct_dataset(..., halves=True)` | `engine` | the same pass also makes the odd-frame and even-frame volumes (`vol.parts`). The frames must have odd and even numbers. The host needs about 120 bytes per voxel at the peak, against about 55 bytes per voxel without halves |
 | `gpu_memory_bytes(n_voxels, halves=False) -> int` | `engine` | GPU accumulator memory of one pass in bytes (20 bytes per voxel, two times with halves) |
@@ -456,6 +459,13 @@ dataset (`reconstruct_dataset(..., keep_setup=True)` puts it in
 `info['setup']`), so no new geometry fit is necessary. `prepare_setup` also
 gives the setup. `info['setup']` is not a JSON value. Remove it before you
 serialise `info`, for example `{k: v for k, v in info.items() if k != 'setup'}`.
+
+With a frame selection (`frames=`), the setup holds only the selected frames.
+All frame tools then see only these frames, in scan order. The ring
+detection uses a running median over the frames, so it runs over the joined
+groups of a selection. The rows of the frame map are the selected frames
+without the omitted frames. The split into halves uses the parity of the
+frame numbers of the selected frames.
 
 The frame chain is: ring mask, frame model (3 iterations), plain orbit mean
 (`run_frame_chain`).

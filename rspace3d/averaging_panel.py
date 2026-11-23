@@ -60,6 +60,7 @@ from matplotlib.figure import Figure
 from . import averaging as av
 from . import orbit_engine as oe
 from . import ui
+from .volume_builder import laue_display_name
 
 # Orbit members (voxels x operations) of the automatic crop. With the NumPy
 # engine, the slowest candidate ('noise weights, noise limit (4 sigma)') then takes less than
@@ -262,7 +263,7 @@ def _measure_job(volume_fn: Callable[..., Any], laue: str, crop: int | str | Non
             region = ('centred crop ' + ' x '.join(str(s) for s in work.intensity.shape)
                       + ' of ' + ' x '.join(str(s) for s in vol.intensity.shape))
         del box
-    log(f'Measure on the {region}, Laue group {laue}.')
+    log(f'Measure on the {region}, Laue group {laue_display_name(laue)}.')
     measured = av.measure_volume(work, laue, use_gpu=use_gpu, log=log, progress=progress,
                                  cancelled=cancelled)
     return {'volume': vol, 'work': work, 'cropped': work is not vol, 'region': region,
@@ -1591,7 +1592,7 @@ class AveragingPanel(QWidget):
         info = out['model'].metadata.get('frame_tools') or {}
         # The prediction of the frame model uses the Laue group. The note shows it.
         self._fnotes['model'] = (('' if found else 'no ring found, frame model only, ')
-                                 + f"Laue group {info.get('laue_group', '-')}")
+                                 + f"Laue group {laue_display_name(info['laue_group']) if info.get('laue_group') else '-'}")
         self._tables = out['tables']
         its = info.get('iterations_info') or []
         last = its[-1] if its else {}

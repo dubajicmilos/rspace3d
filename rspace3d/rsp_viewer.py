@@ -1253,7 +1253,8 @@ class UnifiedViewer(QMainWindow):
         lines.append('=== Processing ===\n')
         laue = m.get('laue_group', '')
         if laue:
-            lines.append(f'Laue group: {laue}')
+            from .volume_builder import laue_display_name
+            lines.append(f'Laue group: {laue_display_name(laue)}')
         lines.append(f'Bin HK:     {m.get("bin_xy", 1)}x')
         lines.append(f'Bin L:      {m.get("bin_z", 1)}x')
 

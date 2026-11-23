@@ -30,7 +30,7 @@ import io
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from scipy import ndimage
 from scipy.ndimage import map_coordinates
 
@@ -1072,6 +1072,8 @@ _INV = -np.eye(3, dtype=int)
 _C2a = np.diag([1, -1, -1]).astype(int)
 _C2b = np.diag([-1, 1, -1]).astype(int)
 _C4c = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=int)
+_C4a = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=int)     # (h,k,l)->(h,-l,k)
+_C4b = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=int)     # (h,k,l)->(l,k,-h)
 _C3_111 = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], dtype=int)
 _C3_hex = np.array([[-1, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=int)    # (h,k,l)->(-h-k, h, l)
 _C6_hex = np.array([[0, -1, 0], [1, 1, 0], [0, 0, 1]], dtype=int)     # (h,k,l)->(-k, h+k, l)
@@ -1081,6 +1083,10 @@ _EXPECTED_ORDERS = {
     '-1': 2, '2/m': 4, 'mmm': 8, '4/m': 8, '4/mmm': 16,
     '-3': 6, '-3m': 12, '6/m': 12, '6/mmm': 24,
     'm-3': 24, 'm-3m': 48,
+    # The 4-fold axis along a or b. These keys come after the 11 keys above.
+    # fitting_laue_group takes the smallest residual at equal order; if the residuals
+    # are equal it keeps this order: the axis c first, then a, then b.
+    '4/m_a': 8, '4/m_b': 8, '4/mmm_a': 16, '4/mmm_b': 16,
 }
 
 _LAUE_GENERATORS = {
@@ -1095,6 +1101,10 @@ _LAUE_GENERATORS = {
     '6/mmm':  [_C6_hex, _C2p_hex, _INV],
     'm-3':    [_C3_111, _C2b, _INV],
     'm-3m':   [_C3_111, _C4c, _INV],
+    '4/m_a':   [_C4a, _INV],
+    '4/m_b':   [_C4b, _INV],
+    '4/mmm_a': [_C4a, _C2b, _INV],
+    '4/mmm_b': [_C4b, _C2a, _INV],
 }
 
 _LAUE_GROUPS_CACHE: dict[str, list[npt.NDArray[np.int_]]] = {}
@@ -1128,6 +1138,35 @@ LAUE_GROUP_NAMES = {
     'm-3m':   'Cubic (m-3m)',
 }
 
+# Groups with a choice of the 4-fold axis. The key of the axis a or b is
+# '<group>_a' or '<group>_b'. The plain key has the axis c.
+AXIS_GROUPS = ('4/m', '4/mmm')
+FOURFOLD_AXES = ('c', 'a', 'b')
+
+
+def laue_key(group: str, axis: str = 'c') -> str:
+    """The Laue key of a group of the list and a 4-fold axis ('c', 'a' or 'b')."""
+    if axis not in FOURFOLD_AXES:
+        raise ValueError(f"The 4-fold axis must be 'c', 'a' or 'b', got {axis!r}.")
+    if axis == 'c' or group not in AXIS_GROUPS:
+        return group
+    return f'{group}_{axis}'
+
+
+def split_laue_key(key: str) -> tuple[str, str]:
+    """(group of the list, 4-fold axis) of a Laue key. The axis is 'c' for most keys."""
+    for group in AXIS_GROUPS:
+        for axis in ('a', 'b'):
+            if key == f'{group}_{axis}':
+                return group, axis
+    return key, 'c'
+
+
+def laue_display_name(key: str) -> str:
+    """A name for the user, for example '4/mmm (4-fold axis a)'."""
+    group, axis = split_laue_key(key)
+    return group if key == group else f'{group} (4-fold axis {axis})'
+
 
 def laue_metric_residual(vol: VolumeData, laue_group: str) -> float | None:
     """Largest relative violation of `W^T G* W = G*` over the group's operations.
@@ -1159,22 +1198,36 @@ def cell_metric_residual(recip: npt.ArrayLike, laue_group: str) -> float:
     return worst
 
 
-def fitting_laue_group(recip: npt.ArrayLike, laue_group: str) -> tuple[float, str]:
+def fitting_laue_group(recip: npt.ArrayLike, laue_group: str,
+                      allowed: Iterable[str] | None = None) -> tuple[float, str]:
     """The residual of `laue_group`, and a group that the cell metric allows.
 
-    If the residual is not more than METRIC_TOLERANCE, the group is
-    `laue_group`. Else it is the group of highest order with a residual not
-    more than METRIC_TOLERANCE ('-1' fits all cells). The metric cannot
+    If the residual is not more than METRIC_TOLERANCE (and `laue_group` is in
+    `allowed`, if given), the group is `laue_group`. Else it is the group of highest order with a residual not
+    more than METRIC_TOLERANCE ('-1' fits all cells); at equal order the
+    group with the smaller residual. The metric cannot
     tell a cubic cell from a cell with a small distortion, so a group that
     fits is not proof of the symmetry.
+
+    `allowed` limits the answer to a set of keys, for a window that has
+    only some of the keys. The default is all keys.
     """
     residual = cell_metric_residual(recip, laue_group)
-    if residual <= METRIC_TOLERANCE:
+    allowed_set = None if allowed is None else set(allowed)
+    if residual <= METRIC_TOLERANCE and (allowed_set is None or laue_group in allowed_set):
         return residual, laue_group
-    for group in sorted(_EXPECTED_ORDERS, key=lambda g: -_EXPECTED_ORDERS[g]):
-        if cell_metric_residual(recip, group) <= METRIC_TOLERANCE:
-            return residual, group
-    return residual, '-1'
+    keys = [k for k in _EXPECTED_ORDERS if allowed_set is None or k in allowed_set]
+    best, best_order, best_res = '-1', -1, 0.0
+    # Highest order first; at equal order the smaller residual wins. Residuals equal to
+    # within 1e-12 keep the order of _EXPECTED_ORDERS (axis c, then a, then b).
+    for group in keys:
+        res = cell_metric_residual(recip, group)
+        if res > METRIC_TOLERANCE:
+            continue
+        order = _EXPECTED_ORDERS[group]
+        if order > best_order or (order == best_order and res < best_res - 1e-12):
+            best, best_order, best_res = group, order, res
+    return residual, best
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1268,6 +1321,18 @@ def index_space_ops(vol: VolumeData, laue_group: str) -> list[dict[str, Any]]:
         else:
             result.append({'op': op, 'M': M, 't': t, 'kind': 'interp'})
     return result
+
+
+def inexact_mapping_note(mapping: str | None) -> str | None:
+    """One log line for a symmetrisation that used the nearest voxel, else None.
+
+    `mapping` is `metadata['symmetry_mapping']` of a symmetrised volume."""
+    if mapping != 'nearest':
+        return None
+    return ('Some operations of the group do not map the grid exactly. They use the nearest '
+            'voxel (error up to half a voxel). This happens when two axes that an operation '
+            'exchanges have different voxel steps. For exact results, use the same bin factor '
+            'on all axes.')
 
 
 def reciprocal_metric(vol: VolumeData) -> tuple[npt.NDArray[np.float64], str]:
@@ -1715,6 +1780,7 @@ _PROVENANCE_KEYS: dict[str, Callable[[Any], Any]] = {
     'polarization_axis': str, 'geometry_method': str, 'source_manifest': str,
     'variance_model': str, 'weighting': str, 'rejection': str,
     'frame_correction': str,
+    'frame_selection': str, 'n_frames_used': int, 'n_frames_total': int,
 }
 
 

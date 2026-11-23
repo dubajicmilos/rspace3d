@@ -39,9 +39,9 @@ import numpy as np
 from rspace3d.volume_builder import (
     load_unwarp_folder, bin_native, symmetrize_volume,
     save_volume_h5, load_volume_h5, resolve_unit_cell, raw_cache_mismatch,
-    format_symmetry_diagnostics,
+    format_symmetry_diagnostics, inexact_mapping_note, laue_display_name,
     _read_header_fast, _filter_numbered_imgs, _img_number,
-    LAUE_GROUP_NAMES, _EXPECTED_ORDERS, HAS_GPU,
+    _EXPECTED_ORDERS, HAS_GPU,
 )
 
 
@@ -123,8 +123,9 @@ def _main() -> None:
 
     parser.add_argument('folder', help='Path to unwarp folder containing .img files')
     parser.add_argument('--laue', default='m-3m',
-                        choices=list(LAUE_GROUP_NAMES.keys()),
-                        help='Laue group (default: m-3m)')
+                        choices=list(_EXPECTED_ORDERS),
+                        help='Laue group (default: m-3m). 4/m_a, 4/m_b, 4/mmm_a and '
+                             '4/mmm_b have the 4-fold axis along a or b')
     parser.add_argument('--sigma', type=float, default=SIGMA_DEFAULT,
                         help='Outlier rejection sigma (default: 3.0); '
                              'pass 0 to skip rejection (pure symmetrization)')
@@ -222,7 +223,7 @@ def _main() -> None:
 
     sigma_val: float | None = args.sigma if args.sigma > 0 else None
     morph_arg: int | str = 'auto' if str(args.morph).lower() == 'auto' else int(args.morph)
-    print(f'  Laue:    {args.laue} ({_EXPECTED_ORDERS[args.laue]} ops)')
+    print(f'  Laue:    {laue_display_name(args.laue)} ({_EXPECTED_ORDERS[args.laue]} ops)')
     print(f'  Sigma:   '
           f'{sigma_val if sigma_val is not None else "off (pure average)"}')
     print(f'  Morph:   {morph_arg}')
@@ -357,6 +358,9 @@ def _main() -> None:
     n_removed = vol.metadata.get('n_outliers_removed', 0)
     print(f'{dt_sym:.1f}s  ({n_removed:,} voxels flagged as outliers, '
           f'{vol.metadata["symmetry_mapping"]} index maps)')
+    note = inexact_mapping_note(vol.metadata.get('symmetry_mapping'))
+    if note:
+        print('      ' + note)
     print('      Symmetry diagnostics per |q| shell:')
     for line in format_symmetry_diagnostics(vol.metadata.get('symmetry_diagnostics')).splitlines():
         print('      ' + line)
