@@ -17,6 +17,8 @@ reconstructed in about half a minute, whereas assembling the same volume from
 CrysAlisPro's `dc unwarp` layers takes hours. Volumes built from `dc unwarp`
 layers are supported as well.
 
+[Video tutorial: how to use rspace3d](https://www.youtube.com/watch?v=4owzi-PtRVA)
+
 <img width="1297" alt="The viewer and the 3D view with the same volume" src="docs/images/viewer_gui.png" />
 
 ## Contents
